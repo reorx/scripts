@@ -1,5 +1,7 @@
 #!/bin/bash
 
+DEBUG="false"
+
 function usage() {
     echo "Usage: gobuildcheck PATH"
 }
@@ -16,6 +18,12 @@ function finddir() {
         -not -path "./.*"
 }
 
+function log_debug() {
+    if [ "$DEBUG" = "true" ]; then
+        echo "$@"
+    fi
+}
+
 target="$1"
 if [ -z "$target" ]; then
     usage
@@ -27,21 +35,24 @@ declare -a errpaths
 for dir in $(finddir $1); do
     num=$(findgo $dir)
     if [ $num -eq 0 ]; then
-        echo "-> $dir (skip)"
+        log_debug "→ $dir (skip)"
         continue
     fi
-    echo "-> $dir $num"
+    log_debug "→ $dir $num"
 
-    go install $dir
+    ro=$(go install $dir 2>&1)
     rc=$?
     if [ $rc -ne 0 ]; then
+        echo "$dir ... FAIL"
+        echo "$ro"
         errpaths=("${errpaths[@]}" "$dir")
     fi
 done
 
 echo
 if [ ${#errpaths[@]} -eq 0 ]; then
-    echo "All pass!"
+    echo "OK"
 else
-    echo "Find errors in: ${errpaths[@]}"
+    echo "FAILED ${#errpaths[@]} (${errpaths[@]})"
+    exit 2
 fi
