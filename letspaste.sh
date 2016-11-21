@@ -32,7 +32,7 @@ function pastebin() {
 
 function generate_and_copy() {
     local filename=$(basename "$2")
-    local cmd="wget -o $filename $1"
+    local cmd="curl -s -o \"$filename\" \"$1\""
     echo "$cmd"
     echo "$cmd" | tr -d '\n' | pbcopy
     echo "* Copied to clipboard"
