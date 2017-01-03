@@ -4,11 +4,12 @@
 # NOTE: wsgiref seems to be a HTTP/1.0 server
 
 import os
+import sys
 from wsgiref.simple_server import make_server
 
 
 def get_import_path(path):
-    return 'git.corp.16financial.com{}'.format(path)
+    return 'foo.example.com{}'.format(get_repo_path(path))
 
 
 def get_vcs(path):
@@ -16,7 +17,22 @@ def get_vcs(path):
 
 
 def get_repo_url(path):
-    return 'ssh://git@git.corp.16financial.com{}.git'.format(path)
+    # the repo path should be in PROJECT/REPO format,
+    # path like /mss/protos/golang/rpc/cashier should be converted to /mss/protos
+    return 'ssh://git@bar.example.com{}.git'.format(get_repo_path(path))
+
+
+def get_repo_path(path):
+    sp = path.split('/')
+    if len(sp) > 3:
+        sp = sp[:3]
+    repo_path = '/'.join(sp)
+    return repo_path
+
+
+def log(s):
+    sys.stdout.write(s + '\n')
+    sys.stdout.flush()
 
 
 # <meta> should be like:
@@ -37,10 +53,18 @@ def simple_app(environ, start_response):
     elif path == '/favicon.ico':
         status = '404 Not Found'
     else:
+        #sp = path.split('/')
+        #if len(sp) > 3:
+        #    status = '404 Not Found'
+        #else:
+        import_path = get_import_path(path)
+        vcs = get_vcs(path)
+        repo_url = get_repo_url(path)
+        log('import_path={} repo_url={} vcs={}'.format(import_path, repo_url, vcs))
         body = template.format(
-            import_path=get_import_path(path),
-            vcs=get_vcs(path),
-            repo_url=get_repo_url(path),
+            import_path=import_path,
+            vcs=vcs,
+            repo_url=repo_url,
         )
 
     start_response(status, headers)
@@ -50,7 +74,7 @@ def simple_app(environ, start_response):
 def main():
     port = int(os.environ.get('PORT', '12345'))
     httpd = make_server('', port, simple_app)
-    print 'Serving on port {}...'.format(port)
+    log('Serving on port {}...'.format(port))
     httpd.serve_forever()
 
 
