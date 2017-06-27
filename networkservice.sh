@@ -1,4 +1,5 @@
 #!/bin/bash
+# TODO show all active
 
 services=$(networksetup -listnetworkserviceorder | grep 'Hardware Port')
 
