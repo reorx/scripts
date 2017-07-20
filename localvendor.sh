@@ -68,3 +68,4 @@ if [ ! -e "$vendor_dir" ]; then
     mkdir -p "$vendor_dir"
 fi
 ln -s $abs_path $vendor_path
+#ls -ld $vendor_path
