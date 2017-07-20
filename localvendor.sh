@@ -2,6 +2,10 @@
 #
 # Usage:
 # $ local-vendor ../foo
+# $ local-vendor ~/go/src/github.com/me/foo
+# $ local-vendor ~/projects/foo github.com/me/foo
+#
+# Vars:
 # abs_path -> /Users/me/go/src/github.com/me/foo
 # import_path -> github.com/me/foo
 # vendor_path -> vendor/github.com/me/foo
@@ -17,7 +21,7 @@ function usage() {
 usage: local-vendor LOCALPATH [IMPORTPATH]
 
 Remove IMPORTPATH under vendor/ of current directory, link LOCALPATH as
-the new vendor.
+the new vendor package.
 EOF
 }
 
