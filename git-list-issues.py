@@ -12,7 +12,7 @@ Environment vars:
 - GIT_LIST_ISSUES_URL
 """
     # the `formatter_class` can make description & epilog show multiline
-    parser = argparse.ArgumentParser(description="List JIRA issues between commits", epilog=epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(description="List JIRA issues in commits", epilog=epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
 
     # arguments
     parser.add_argument('revision', metavar="REVISION", type=str, help="e.g. 1.9..1.10, c5f897f..6132241")
