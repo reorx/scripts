@@ -1,5 +1,9 @@
 #!/usr/bin/env PYTHONIOENCODING=UTF-8 /Users/reorx/.pyenv/versions/3.7.1/bin/python
 
+# Read before Use:
+# 1. Please change the absolute path of Python 3 executable in the first line
+# 2. Python version should be of 3.7+
+
 # <bitbar.title>Binance Price Ticker</bitbar.title>
 # <bitbar.version>v1.0</bitbar.version>
 # <bitbar.author>Reorx</bitbar.author>
