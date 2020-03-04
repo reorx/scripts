@@ -16,10 +16,43 @@
 # - [ ] ansi color for price up/down
 # - [ ] ratio for last n hours
 
+from typing import Optional
+import sys
 import json
+import subprocess
 from urllib.request import urlopen
 from http.client import HTTPResponse, HTTPException
 from dataclasses import dataclass, field
+
+
+# ref: https://stackoverflow.com/a/11511419/596206
+def get_screen_status(debug=False) -> Optional[dict]:
+    system_python = '/usr/bin/python'
+    code = """\
+import Quartz, json
+d = {'is_screen_active': False, 'data': None}
+_d = Quartz.CGSessionCopyCurrentDictionary()
+if _d and not _d.get('CGSSessionScreenIsLocked') and _d.get('kCGSSessionOnConsoleKey', 0):
+    d['is_screen_active'] = True
+    d['data'] = dict(_d.items())
+print(json.dumps(d))
+"""
+    p = subprocess.Popen([system_python], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    out, err = p.communicate(code.encode())
+    if debug:
+        print(f'returncode={p.returncode}\nout={out.decode()}\nerr={err.decode()}')
+    if p.returncode != 0:
+        return None
+    try:
+        return json.loads(out)
+    except ValueError:
+        return None
+
+
+screen = get_screen_status()
+if screen and not screen['is_screen_active']:
+    print('** NO SCREEN **')
+    sys.exit(0)
 
 
 style = '|font=Hack size=11'
@@ -64,15 +97,21 @@ for symbol in symbols:
     url = f'https://api.binance.com/api/v3/ticker/price?symbol={symbol}'
     try:
         resp: HTTPResponse = urlopen(url)
+        # read earily to trigger exceptions
+        resp_content: str = resp.read().decode()
     except HTTPException as e:
         state.error = f'Get {symbol} error: {e.__class__}: {e}'
         continue
 
     if resp.status != 200:
-        state.error = f'Get {symbol} error: {resp.status} {resp.read().decode()}'
+        state.error = f'Get {symbol} error: {resp.status} {resp_content}'
         continue
 
-    data = json.load(resp)
+    try:
+        data = json.loads(resp_content)
+    except ValueError as e:
+        state.error = f'{symbol} decode json error: {e}, {resp_content}'
+        continue
     state.price = float(data['price'])
     state.price_str = f'{state.price:.2f}'
 
@@ -88,3 +127,5 @@ for s in symbols:
     else:
         render(f'- Last Price: ${state.price_str}', ' color=#555')
     render('- View Chart', f' href={state.link}')
+
+get_screen_status()
