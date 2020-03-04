@@ -47,7 +47,7 @@ symbol_configs = [
     {
         'symbol': 'BTCUSDT',
         'type': SymbolType.spot,
-        #'acronym': 'B',
+        'acronym': 'B',
         'link': 'https://www.tradingview.com/symbols/BTCUSDT/?exchange=BINANCE',
     },
     {
@@ -192,12 +192,12 @@ def process_symbol(config):
     try:
         resp: HTTPResponse = urlopen(url)
         # read earily to trigger exceptions
-        resp_content: str = resp.read().decode()
+        try:
+            resp_content: str = resp.read().decode()
+        except IncompleteRead as e:
+            resp_content: str = e.partial.decode()
     except HTTPException as e:
-        if isinstance(e, IncompleteRead):
-            state.error = f'Get {symbol} error: IncompleteRead: {e.partial}'
-        else:
-            state.error = f'Get {symbol} error:\n{e.__class__}: {e}'
+        state.error = f'Get {symbol} error:\n{e.__class__}: {e}'
         return state
     finally:
         state.duration = cal_duration(t00)
