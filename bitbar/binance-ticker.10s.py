@@ -23,8 +23,9 @@ import sys
 import json
 import time
 import subprocess
+from multiprocessing import Pool
 from urllib.request import urlopen
-from http.client import HTTPResponse, HTTPException
+from http.client import HTTPResponse, HTTPException, IncompleteRead
 from dataclasses import dataclass, field
 
 
@@ -116,6 +117,7 @@ class State:
     price: float = field(default=0.0)
     price_str: str = field(default='⚠')
     error: str = field(default='')
+    duration: int = field(default=0)
 
     @property
     def id(self):
@@ -163,6 +165,10 @@ cyan = make_color(36)
 white = make_color(37)
 
 
+def cal_duration(t_s):
+    return int((time.time() - t_s) * 1000)
+
+
 ################
 # Main Process #
 ################
@@ -177,34 +183,35 @@ store = Store.load()
 new_store = Store.new()
 
 
-coin_states = []
-
-
-for config in symbol_configs:
+def process_symbol(config):
     state = State(**config)
-    coin_states.append(state)
     symbol = state.symbol
 
     url = api_urls[state.type].format(symbol=symbol)
+    t00 = time.time()
     try:
         resp: HTTPResponse = urlopen(url)
         # read earily to trigger exceptions
         resp_content: str = resp.read().decode()
     except HTTPException as e:
-        state.error = f'Get {symbol} error:\n{e.__class__}: {e}'
-        continue
+        if isinstance(e, IncompleteRead):
+            state.error = f'Get {symbol} error: IncompleteRead: {e.partial}'
+        else:
+            state.error = f'Get {symbol} error:\n{e.__class__}: {e}'
+        return state
+    finally:
+        state.duration = cal_duration(t00)
 
     if resp.status != 200:
         state.error = f'Get {symbol} error:\n{resp.status} {resp_content}'
-        continue
+        return state
 
     try:
         data = json.loads(resp_content)
     except ValueError as e:
         state.error = f'{symbol} decode json error:\n{e}, {resp_content}'
-        continue
+        return state
     state.price = float(data['price'])
-    new_store.prices[state.id] = state.price
     price_str = f'{state.price:.2f}'
 
     last_price = store.prices.get(state.id)
@@ -216,9 +223,18 @@ for config in symbol_configs:
             #price_str += red('⇂')
             price_str += red('↓')
     state.price_str = price_str
+    return state
+
+
+coin_states: list
+with Pool() as pool:
+    coin_states = pool.map(process_symbol, symbol_configs)
+
 
 summary_items = []
 for s in coin_states:
+    new_store.prices[s.id] = s.price
+
     if not s.acronym:
         continue
     summary_items.append(f'{s.acronym}:{s.price_str}')
@@ -232,11 +248,11 @@ for s in coin_states:
     if s.error:
         render(f'- Error: {s.error}')
     else:
-        render(black(f'- Price: ${s.price_str}, Last: ${store.prices.get(s.id, "")}'))
+        render(black(f'- Price: ${s.price_str}') + f', Last: ${store.prices.get(s.id, "")}')
     render('- View Chart', f' href={s.link}')
 
-duration = int((time.time() - t0) * 1000)
-print(f'Duration: {duration}ms')
+duration = cal_duration(t0)
+print(f'Duration: {duration}ms ({", ".join(str(s.duration) for s in coin_states)})|font=Helvtica size=11')
 
 
 # save new store
