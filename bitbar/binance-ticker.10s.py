@@ -13,10 +13,12 @@
 # <bitbar.dependencies>python</bitbar.dependencies>
 
 # TODO
-# - [ ] ansi color for price up/down
+# - [x] ansi color for price up/down
 # - [ ] ratio for last n hours
+# - [ ] margin symbol
 
 from typing import Optional
+import os
 import sys
 import json
 import time
@@ -66,6 +68,8 @@ api_urls = {
     SymbolType.spot: 'https://api.binance.com/api/v3/ticker/price?symbol={symbol}',
     SymbolType.future: 'https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}',
 }
+
+store_file_path = os.path.expanduser('~/.bitbar.binance-ticker.json')
 
 
 #####################
@@ -120,9 +124,43 @@ class State:
 
 @dataclass
 class Store:
-    timestamp: int
-    prices: dict
+    timestamp: float
+    prices: dict  # {'ETHUSDT-SPOT': 223.24}
     # h24_prices, h4_prices
+
+    @classmethod
+    def new(cls) -> 'Store':
+        return cls(timestamp=t0, prices={})
+
+    @classmethod
+    def load(cls) -> 'Store':
+        if not os.path.exists(store_file_path):
+            return cls.new()
+
+        with open(store_file_path, 'r') as f:
+            d = json.loads(f.read())
+        return cls(**d)
+
+    def save(self):
+        with open(store_file_path, 'w') as f:
+            f.write(json.dumps(self.__dict__))
+
+
+def make_color(code):
+    def color_func(s):
+        tpl = '\x1b[{}m{}\x1b[0m'
+        return tpl.format(code, s)
+    return color_func
+
+
+black = make_color(30)
+red = make_color(31)
+green = make_color(32)
+yellow = make_color(33)
+blue = make_color(34)
+magenta = make_color(35)
+cyan = make_color(36)
+white = make_color(37)
 
 
 ################
@@ -133,6 +171,10 @@ screen = get_screen_status()
 if screen and not screen['is_screen_active']:
     print('** NO SCREEN **')
     sys.exit(0)
+
+
+store = Store.load()
+new_store = Store.new()
 
 
 coin_states = []
@@ -149,22 +191,39 @@ for config in symbol_configs:
         # read earily to trigger exceptions
         resp_content: str = resp.read().decode()
     except HTTPException as e:
-        state.error = f'Get {symbol} error: {e.__class__}: {e}'
+        state.error = f'Get {symbol} error:\n{e.__class__}: {e}'
         continue
 
     if resp.status != 200:
-        state.error = f'Get {symbol} error: {resp.status} {resp_content}'
+        state.error = f'Get {symbol} error:\n{resp.status} {resp_content}'
         continue
 
     try:
         data = json.loads(resp_content)
     except ValueError as e:
-        state.error = f'{symbol} decode json error: {e}, {resp_content}'
+        state.error = f'{symbol} decode json error:\n{e}, {resp_content}'
         continue
     state.price = float(data['price'])
-    state.price_str = f'{state.price:.2f}'
+    new_store.prices[state.id] = state.price
+    price_str = f'{state.price:.2f}'
 
-summary = ' '.join([f'{s.acronym}:{s.price_str}' for s in coin_states if s.acronym])
+    last_price = store.prices.get(state.id)
+    if last_price is not None:
+        if state.price > last_price:
+            #price_str += green('↾')
+            price_str += green('↑')
+        else:
+            #price_str += red('⇂')
+            price_str += red('↓')
+    state.price_str = price_str
+
+summary_items = []
+for s in coin_states:
+    if not s.acronym:
+        continue
+    summary_items.append(f'{s.acronym}:{s.price_str}')
+
+summary = ' '.join(summary_items)
 render(summary + style)
 print('---')
 
@@ -173,8 +232,12 @@ for s in coin_states:
     if s.error:
         render(f'- Error: {s.error}')
     else:
-        render(f'- Last Price: ${s.price_str}', ' color=#555')
+        render(black(f'- Price: ${s.price_str}, Last: ${store.prices.get(s.id, "")}'))
     render('- View Chart', f' href={s.link}')
 
 duration = int((time.time() - t0) * 1000)
 print(f'Duration: {duration}ms')
+
+
+# save new store
+new_store.save()
