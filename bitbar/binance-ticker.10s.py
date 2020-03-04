@@ -25,6 +25,30 @@ from http.client import HTTPResponse, HTTPException
 from dataclasses import dataclass, field
 
 
+#################
+# Configuration #
+#################
+
+# configure symbols and links
+symbol_configs = {
+    'BTCUSDT': {
+        'acronym': 'B',
+        'link': 'https://www.tradingview.com/symbols/BTCUSDT/?exchange=BINANCE',
+    },
+    'ETHUSDT': {
+        'acronym': 'E',
+        'link': 'https://www.tradingview.com/symbols/ETHUSDT/?exchange=BINANCE',
+    },
+}
+
+# symbols will be displayed by the following order
+symbols = ['BTCUSDT', 'ETHUSDT']
+
+
+#####################
+# Utility Functions #
+#####################
+
 # ref: https://stackoverflow.com/a/11511419/596206
 def get_screen_status(debug=False) -> Optional[dict]:
     system_python = '/usr/bin/python'
@@ -49,29 +73,11 @@ print(json.dumps(d))
         return None
 
 
-screen = get_screen_status()
-if screen and not screen['is_screen_active']:
-    print('** NO SCREEN **')
-    sys.exit(0)
-
-
 style = '|font=Hack size=11'
 
 
 def render(s, extra_style=''):
     print(s + style + extra_style)
-
-
-symbol_configs = {
-    'BTCUSDT': {
-        'acronym': 'B',
-        'link': 'https://www.tradingview.com/symbols/BTCUSDT/?exchange=BINANCE',
-    },
-    'ETHUSDT': {
-        'acronym': 'E',
-        'link': 'https://www.tradingview.com/symbols/ETHUSDT/?exchange=BINANCE',
-    },
-}
 
 
 @dataclass
@@ -84,10 +90,17 @@ class State:
     error: str = field(default='')
 
 
+################
+# Main Process #
+################
+
+screen = get_screen_status()
+if screen and not screen['is_screen_active']:
+    print('** NO SCREEN **')
+    sys.exit(0)
+
+
 symbol_states = {}
-
-
-symbols = ['BTCUSDT', 'ETHUSDT']
 
 
 for symbol in symbols:
