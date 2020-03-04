@@ -19,30 +19,53 @@
 from typing import Optional
 import sys
 import json
+import time
 import subprocess
 from urllib.request import urlopen
 from http.client import HTTPResponse, HTTPException
 from dataclasses import dataclass, field
 
 
+t0 = time.time()
+
+
 #################
 # Configuration #
 #################
 
-# configure symbols and links
-symbol_configs = {
-    'BTCUSDT': {
-        'acronym': 'B',
+class SymbolType:
+    spot = 'SPOT'
+    future = 'FUTURE'
+    # margin = 'MARGIN'
+
+
+# configure symbols to monitor
+symbol_configs = [
+    {
+        'symbol': 'BTCUSDT',
+        'type': SymbolType.spot,
+        #'acronym': 'B',
         'link': 'https://www.tradingview.com/symbols/BTCUSDT/?exchange=BINANCE',
     },
-    'ETHUSDT': {
-        'acronym': 'E',
+    {
+        'symbol': 'ETHUSDT',
+        'type': SymbolType.future,
+        'acronym': 'E(F)',
         'link': 'https://www.tradingview.com/symbols/ETHUSDT/?exchange=BINANCE',
     },
-}
+    {
+        'symbol': 'ETHUSDT',
+        'type': SymbolType.spot,
+        #'acronym': 'E',
+        'link': 'https://www.tradingview.com/symbols/ETHUSDT/?exchange=BINANCE',
+    },
+]
 
-# symbols will be displayed by the following order
-symbols = ['BTCUSDT', 'ETHUSDT']
+
+api_urls = {
+    SymbolType.spot: 'https://api.binance.com/api/v3/ticker/price?symbol={symbol}',
+    SymbolType.future: 'https://fapi.binance.com/fapi/v1/ticker/price?symbol={symbol}',
+}
 
 
 #####################
@@ -83,11 +106,23 @@ def render(s, extra_style=''):
 @dataclass
 class State:
     symbol: str
-    acronym: str
+    type: str
     link: str
+    acronym: str = field(default='')
     price: float = field(default=0.0)
     price_str: str = field(default='⚠')
     error: str = field(default='')
+
+    @property
+    def id(self):
+        return f'{self.symbol}-{self.type}'
+
+
+@dataclass
+class Store:
+    timestamp: int
+    prices: dict
+    # h24_prices, h4_prices
 
 
 ################
@@ -100,14 +135,15 @@ if screen and not screen['is_screen_active']:
     sys.exit(0)
 
 
-symbol_states = {}
+coin_states = []
 
 
-for symbol in symbols:
-    state = State(symbol=symbol, **symbol_configs[symbol])
-    symbol_states[symbol] = state
+for config in symbol_configs:
+    state = State(**config)
+    coin_states.append(state)
+    symbol = state.symbol
 
-    url = f'https://api.binance.com/api/v3/ticker/price?symbol={symbol}'
+    url = api_urls[state.type].format(symbol=symbol)
     try:
         resp: HTTPResponse = urlopen(url)
         # read earily to trigger exceptions
@@ -128,17 +164,17 @@ for symbol in symbols:
     state.price = float(data['price'])
     state.price_str = f'{state.price:.2f}'
 
-summary = ' '.join([f'{symbol_states[s].acronym}:{symbol_states[s].price_str}' for s in symbols])
+summary = ' '.join([f'{s.acronym}:{s.price_str}' for s in coin_states if s.acronym])
 render(summary + style)
 print('---')
 
-for s in symbols:
-    state = symbol_states[s]
-    render(f'{s}', ' color=blue')
-    if state.error:
-        render(f'- Error: {state.error}')
+for s in coin_states:
+    render(f'{s.symbol} ({s.type})', ' color=blue')
+    if s.error:
+        render(f'- Error: {s.error}')
     else:
-        render(f'- Last Price: ${state.price_str}', ' color=#555')
-    render('- View Chart', f' href={state.link}')
+        render(f'- Last Price: ${s.price_str}', ' color=#555')
+    render('- View Chart', f' href={s.link}')
 
-get_screen_status()
+duration = int((time.time() - t0) * 1000)
+print(f'Duration: {duration}ms')
