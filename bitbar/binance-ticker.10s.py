@@ -47,19 +47,19 @@ symbol_configs = [
     {
         'symbol': 'BTCUSDT',
         'type': SymbolType.spot,
-        'acronym': 'B',
+        'acronym': '₿',
         'link': 'https://www.tradingview.com/symbols/BTCUSDT/?exchange=BINANCE',
     },
     {
         'symbol': 'ETHUSDT',
         'type': SymbolType.future,
-        'acronym': 'E(F)',
+        'acronym': 'Ξ(F)',
         'link': 'https://www.tradingview.com/symbols/ETHUSDT/?exchange=BINANCE',
     },
     {
         'symbol': 'ETHUSDT',
         'type': SymbolType.spot,
-        #'acronym': 'E',
+        #'acronym': 'Ξ',
         'link': 'https://www.tradingview.com/symbols/ETHUSDT/?exchange=BINANCE',
     },
 ]
