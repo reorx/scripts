@@ -1,5 +1,5 @@
 import re
-import sys
+import argparse
 from bs4 import BeautifulSoup
 
 
@@ -64,7 +64,17 @@ def get_texts_from_els(els):
 
 
 def main():
-    with open(sys.argv[1], 'r') as f:
+    parser = argparse.ArgumentParser(description="Convert HTML to markdown table")
+    # arguments
+    parser.add_argument('file', metavar="FILE", type=str, help="HTML input file")
+    # options
+    #parser.add_argument('-a', '--aa', type=int, default=0, help="")
+    #parser.add_argument('-b', '--bb', type=str, help="")
+    #parser.add_argument('-c', '--cc', action='store_true', help="")
+
+    args = parser.parse_args()
+
+    with open(args.file, 'r') as f:
         html = f.read()
 
     html_table_to_markdown(html)
