@@ -24,7 +24,7 @@ import json
 import time
 import subprocess
 from multiprocessing import Pool
-from urllib.request import urlopen
+from urllib.request import urlopen, URLError
 from http.client import HTTPResponse, HTTPException, IncompleteRead
 from dataclasses import dataclass, field
 
@@ -46,20 +46,26 @@ class SymbolType:
 symbol_configs = [
     {
         'symbol': 'BTCUSDT',
+        'type': SymbolType.future,
+        #'acronym': '₿(F)',
+        'link': 'https://www.tradingview.com/symbols/BTCUSDT/?exchange=BINANCE',
+    },
+    {
+        'symbol': 'ETHUSDT',
+        'type': SymbolType.future,
+        #'acronym': 'Ξ(F)',
+        'link': 'https://www.tradingview.com/chart/uS8ivF5I/',
+    },
+    {
+        'symbol': 'BTCUSDT',
         'type': SymbolType.spot,
         'acronym': '₿',
         'link': 'https://www.tradingview.com/symbols/BTCUSDT/?exchange=BINANCE',
     },
     {
         'symbol': 'ETHUSDT',
-        'type': SymbolType.future,
-        'acronym': 'Ξ(F)',
-        'link': 'https://www.tradingview.com/symbols/ETHUSDT/?exchange=BINANCE',
-    },
-    {
-        'symbol': 'ETHUSDT',
         'type': SymbolType.spot,
-        #'acronym': 'Ξ',
+        'acronym': 'Ξ',
         'link': 'https://www.tradingview.com/symbols/ETHUSDT/?exchange=BINANCE',
     },
 ]
@@ -190,13 +196,13 @@ def process_symbol(config):
     url = api_urls[state.type].format(symbol=symbol)
     t00 = time.time()
     try:
-        resp: HTTPResponse = urlopen(url)
+        resp: HTTPResponse = urlopen(url, timeout=3)
         # read earily to trigger exceptions
         try:
             resp_content: str = resp.read().decode()
         except IncompleteRead as e:
             resp_content: str = e.partial.decode()
-    except HTTPException as e:
+    except (HTTPException, URLError) as e:
         state.error = f'Get {symbol} error:\n{e.__class__}: {e}'
         return state
     finally:
