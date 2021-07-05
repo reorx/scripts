@@ -1,0 +1,26 @@
+#!/bin/bash
+
+# loop each folder and do `go mod download` if `go.mod` exists
+
+if [ -z "$1" ]; then
+    echo "Please specify go mod command(s)"
+    exit 1
+fi
+
+set -e
+
+for i in `ls`; do
+    if [ -f "$i" ]; then
+        continue
+    fi
+    mod_file="$i/go.mod"
+    if [ ! -f "$mod_file" ]; then
+        continue
+    fi
+    pushd "$i" >/dev/null
+    for cmd in "$@"; do
+        echo "Run 'go mod $cmd' for $mod_file"
+        go mod "$cmd"
+    done
+    popd >/dev/null
+done
