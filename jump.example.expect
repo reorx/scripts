@@ -1,0 +1,29 @@
+#!/usr/bin/expect -f
+
+set timeout 30
+
+set cmd [lindex $argv 0]
+set password ""
+
+if {$cmd eq ""} {
+    # 输入 p 进行显示您有权限的主机
+    set cmd "p"
+}
+
+spawn ssh jump-host
+
+expect {
+    "Are you sure you want to continue connecting*" {
+        send "yes\n"
+        exp_continue
+    }
+    "*password*" {
+        send "$password\n"
+        exp_continue
+    }
+    "*Opt*" {
+        send "$cmd\r"
+    }
+}
+
+interact
