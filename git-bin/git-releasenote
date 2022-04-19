@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+tags=($(git tag --sort=-creatordate))
+
+echo "Release note from ${tags[1]} to ${tags[0]}"
+git log --format=format:'- %s (%h)' ${tags[1]}...${tags[0]}
