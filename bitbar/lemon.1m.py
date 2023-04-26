@@ -1,33 +1,24 @@
-#!/usr/bin/env PYTHONIOENCODING=UTF-8 /Users/reorx/.pyenv/versions/3.10.6/bin/python
+#!/usr/bin/env PYTHONIOENCODING=UTF-8 python3
 
 # Read before Use:
 # 1. Please change the absolute path of Python 3 executable in the first line
 # 2. Python version should be of 3.7+
 
-# <bitbar.title>Binance Price Ticker</bitbar.title>
+# <bitbar.title>Lemon Revenue Indicator</bitbar.title>
 # <bitbar.version>v1.0</bitbar.version>
 # <bitbar.author>Reorx</bitbar.author>
 # <bitbar.author.github>reorx</bitbar.author.github>
-# <bitbar.desc>Displays Binance's ticker price for configured coin pairs</bitbar.desc>
-# <bitbar.image>https://i.imgur.com/zJsoTl8.jpg</bitbar.image>
+# <bitbar.desc>Displays your store revenue from Lemon Squeezy</bitbar.desc>
 # <bitbar.dependencies>python</bitbar.dependencies>
-
-# TODO
-# - [x] ansi color for price up/down
-# - [ ] ratio for last n hours
-# - [ ] margin symbol
 
 import os
 import json
 from pathlib import Path
-import time
 import datetime
 from typing import Optional, Tuple, Union
 from urllib import request, parse
 from http.client import HTTPResponse, IncompleteRead
 
-
-t0 = time.time()
 
 
 #################
