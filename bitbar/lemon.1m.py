@@ -1,9 +1,10 @@
 #!/usr/bin/env PYTHONIOENCODING=UTF-8 python3
 
 # Read before Use:
-# 1. Please change the absolute path of Python 3 executable in the first line
-# 2. Python version should be of 3.7+
-
+# 1. Please ensure that python3 is installed on your MacOS
+# 2. Please create the file `~/.config/xbar/lemonsqueezy.json` and put "api_key" and "store_id" in it before using the script
+# 3. The script should be put at `~/Library/Application Support/xbar/plugins`. See xbar documentation: https://github.com/matryer/xbar#the-plugin-directory
+#
 # <bitbar.title>Lemon Revenue Indicator</bitbar.title>
 # <bitbar.version>v1.0</bitbar.version>
 # <bitbar.author>Reorx</bitbar.author>
