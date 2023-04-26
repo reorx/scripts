@@ -34,6 +34,7 @@ with open(config_path, 'r') as f:
 
 API_KEY = config['api_key']
 STORE_ID = config['store_id']
+DISPLAY_CURRENCY = config.get('display_currency', 'USD')
 
 
 #####################
@@ -70,21 +71,42 @@ def http_request(method, url, params=None, headers=None, data: Optional[Union[di
     return res, body_b
 
 
-def get_usd_cny_rate():
-    rate_path = xbar_config_dir.joinpath('usd_cny.json')
+def get_usd_currency_rate(currency: str):
+    currency_lower = currency.lower()
+    rate_path = xbar_config_dir.joinpath(f'{default_currency}_{currency}.json')
     if rate_path.exists():
         with open(rate_path, 'r') as f:
             rate_data = json.load(f)
             today = datetime.datetime.now().strftime('%Y-%m-%d')
             if rate_data['date'] == today:
-                return rate_data['cny']
-    url = 'https://cdn.jsdelivr.net/gh/fawazahmed0/currency-api@1/latest/currencies/usd/cny.json'
+                return rate_data[currency_lower]
+    url = f'https://cdn.jsdelivr.net/gh/fawazahmed0/currency-api@1/latest/currencies/{default_currency.lower()}/{currency_lower}.json'
     _, body_b = http_request('GET', url)
     data = json.loads(body_b)
     with open(rate_path, 'w') as f:
         json.dump(data, f)
-    return data['cny']
+    return data[currency_lower]
 
+
+default_currency = 'USD'
+currency_symbol_map = {
+  "USD": "$",
+  "EUR": "€",
+  "JPY": "¥",
+  "GBP": "£",
+  "AUD": "$",
+  "CAD": "$",
+  "CHF": "CHF",
+  "CNY": "¥",
+  "HKD": "$",
+  "NZD": "$"
+}
+
+def format_money(n, currency):
+    v = n
+    if currency != default_currency:
+        v = n * get_usd_currency_rate(currency)
+    return f'{currency_symbol_map.get(currency, "")}{v/100:.0f}'
 
 
 ################
@@ -102,17 +124,14 @@ def main():
     _, body_b = http_request('GET', url, headers=headers)
     data = json.loads(body_b)
     attrs = data['data']['attributes']
-    def format_money(n):
-        v = n * get_usd_cny_rate() / 100
-        return f'{v:.0f}'
-    text = f'{attrs["name"]}: {format_money(attrs["total_revenue"])} {attrs["currency"]}'
+    text = f'{attrs["name"]}: {format_money(attrs["total_revenue"], DISPLAY_CURRENCY)}'
     render(text)
     print('---')
-    submenu_keys = ['total_sales', 'thirty_day_sales', 'thirty_day_revenue', 'updated_at']
+    submenu_keys = ['total_sales', 'thirty_day_revenue', 'thirty_day_sales']
     for key in submenu_keys:
         value = attrs[key]
         if key.endswith('revenue'):
-            value = format_money(value)
+            value = format_money(value, DISPLAY_CURRENCY)
         render(f'{key}: {value}')
 
 main()
