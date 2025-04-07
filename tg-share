@@ -1,0 +1,39 @@
+#!/bin/bash
+
+category="$1"
+input="$2"
+
+if [ -z "$input" ]; then
+    echo "Please input what to share"
+    exit 1
+fi
+
+if [ -z "$TELEGRAM_BOT_TOKEN" ]; then
+    echo "Please set TELEGRAM_BOT_TOKEN"
+    exit 1
+fi
+
+if [ "$category" = "thought" ]; then
+    text="💭 $input #thought"
+elif [ "$category" = "recipe" ]; then
+    url="$3"
+    text="🍳 $input #recipe\n\n$url"
+fi
+
+code="$(cat<<EOF
+import sys, json;
+print(json.dumps({
+"chat_id": "@reorx_share",
+"parse_mode": "HTML",
+"text": sys.argv[1],
+}))
+EOF
+)"
+echo  "$code"
+
+data=$(python -c "$code" "$text")
+echo "$data"
+
+curl "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/sendMessage" \
+    -X POST -H "Content-Type: application/json" \
+    -d "$data"
