@@ -3,9 +3,10 @@
 # Set default quality / optimization parameters if not set.
 : ${JPEG_QUALITY:=80}
 : ${PNGQUANT_SPEED:=3}
-: ${GIF_COLORS:=64}
+: ${GIF_COLORS:=}
 : ${GIF_LOSSY_LEVEL:=40}
 : ${GIF_RESIZE_P:=65}
+: ${SHOW_OPTIMIZE_OUTPUT:=}
 
 # Function to ensure a required command is installed.
 ensure_command_installed() {
@@ -60,12 +61,15 @@ compress_png() {
     local new_ext=".new.png"
     local old_size_kb
     old_size_kb=$(get_file_size "$file")
-    pngquant --speed "$PNGQUANT_SPEED" --ext "${new_ext}" "$file"
+    # Store only stdout in out variable.
+    local out
+    out=$(pngquant --speed "$PNGQUANT_SPEED" --ext "${new_ext}" "$file")
     if [ $? -eq 0 ]; then
         local base_name="${file%.*}"
         local new_image="${base_name}${new_ext}"
         mv "$new_image" "$file"
         echo_size_comparison "$file" "$old_size_kb"
+        [ -n "$SHOW_OPTIMIZE_OUTPUT" ] && echo "$out"
     else
         echo "PNG compression failed for '$file'. The original image remains unchanged."
         exit 1
@@ -78,9 +82,11 @@ compress_jpg() {
     backup_file "$file"
     local old_size_kb
     old_size_kb=$(get_file_size "$file")
-    jpegoptim --max="$JPEG_QUALITY" "$file"
+    local out
+    out=$(jpegoptim --max="$JPEG_QUALITY" "$file")
     if [ $? -eq 0 ]; then
         echo_size_comparison "$file" "$old_size_kb"
+        [ -n "$SHOW_OPTIMIZE_OUTPUT" ] && echo "$out"
     else
         echo "JPEG compression failed for '$file'. The original image remains unchanged."
         exit 1
@@ -94,9 +100,15 @@ compress_gif() {
     local old_size_kb
     old_size_kb=$(get_file_size "$file")
     local resize_param="${GIF_RESIZE_P}x${GIF_RESIZE_P}%"
-    gifsicle --batch -O3 --colors "$GIF_COLORS" --lossy="$GIF_LOSSY_LEVEL" --resize-geometry "$resize_param" "$file"
+    local out
+    local extra_args=""
+    if [ -n "$GIF_COLORS" ]; then
+        extra_args="--colors $GIF_COLORS"
+    fi
+    out=$(gifsicle --batch -O3 --lossy="$GIF_LOSSY_LEVEL" --resize-geometry "$resize_param" $extra_args "$file")
     if [ $? -eq 0 ]; then
         echo_size_comparison "$file" "$old_size_kb"
+        [ -n "$SHOW_OPTIMIZE_OUTPUT" ] && echo "$out"
     else
         echo "GIF compression failed for '$file'. The original image remains unchanged."
         exit 1
