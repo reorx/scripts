@@ -24,18 +24,27 @@ get_file_size() {
     echo $(( size_bytes / 1024 ))
 }
 
+# Function to output size comparison after compression.
+echo_size_comparison() {
+    local file="$1"
+    local old_size="$2"
+    local new_size
+    new_size=$(get_file_size "$file")
+    echo "'$file' compressed   (size ${old_size}KB -> ${new_size}KB)"
+}
+
 # Function to compress PNG images with pngquant
 compress_png() {
     local file="$1"
     local new_ext=".new.png"
+    local old_size_kb
+    old_size_kb=$(get_file_size "$file")
     pngquant --speed "$PNGQUANT_SPEED" --ext "${new_ext}" "$file"
     if [ $? -eq 0 ]; then
         local base_name="${file%.*}"
         local new_image="${base_name}${new_ext}"
-        local old_size_kb=$(get_file_size "$file")
-        local new_size_kb=$(get_file_size "$new_image")
         mv "$new_image" "$file"
-        echo "Replaced '$file' (Old Size: ${old_size_kb} KB) with compressed PNG (New Size: ${new_size_kb} KB)."
+        echo_size_comparison "$file" "$old_size_kb"
     else
         echo "PNG compression failed for '$file'. The original image remains unchanged."
         exit 1
@@ -45,11 +54,11 @@ compress_png() {
 # Function to compress JPEG images with jpegoptim
 compress_jpg() {
     local file="$1"
-    local old_size_kb=$(get_file_size "$file")
+    local old_size_kb
+    old_size_kb=$(get_file_size "$file")
     jpegoptim --max="$JPEG_QUALITY" "$file"
     if [ $? -eq 0 ]; then
-        local new_size_kb=$(get_file_size "$file")
-        echo "Compressed '$file' (Old Size: ${old_size_kb} KB, New Size: ${new_size_kb} KB) using jpegoptim with quality set to ${JPEG_QUALITY}."
+        echo_size_comparison "$file" "$old_size_kb"
     else
         echo "JPEG compression failed for '$file'. The original image remains unchanged."
         exit 1
@@ -59,12 +68,12 @@ compress_jpg() {
 # Function to compress GIF images with gifsicle
 compress_gif() {
     local file="$1"
-    local old_size_kb=$(get_file_size "$file")
+    local old_size_kb
+    old_size_kb=$(get_file_size "$file")
     local resize_param="${GIF_RESIZE_P}x${GIF_RESIZE_P}%"
     gifsicle --batch -O3 --colors "$GIF_COLORS" --lossy="$GIF_LOSSY_LEVEL" --resize-geometry "$resize_param" "$file"
     if [ $? -eq 0 ]; then
-        local new_size_kb=$(get_file_size "$file")
-        echo "Compressed '$file' (Old Size: ${old_size_kb} KB, New Size: ${new_size_kb} KB) using gifsicle with colors=${GIF_COLORS}, lossy=${GIF_LOSSY_LEVEL}, resize=${resize_param}."
+        echo_size_comparison "$file" "$old_size_kb"
     else
         echo "GIF compression failed for '$file'. The original image remains unchanged."
         exit 1
