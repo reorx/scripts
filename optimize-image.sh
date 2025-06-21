@@ -33,9 +33,30 @@ echo_size_comparison() {
     echo "'$file' compressed   (size ${old_size}KB -> ${new_size}KB)"
 }
 
+# Function to create a backup of the file.
+# The backup is only made if BACKUP_DIR environment variable is set.
+# If BACKUP_DIR is not provided, the function returns immediately (no-op).
+# Backup file will have name format: basename.YYYY-MM-DD-HH-MM.ext
+backup_file() {
+    local file="$1"
+    if [ -z "$BACKUP_DIR" ]; then
+        return
+    fi
+    mkdir -p "$BACKUP_DIR"
+    local filename
+    filename=$(basename -- "$file")
+    local base_name="${filename%.*}"
+    local ext="${filename##*.}"
+    local timestamp
+    timestamp=$(date +"%Y-%m-%d-%H-%M")
+    local new_name="${base_name}.${timestamp}.${ext}"
+    cp "$file" "$BACKUP_DIR/$new_name"
+}
+
 # Function to compress PNG images with pngquant
 compress_png() {
     local file="$1"
+    backup_file "$file"
     local new_ext=".new.png"
     local old_size_kb
     old_size_kb=$(get_file_size "$file")
@@ -54,6 +75,7 @@ compress_png() {
 # Function to compress JPEG images with jpegoptim
 compress_jpg() {
     local file="$1"
+    backup_file "$file"
     local old_size_kb
     old_size_kb=$(get_file_size "$file")
     jpegoptim --max="$JPEG_QUALITY" "$file"
@@ -68,6 +90,7 @@ compress_jpg() {
 # Function to compress GIF images with gifsicle
 compress_gif() {
     local file="$1"
+    backup_file "$file"
     local old_size_kb
     old_size_kb=$(get_file_size "$file")
     local resize_param="${GIF_RESIZE_P}x${GIF_RESIZE_P}%"
