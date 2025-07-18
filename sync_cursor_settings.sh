@@ -26,6 +26,7 @@ load_settings() {
   local source_name="$1"
   if [ -z "$source_name" ]; then
     echo "Error: Must specify a name to load settings from"
+    ls -l "$sync_root"
     exit 1
   fi
 
