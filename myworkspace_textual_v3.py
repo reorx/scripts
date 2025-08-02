@@ -16,11 +16,11 @@ from typing import Optional, List, Dict, Tuple
 
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
-from textual.widgets import Header, Footer, Static, Button, Label
+from textual.widgets import Header, Footer, Static, Button, Label, LoadingIndicator
 from textual.message import Message
 from textual.reactive import reactive
 from textual.events import Click
-from textual import on
+from textual import on, work
 from textual.css.query import NoMatches
 
 
@@ -37,12 +37,12 @@ class WorkingDirStatus(Enum):
 
 # Ordered status combinations with their priority emojis
 STATUS_PRIORITY_ORDER = OrderedDict([
-    ((SyncStatus.OUT_OF_SYNC, WorkingDirStatus.DIRTY), "❗"),
-    ((SyncStatus.SYNC, WorkingDirStatus.DIRTY), "⚠️"),
-    ((SyncStatus.OUT_OF_SYNC, WorkingDirStatus.CLEAN), "⚠️"),
-    ((SyncStatus.OUT_OF_SYNC, WorkingDirStatus.UNTRACKED), "⚠️"),
-    ((SyncStatus.SYNC, WorkingDirStatus.UNTRACKED), "✅"),
-    ((SyncStatus.SYNC, WorkingDirStatus.CLEAN), "✅"),
+    ((SyncStatus.OUT_OF_SYNC, WorkingDirStatus.DIRTY), "🔴"),
+    ((SyncStatus.SYNC, WorkingDirStatus.DIRTY), "🟡"),
+    ((SyncStatus.OUT_OF_SYNC, WorkingDirStatus.CLEAN), "🟡"),
+    ((SyncStatus.OUT_OF_SYNC, WorkingDirStatus.UNTRACKED), "🟡"),
+    ((SyncStatus.SYNC, WorkingDirStatus.UNTRACKED), "🟢"),
+    ((SyncStatus.SYNC, WorkingDirStatus.CLEAN), "🟢"),
 ])
 
 
@@ -176,35 +176,46 @@ class RegularDir:
         self.name = name
 
 
-class DirectoryButton(Static):
-    """Static widget representing a directory"""
+class DirectoryWidget(Static):
+    """Focusable directory widget"""
     
     DEFAULT_CSS = """
-    DirectoryButton {
-        background: $surface;
+    DirectoryWidget {
+        background: #404040;
         margin: 0 1;
         padding: 0 1;
         min-width: 8;
         max-width: 20;
+        width: auto;
         height: 1;
         text-align: center;
+        display: block;
     }
-    DirectoryButton:hover {
+    DirectoryWidget:focus {
         background: $accent;
+        text-style: bold underline;
     }
-    DirectoryButton:focus {
-        background: $success;
+    DirectoryWidget.git-dir {
+        background: #404040;
+    }
+    DirectoryWidget.git-dir:focus {
+        background: $accent;
+        text-style: bold underline;
+    }
+    DirectoryWidget.regular-dir {
+        background: #404040;
+    }
+    DirectoryWidget.regular-dir:focus {
+        background: $accent;
+        text-style: bold underline;
     }
     """
     
     def __init__(self, dir_obj, *args, **kwargs):
         self.dir_obj = dir_obj
         super().__init__(dir_obj.name, *args, **kwargs)
-        
-        # Make it focusable and clickable
         self.can_focus = True
         
-        # Set style based on directory type
         if isinstance(dir_obj, GitDir):
             self.add_class("git-dir")
         else:
@@ -215,40 +226,27 @@ class MyWorkspaceApp(App):
     """MyWorkspace TUI Application with Textual"""
     
     CSS = """
-    .git-dir {
-        background: $success-darken-2;
-        margin: 0 1;
-        min-width: 8;
-        max-width: 20;
-        height: 1;
-        text-align: center;
-        padding: 0 1;
-    }
-    
-    .regular-dir {
-        background: $warning-darken-2;
-        margin: 0 1;
-        min-width: 8;
-        max-width: 20;
-        height: 1;
-        text-align: center;
-        padding: 0 1;
-    }
-    
-    .git-dir:focus {
-        background: $success;
-    }
-    
-    .regular-dir:focus {
-        background: $warning;
-    }
-    
     .group-title {
         text-style: bold;
         color: $text;
         margin: 1 0;
-        padding: 1;
         background: $surface;
+        height: auto;
+        min-height: 1;
+    }
+    
+    .group-title.selected {
+        background: $primary;
+        color: $text;
+    }
+    
+    .directories-row {
+        layout: horizontal;
+        margin: 0 1 1 1;
+        padding: 0;
+        width: 100%;
+        height: auto;
+        min-height: 1;
     }
     
     .detail-view {
@@ -275,14 +273,51 @@ class MyWorkspaceApp(App):
         min-height: 3;
     }
     
+    .compact-button {
+        min-width: 8;
+        margin: 0 1;
+        padding: 0 1;
+    }
+    
     #main-scroll {
         padding: 1;
+        height: 1fr;
+        width: 100%;
+    }
+    
+    #main-container {
+        height: 1fr;
+    }
+    
+    .loading-container {
+        height: 1fr;
+        width: 100%;
+        align: center middle;
+    }
+    
+    .loading-text {
+        text-align: center;
+        margin: 1 0;
+        color: $accent;
+    }
+    
+    /* Allow nested containers to size to content */
+    Vertical {
+        height: auto;
+    }
+    
+    Horizontal {
+        height: auto;
+    }
+    
+    .dirs-container {
+        height: auto;
     }
     """
 
     BINDINGS = [
-        #("j", "move_down", "Move Down"),
-        #("k", "move_up", "Move Up"),
+        ("j", "next_group", "Next Group"),
+        ("k", "prev_group", "Previous Group"),
         ("h", "move_left", "Move Left"),
         ("l", "move_right", "Move Right"),
         ("enter", "select", "Select"),
@@ -300,6 +335,9 @@ class MyWorkspaceApp(App):
         self.current_view = "main"
         self.selected_dir: Optional[GitDir] = None
         self.operation_result = ""
+        self.current_group_index = 0
+        self.group_widgets: List[List[DirectoryWidget]] = []
+        self.is_loading = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -309,6 +347,13 @@ class MyWorkspaceApp(App):
     async def on_mount(self) -> None:
         """Initialize the application"""
         self.title = f"MyWorkspace TUI - {self.current_dir}"
+        await self.show_loading("Scanning directories...")
+        self.load_directories()
+
+    @work
+    async def load_directories(self):
+        """Load directories in background"""
+        await asyncio.sleep(0.1)  # Give UI time to update
         self.scan_directories()
         await self.show_main_view()
 
@@ -345,18 +390,36 @@ class MyWorkspaceApp(App):
                 self.groups.append((key, emoji, groups_dict[key]))
 
         if self.regular_dirs:
-            self.groups.append((None, "📁", self.regular_dirs))
+            self.groups.append((None, "⚪", self.regular_dirs))
+
+    async def show_loading(self, message: str = "Loading..."):
+        """Show loading indicator with message"""
+        self.is_loading = True
+        container = self.query_one("#main-container")
+        await container.remove_children()
+        
+        loading_container = Vertical(classes="loading-container")
+        await container.mount(loading_container)
+        
+        loading_text = Label(message, classes="loading-text")
+        loading_indicator = LoadingIndicator()
+        
+        await loading_container.mount(loading_text)
+        await loading_container.mount(loading_indicator)
 
     async def show_main_view(self):
         """Show the main view"""
         self.current_view = "main"
+        self.is_loading = False
         container = self.query_one("#main-container")
         await container.remove_children()
 
         scroll_view = ScrollableContainer(id="main-scroll")
         await container.mount(scroll_view)
 
-        for group_key, emoji, dirs in self.groups:
+        self.group_widgets = []
+
+        for group_index, (group_key, emoji, dirs) in enumerate(self.groups):
             # Add group title
             if group_key:
                 sync_status, working_status = group_key
@@ -365,20 +428,33 @@ class MyWorkspaceApp(App):
                 title_text = f"{emoji} Non-Git Directories ({len(dirs)})"
             
             group_title = Label(title_text, classes="group-title")
+            if group_index == self.current_group_index:
+                group_title.add_class("selected")
             await scroll_view.mount(group_title)
             
-            # Add directory buttons in horizontal layout
-            dir_container = Horizontal()
-            await scroll_view.mount(dir_container)
+            # Create rows of directories (wrap every 6 items)
+            dirs_container = Vertical(classes="dirs-container")
+            await scroll_view.mount(dirs_container)
             
-            for dir_obj in dirs:
-                # Create simple clickable text using markup
-                if isinstance(dir_obj, GitDir):
-                    clickable_text = Static(f"[@click=select_dir('{dir_obj.name}')]{dir_obj.name}[/]", classes="git-dir")
-                else:
-                    clickable_text = Static(f"{dir_obj.name}", classes="regular-dir")
-                clickable_text.dir_obj = dir_obj  # Attach the directory object
-                await dir_container.mount(clickable_text)
+            # Add directory widgets in rows
+            group_dir_widgets = []
+            dirs_per_row = 6
+            for i in range(0, len(dirs), dirs_per_row):
+                row_dirs = dirs[i:i + dirs_per_row]
+                row_container = Horizontal(classes="directories-row")
+                await dirs_container.mount(row_container)
+                
+                for dir_obj in row_dirs:
+                    dir_widget = DirectoryWidget(dir_obj)
+                    group_dir_widgets.append(dir_widget)
+                    await row_container.mount(dir_widget)
+            
+            self.group_widgets.append(group_dir_widgets)
+
+        # Focus on first directory of current group
+        if self.groups and self.group_widgets:
+            if self.group_widgets[self.current_group_index]:
+                self.group_widgets[self.current_group_index][0].focus()
 
     async def show_detail_view(self, git_dir: GitDir):
         """Show the detail view for a selected directory"""
@@ -387,8 +463,12 @@ class MyWorkspaceApp(App):
         container = self.query_one("#main-container")
         await container.remove_children()
 
+        # Create scrollable container for detail view
+        scroll_view = ScrollableContainer()
+        await container.mount(scroll_view)
+        
         detail_view = Vertical(classes="detail-view")
-        await container.mount(detail_view)
+        await scroll_view.mount(detail_view)
 
         # Title
         title = Label(f"Directory Details - {git_dir.name}", classes="section-title")
@@ -415,18 +495,20 @@ class MyWorkspaceApp(App):
         ops_section = Horizontal()
         await detail_view.mount(ops_section)
         
-        pull_btn = Button("Pull", id="pull", variant="primary")
-        push_btn = Button("Push", id="push", variant="success")
-        fetch_btn = Button("Fetch", id="fetch", variant="warning")
+        pull_btn = Button("Pull", id="pull", variant="primary", classes="compact-button")
+        push_btn = Button("Push", id="push", variant="success", classes="compact-button")
+        fetch_btn = Button("Fetch", id="fetch", variant="warning", classes="compact-button")
         
         await ops_section.mount(pull_btn)
         await ops_section.mount(push_btn)
         await ops_section.mount(fetch_btn)
 
-        # Detailed status section
-        await detail_view.mount(Label("Detailed Status", classes="section-title"))
+        # Detailed status section with border
+        detail_status_section = Vertical(classes="detail-section")
+        await detail_view.mount(detail_status_section)
+        await detail_status_section.mount(Label("Detailed Status", classes="section-title"))
         detailed_status = Static(git_dir.detailed_status or "No detailed status available")
-        await detail_view.mount(detailed_status)
+        await detail_status_section.mount(detailed_status)
 
         # Operation result section
         if self.operation_result:
@@ -434,44 +516,41 @@ class MyWorkspaceApp(App):
             await detail_view.mount(result_section)
 
         # Back button
-        back_btn = Button("Back", id="back", variant="error")
+        back_btn = Button("Back", id="back", variant="error", classes="compact-button")
         await detail_view.mount(back_btn)
 
-    @on(Click, ".git-dir")
-    async def on_git_directory_click(self, event: Click) -> None:
-        """Handle git directory clicks"""
+    @on(Click, "DirectoryWidget")
+    async def on_directory_click(self, event: Click) -> None:
+        """Handle directory clicks"""
         if hasattr(event.widget, 'dir_obj') and isinstance(event.widget.dir_obj, GitDir):
             await self.show_detail_view(event.widget.dir_obj)
 
     @on(Button.Pressed, "#pull")
     async def handle_pull(self) -> None:
         if self.selected_dir:
-            self.operation_result = "Running git pull..."
-            await self.show_detail_view(self.selected_dir)  # Refresh view
-            result = await self.selected_dir.git_operation("pull")
+            await self.show_loading(f"Running git pull in {self.selected_dir.name}...")
+            self.perform_git_operation("pull")
+
+    @work
+    async def perform_git_operation(self, operation: str):
+        """Perform git operation in background"""
+        if self.selected_dir:
+            result = await self.selected_dir.git_operation(operation)
             self.operation_result = result
             self.selected_dir.analyze_status()
-            await self.show_detail_view(self.selected_dir)  # Update view
+            await self.show_detail_view(self.selected_dir)
 
     @on(Button.Pressed, "#push")
     async def handle_push(self) -> None:
         if self.selected_dir:
-            self.operation_result = "Running git push..."
-            await self.show_detail_view(self.selected_dir)
-            result = await self.selected_dir.git_operation("push")
-            self.operation_result = result
-            self.selected_dir.analyze_status()
-            await self.show_detail_view(self.selected_dir)
+            await self.show_loading(f"Running git push in {self.selected_dir.name}...")
+            self.perform_git_operation("push")
 
     @on(Button.Pressed, "#fetch")
     async def handle_fetch(self) -> None:
         if self.selected_dir:
-            self.operation_result = "Running git fetch..."
-            await self.show_detail_view(self.selected_dir)
-            result = await self.selected_dir.git_operation("fetch")
-            self.operation_result = result
-            self.selected_dir.analyze_status()
-            await self.show_detail_view(self.selected_dir)
+            await self.show_loading(f"Running git fetch in {self.selected_dir.name}...")
+            self.perform_git_operation("fetch")
 
     @on(Button.Pressed, "#back")
     async def handle_back(self) -> None:
@@ -486,48 +565,84 @@ class MyWorkspaceApp(App):
 
     async def action_refresh(self) -> None:
         """Refresh the directory scan"""
+        await self.show_loading("Refreshing directories...")
+        self.refresh_directories()
+
+    @work
+    async def refresh_directories(self):
+        """Refresh directories in background"""
+        await asyncio.sleep(0.1)  # Give UI time to update
         self.scan_directories()
         if self.current_view == "main":
             await self.show_main_view()
         elif self.current_view == "detail" and self.selected_dir:
             self.selected_dir.analyze_status()
             await self.show_detail_view(self.selected_dir)
-    
-    async def action_select_dir(self, dir_name: str) -> None:
-        """Handle directory selection via markup click"""
-        # Find the directory object by name
-        for git_dir in self.git_dirs:
-            if git_dir.name == dir_name:
-                await self.show_detail_view(git_dir)
-                break
 
     async def action_select(self) -> None:
         """Handle enter key"""
         if self.current_view == "main":
-            try:
-                focused = self.focused
-                if isinstance(focused, DirectoryButton) and isinstance(focused.dir_obj, GitDir):
-                    await self.show_detail_view(focused.dir_obj)
-            except (NoMatches, AttributeError):
-                pass
+            focused = self.focused
+            if isinstance(focused, DirectoryWidget) and isinstance(focused.dir_obj, GitDir):
+                await self.show_detail_view(focused.dir_obj)
 
-    def action_move_down(self) -> None:
-        """Move focus down"""
-        self.screen.focus_next()
+    async def update_group_selection(self) -> None:
+        """Update group title selection without rebuilding the entire UI"""
+        try:
+            # Find all group title labels and update their selection state
+            group_titles = self.query(".group-title")
+            for index, title in enumerate(group_titles):
+                if index == self.current_group_index:
+                    title.add_class("selected")
+                else:
+                    title.remove_class("selected")
+            
+            # Focus on first directory of current group
+            if self.groups and self.group_widgets:
+                if self.group_widgets[self.current_group_index]:
+                    self.group_widgets[self.current_group_index][0].focus()
+        except Exception:
+            # Fallback to full refresh if update fails
+            await self.show_main_view()
 
-    def action_move_up(self) -> None:
-        """Move focus previous"""
-        self.screen.focus_previous()
+    async def action_next_group(self) -> None:
+        """Move to next group and focus first directory"""
+        if self.current_view == "main" and self.groups:
+            self.current_group_index = (self.current_group_index + 1) % len(self.groups)
+            await self.update_group_selection()
+
+    async def action_prev_group(self) -> None:
+        """Move to previous group and focus first directory"""
+        if self.current_view == "main" and self.groups:
+            self.current_group_index = (self.current_group_index - 1) % len(self.groups)
+            await self.update_group_selection()
+
 
     def action_move_left(self) -> None:
-        """Move focus left"""
-        # For horizontal layouts, this might need custom implementation
-        pass
+        """Move focus left within current group"""
+        if self.current_view == "main" and self.group_widgets:
+            current_group = self.group_widgets[self.current_group_index]
+            if current_group:
+                focused = self.focused
+                if isinstance(focused, DirectoryWidget) and focused in current_group:
+                    current_index = current_group.index(focused)
+                    if current_index > 0:
+                        current_group[current_index - 1].focus()
+                    else:
+                        current_group[-1].focus()  # Wrap to end
 
     def action_move_right(self) -> None:
-        """Move focus right"""
-        # For horizontal layouts, this might need custom implementation
-        pass
+        """Move focus right within current group"""
+        if self.current_view == "main" and self.group_widgets:
+            current_group = self.group_widgets[self.current_group_index]
+            if current_group:
+                focused = self.focused
+                if isinstance(focused, DirectoryWidget) and focused in current_group:
+                    current_index = current_group.index(focused)
+                    if current_index + 1 < len(current_group):
+                        current_group[current_index + 1].focus()
+                    else:
+                        current_group[0].focus()  # Wrap to beginning
 
 
 def main():

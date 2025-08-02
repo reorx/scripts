@@ -5,7 +5,10 @@
       "Bash(./test_myworkspace_tui.sh:*)",
       "mcp__context7__resolve-library-id",
       "mcp__context7__get-library-docs",
-      "Bash(./test_textual_tui.sh:*)"
+      "Bash(./test_textual_tui.sh:*)",
+      "Bash(./test_myworkspace_v3.sh:*)",
+      "WebFetch(domain:textual.textualize.io)",
+      "WebFetch(domain:github.com)"
     ],
     "deny": []
   }
