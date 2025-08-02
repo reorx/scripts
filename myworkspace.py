@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 #
 # /// script
-# requires-python = ">=3.6"
+# requires-python = ">=3.9"
 # dependencies = []
 # ///
 
@@ -11,7 +11,6 @@ import shutil
 from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional, List, Dict, Tuple
 from enum import Enum
 
 
@@ -78,8 +77,8 @@ def cdctx(path: str):
 class GitDir:
     def __init__(self, name: str):
         self.name = name
-        self.sync_status: Optional[SyncStatus] = None
-        self.working_dir_status: Optional[WorkingDirStatus] = None
+        self.sync_status: SyncStatus | None = None
+        self.working_dir_status: WorkingDirStatus | None = None
 
     def analyze_status(self) -> None:
         with cdctx(self.name):
@@ -178,7 +177,7 @@ class RegularDir:
         return f'<RegularDir {self.name}>'
 
 
-def list_dirs() -> Tuple[List[GitDir], List[RegularDir]]:
+def list_dirs() -> tuple[list[GitDir], list[RegularDir]]:
     git_dirs = []
     regular_dirs = []
 
@@ -197,7 +196,7 @@ def list_dirs() -> Tuple[List[GitDir], List[RegularDir]]:
     return git_dirs, regular_dirs
 
 
-def echo(s: str, indent: Optional[int] = None, prefix: Optional[str] = None) -> None:
+def echo(s: str, indent: int | None = None, prefix: str | None = None) -> None:
     if prefix:
         s = prefix + s
     if indent:
@@ -205,7 +204,7 @@ def echo(s: str, indent: Optional[int] = None, prefix: Optional[str] = None) -> 
     print(s)
 
 
-def get_status_colors(sync_status: SyncStatus, working_status: WorkingDirStatus) -> Tuple[str, str]:
+def get_status_colors(sync_status: SyncStatus, working_status: WorkingDirStatus) -> tuple[str, str]:
     """Get text colors with underline for sync and working dir status."""
     # Sync status colors
     if sync_status == SyncStatus.SYNC:
@@ -224,7 +223,7 @@ def get_status_colors(sync_status: SyncStatus, working_status: WorkingDirStatus)
     return sync_color, working_color
 
 
-def get_priority_emoji(sync_status: Optional[SyncStatus], working_status: Optional[WorkingDirStatus]) -> str:
+def get_priority_emoji(sync_status: SyncStatus | None, working_status: WorkingDirStatus | None) -> str:
     """Get priority emoji based on sync and working dir status combination."""
     if sync_status is None or working_status is None:
         return "📁"  # For regular directories
@@ -234,7 +233,7 @@ def get_priority_emoji(sync_status: Optional[SyncStatus], working_status: Option
     return STATUS_PRIORITY_ORDER.get(key, "❓")  # Default fallback
 
 
-def echo_dirs(dirs: List, indent: Optional[int] = None, prefix: str = '│') -> None:
+def echo_dirs(dirs: list, indent: int | None = None, prefix: str = '│') -> None:
     if not dirs:
         return
 
@@ -288,7 +287,7 @@ def main() -> None:
     git_dirs, regular_dirs = list_dirs()
 
     # Group git dirs by sync and working dir status
-    groups: Dict[tuple, list] = {}
+    groups: dict[tuple, list] = {}
 
     for git_dir in git_dirs:
         key = (git_dir.sync_status, git_dir.working_dir_status)
