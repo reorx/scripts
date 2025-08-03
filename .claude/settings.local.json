@@ -8,7 +8,10 @@
       "Bash(./test_textual_tui.sh:*)",
       "Bash(./test_myworkspace_v3.sh:*)",
       "WebFetch(domain:textual.textualize.io)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(./test-myws-tui.sh:*)",
+      "Bash(python:*)",
+      "Bash(timeout:*)"
     ],
     "deny": []
   }

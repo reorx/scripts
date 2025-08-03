@@ -13,6 +13,9 @@ This repository is a collection of scripts I use for working tricks, productivit
 - Use only built-in libraries when possible
 - Avoid third-party dependencies unless absolutely necessary
 - Create single monolithic scripts that do all the work
+- For scripts with metadata, run using uv or make executable with uv shebang
+  - Do not directly run Python scripts with metadata
+  - Use uv to run or set uv as shebang interpreter
 
 ### Bash Scripts
 - Refer to @~/.claude/bash_cheatsheet.md for coding tricks and style guidelines

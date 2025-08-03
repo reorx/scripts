@@ -8,6 +8,7 @@
 import os
 import subprocess
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from collections import OrderedDict
 from contextlib import contextmanager
 from pathlib import Path
@@ -16,7 +17,7 @@ from typing import Optional, List, Dict, Tuple
 
 from textual.app import App, ComposeResult
 from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
-from textual.widgets import Header, Footer, Static, Button, Label, LoadingIndicator
+from textual.widgets import Header, Footer, Static, Button, Label, LoadingIndicator, Input, RichLog, DataTable
 from textual.message import Message
 from textual.reactive import reactive
 from textual.events import Click
@@ -56,6 +57,26 @@ def cdctx(path: str):
         os.chdir(old_cwd)
 
 
+def analyze_git_directory(dir_name: str) -> Optional['GitDir']:
+    """Worker function to analyze a git directory - safe for threading"""
+    try:
+        if not Path(dir_name, '.git').exists():
+            return None
+        
+        # Use absolute path to avoid working directory conflicts in threads
+        abs_path = os.path.abspath(dir_name)
+        git_dir = GitDir(dir_name)
+        
+        # Perform all git operations with absolute paths in the worker thread
+        with cdctx(abs_path):
+            git_dir.analyze_status(use_cwd=True)
+        
+        return git_dir
+    except Exception as e:
+        # Log error but don't print to avoid TUI interference  
+        return None
+
+
 class GitDir:
     def __init__(self, name: str):
         self.name = name
@@ -64,14 +85,22 @@ class GitDir:
         self.detailed_status: str = ""
         self.ahead_behind: Tuple[int, int] = (0, 0)
 
-    def analyze_status(self) -> None:
-        with cdctx(self.name):
+    def analyze_status(self, use_cwd: bool = False) -> None:
+        if use_cwd:
+            # Already in correct directory, don't change directory
             if not Path('.git').exists():
                 raise ValueError(f'{self.name} is not a git repository')
-
             self._check_sync_status()
             self._check_working_dir_status()
             self._get_detailed_status()
+        else:
+            # Change to directory (original behavior)
+            with cdctx(self.name):
+                if not Path('.git').exists():
+                    raise ValueError(f'{self.name} is not a git repository')
+                self._check_sync_status()
+                self._check_working_dir_status()
+                self._get_detailed_status()
 
     def _check_sync_status(self) -> None:
         try:
@@ -147,7 +176,7 @@ class GitDir:
     def _get_detailed_status(self) -> None:
         try:
             result = subprocess.run(
-                ['git', 'status', '--short', '--branch'],
+                ['git', '-c', 'color.ui=always', 'status', '--short', '--branch'],
                 capture_output=True,
                 text=True,
                 check=True
@@ -259,11 +288,6 @@ class MyWorkspaceApp(App):
         border: solid $primary;
     }
     
-    .section-title {
-        text-style: bold;
-        color: $accent;
-        margin: 0 0 1 0;
-    }
     
     .operation-result {
         background: $surface;
@@ -275,6 +299,7 @@ class MyWorkspaceApp(App):
     
     .compact-button {
         min-width: 8;
+        height: 3;
         margin: 0 1;
         padding: 0 1;
     }
@@ -313,6 +338,61 @@ class MyWorkspaceApp(App):
     .dirs-container {
         height: auto;
     }
+    
+    .shell-panel {
+        border: solid $accent;
+        margin: 1 0;
+        padding: 1;
+        height: 20;
+    }
+    
+    .shell-output {
+        height: 13;
+        background: $surface;
+        border: solid $secondary;
+        margin: 0 0 1 0;
+        padding: 1;
+    }
+    
+    .shell-input {
+        height: 3;
+        border: solid $accent;
+        background: $surface;
+    }
+    
+    .shell-input:focus {
+        border: solid $primary;
+    }
+    
+    .status-table {
+        height: 4;
+        border: none;
+        margin: 1 0;
+    }
+    
+    .shell-button {
+        background: purple;
+        color: white;
+    }
+    
+    .shell-button:hover {
+        background: #8B008B;
+    }
+    
+    .ops-buttons-left {
+        align: left middle;
+    }
+    
+    .ops-buttons-right {
+        align: right middle;
+    }
+    
+    .detailed-status-log {
+        height: auto;
+        min-height: 3;
+        border: none;
+    }
+    
     """
 
     BINDINGS = [
@@ -338,6 +418,8 @@ class MyWorkspaceApp(App):
         self.current_group_index = 0
         self.group_widgets: List[List[DirectoryWidget]] = []
         self.is_loading = False
+        self.shell_output: List[str] = []
+        self.shell_panel_visible = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -363,14 +445,31 @@ class MyWorkspaceApp(App):
         self.regular_dirs = []
 
         try:
-            for item in os.listdir('.'):
-                if item.strip() and Path(item).is_dir():
-                    if Path(item, '.git').exists():
-                        git_dir = GitDir(item)
-                        git_dir.analyze_status()
-                        self.git_dirs.append(git_dir)
-                    else:
-                        self.regular_dirs.append(RegularDir(item))
+            # Get all directories
+            all_dirs = [item for item in os.listdir('.') 
+                       if item.strip() and Path(item).is_dir()]
+            
+            # Separate git and regular directories
+            git_candidates = []
+            for item in all_dirs:
+                if Path(item, '.git').exists():
+                    git_candidates.append(item)
+                else:
+                    self.regular_dirs.append(RegularDir(item))
+            
+            # Process git directories with ThreadPoolExecutor
+            if git_candidates:
+                # Calculate thread count: CPU cores / 2, max 4
+                cpu_count = os.cpu_count() or 4
+                thread_count = min(4, max(1, cpu_count // 2))
+                #raise Exception(f'total git dirs: {len(git_candidates)}, thread count: {thread_count}')
+                
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    results = list(executor.map(analyze_git_directory, git_candidates))
+                    
+                # Filter out None results and add to git_dirs
+                self.git_dirs = [git_dir for git_dir in results if git_dir is not None]
+                    
         except OSError:
             pass
 
@@ -471,43 +570,65 @@ class MyWorkspaceApp(App):
         await scroll_view.mount(detail_view)
 
         # Title
-        title = Label(f"Directory Details - {git_dir.name}", classes="section-title")
+        title = Label(f"Directory Details", classes="section-title")
         await detail_view.mount(title)
 
-        # Git status section
-        status_section = Vertical(classes="detail-section")
-        await detail_view.mount(status_section)
+        # Interactive Shell section (initially hidden)
+        if self.shell_panel_visible:
+            await self._mount_shell_panel(detail_view, git_dir)
+
+        # Git status DataTable (no container panel)
+        status_table = DataTable(show_header=False, zebra_stripes=True, classes="status-table")
+        status_table.cursor_type = "none"
+        await detail_view.mount(status_table)
         
-        await status_section.mount(Label("Git Status", classes="section-title"))
+        # Add columns (no headers will be shown)
+        status_table.add_column("Property", width=15)
+        status_table.add_column("Value", width=30)
         
-        status_text = []
-        status_text.append(f"Directory: {git_dir.name}")
-        status_text.append(f"Sync Status: {git_dir.sync_status.value if git_dir.sync_status else 'unknown'}")
-        status_text.append(f"Working Dir: {git_dir.working_dir_status.value if git_dir.working_dir_status else 'unknown'}")
+        # Add rows with git status data
+        status_table.add_row("Directory", git_dir.name)
+        status_table.add_row("Sync Status", git_dir.sync_status.value if git_dir.sync_status else 'unknown')
+        status_table.add_row("Working Dir", git_dir.working_dir_status.value if git_dir.working_dir_status else 'unknown')
         
         if git_dir.ahead_behind != (0, 0):
             ahead, behind = git_dir.ahead_behind
-            status_text.append(f"Ahead/Behind: {ahead}/{behind}")
-        
-        await status_section.mount(Static("\n".join(status_text)))
+            status_table.add_row("Ahead/Behind", f"{ahead}/{behind}")
 
-        # Git operations section
+        # Git operations section with back button
         ops_section = Horizontal()
         await detail_view.mount(ops_section)
+        
+        # Left side buttons
+        left_buttons = Horizontal(classes="ops-buttons-left")
+        await ops_section.mount(left_buttons)
         
         pull_btn = Button("Pull", id="pull", variant="primary", classes="compact-button")
         push_btn = Button("Push", id="push", variant="success", classes="compact-button")
         fetch_btn = Button("Fetch", id="fetch", variant="warning", classes="compact-button")
+        shell_btn = Button("Shell", id="toggle-shell", variant="error", classes="compact-button")
         
-        await ops_section.mount(pull_btn)
-        await ops_section.mount(push_btn)
-        await ops_section.mount(fetch_btn)
+        await left_buttons.mount(pull_btn)
+        await left_buttons.mount(push_btn)
+        await left_buttons.mount(fetch_btn)
+        await left_buttons.mount(shell_btn)
+        
+        # Right side button
+        right_buttons = Horizontal(classes="ops-buttons-right")
+        await ops_section.mount(right_buttons)
+        
+        back_btn = Button("Back", id="back", variant="default", classes="compact-button")
+        await right_buttons.mount(back_btn)
 
         # Detailed status section with border
         detail_status_section = Vertical(classes="detail-section")
+        detail_status_section.border_title = "Detailed Status"
         await detail_view.mount(detail_status_section)
-        await detail_status_section.mount(Label("Detailed Status", classes="section-title"))
-        detailed_status = Static(git_dir.detailed_status or "No detailed status available")
+        detailed_status = RichLog(classes="detailed-status-log")
+        if git_dir.detailed_status:
+            detailed_status.write(git_dir.detailed_status)
+        else:
+            detailed_status.write("No detailed status available")
         await detail_status_section.mount(detailed_status)
 
         # Operation result section
@@ -515,9 +636,32 @@ class MyWorkspaceApp(App):
             result_section = Static(f"Operation Result:\n{self.operation_result}", classes="operation-result")
             await detail_view.mount(result_section)
 
-        # Back button
-        back_btn = Button("Back", id="back", variant="error", classes="compact-button")
-        await detail_view.mount(back_btn)
+    async def _mount_shell_panel(self, detail_view: Vertical, git_dir: GitDir):
+        """Mount the interactive shell panel"""
+        shell_section = Vertical(classes="shell-panel", id="shell-panel")
+        shell_section.border_title = "Interactive Shell"
+        
+        # Find the position after the operations section
+        ops_section = detail_view.children[-3]  # Should be the operations section (3rd from end: ops, detailed status, back button)
+        detail_view.mount(shell_section, after=ops_section)
+        
+        # Shell input
+        shell_input = Input(placeholder="Enter command...", id="shell-input", classes="shell-input")
+        await shell_section.mount(shell_input)
+        
+        # Shell output display
+        shell_output = RichLog(id="shell-output", classes="shell-output")
+        shell_output.write(f"Shell initialized in: {git_dir.name}")
+        shell_output.write(f"Working directory: {os.path.abspath(git_dir.name)}")
+        
+        # Display previous shell output if any
+        for line in self.shell_output:
+            shell_output.write(line)
+            
+        await shell_section.mount(shell_output)
+        
+        # Set focus to shell input
+        shell_input.focus()
 
     @on(Click, "DirectoryWidget")
     async def on_directory_click(self, event: Click) -> None:
@@ -552,15 +696,93 @@ class MyWorkspaceApp(App):
             await self.show_loading(f"Running git fetch in {self.selected_dir.name}...")
             self.perform_git_operation("fetch")
 
+    @on(Button.Pressed, "#toggle-shell")
+    async def handle_toggle_shell(self) -> None:
+        """Toggle shell panel visibility"""
+        if self.selected_dir:
+            self.shell_panel_visible = not self.shell_panel_visible
+            
+            if self.shell_panel_visible:
+                # Show shell panel
+                detail_view = self.query_one(".detail-view")
+                await self._mount_shell_panel(detail_view, self.selected_dir)
+            else:
+                # Hide shell panel
+                try:
+                    shell_panel = self.query_one("#shell-panel")
+                    await shell_panel.remove()
+                except:
+                    pass  # Panel might not exist
+
     @on(Button.Pressed, "#back")
     async def handle_back(self) -> None:
         self.operation_result = ""
+        self.shell_output = []  # Clear shell output when going back
+        self.shell_panel_visible = False  # Reset shell panel state
         await self.show_main_view()
+
+    @on(Input.Submitted, "#shell-input")
+    async def handle_shell_command(self, message: Input.Submitted) -> None:
+        """Handle shell command submission"""
+        if self.selected_dir and message.value.strip():
+            command = message.value.strip()
+            
+            # Clear the input
+            shell_input = self.query_one("#shell-input", Input)
+            shell_input.value = ""
+            
+            # Update shell output display
+            shell_output = self.query_one("#shell-output", RichLog)
+            shell_output.write(f"$ {command}")
+            
+            # Execute command using worker
+            self.execute_shell_command(command, shell_output)
+
+    @work
+    async def execute_shell_command(self, command: str, shell_output: RichLog):
+        """Execute shell command in the selected directory"""
+        if not self.selected_dir:
+            return
+            
+        try:
+            with cdctx(self.selected_dir.name):
+                # Execute the command
+                result = subprocess.run(
+                    command,
+                    shell=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30  # 30 second timeout
+                )
+                
+                # Display output
+                if result.stdout:
+                    for line in result.stdout.strip().split('\n'):
+                        shell_output.write(line)
+                        self.shell_output.append(line)
+                
+                if result.stderr:
+                    for line in result.stderr.strip().split('\n'):
+                        shell_output.write(f"[red]ERROR: {line}[/red]")
+                        self.shell_output.append(f"ERROR: {line}")
+                
+                if result.returncode != 0:
+                    shell_output.write(f"[red]Command exited with code {result.returncode}[/red]")
+                    self.shell_output.append(f"Command exited with code {result.returncode}")
+                    
+        except subprocess.TimeoutExpired:
+            shell_output.write("[red]Command timed out after 30 seconds[/red]")
+            self.shell_output.append("Command timed out after 30 seconds")
+        except Exception as e:
+            shell_output.write(f"[red]Error executing command: {str(e)}[/red]")
+            self.shell_output.append(f"Error executing command: {str(e)}")
 
     async def action_back(self) -> None:
         """Handle backspace key"""
         if self.current_view == "detail":
             self.operation_result = ""
+            self.shell_output = []  # Clear shell output when going back
+            self.shell_panel_visible = False  # Reset shell panel state
             await self.show_main_view()
 
     async def action_refresh(self) -> None:
