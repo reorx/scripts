@@ -1,0 +1,47 @@
+#!/bin/bash
+# Made for Claude Code hooks
+
+usage() {
+    echo "Usage: $0 <filename>"
+    echo "Formats files based on their extension:"
+    echo "  .py       - formatted with ruff"
+    echo "  .ts/.tsx/.js - formatted with biome"
+    exit 1
+}
+
+# Check arguments
+[ $# -eq 0 ] && usage
+
+# Get the file path from the first argument
+FILE="$1"
+
+# Check if the file exists
+if [ ! -f "$FILE" ]; then
+    echo "Error: File '$FILE' does not exist"
+    exit 1
+fi
+
+# Extract the file extension
+EXTENSION="${FILE##*.}"
+
+# Format based on extension
+case "$EXTENSION" in
+    py)
+        #echo "Formatting Python file with ruff..."
+        ruff format \
+            --line-length 120 \
+            --config "format.quote-style = 'single'" \
+            "$FILE"
+        ;;
+    ts|tsx|js)
+        #echo "Formatting $EXTENSION file with biome..."
+        biome format --write \
+            --indent-style=space --line-width=120 \
+            --javascript-formatter-quote-style=single \
+            "$FILE"
+        ;;
+    *)
+        echo "Error: Unsupported file type '.$EXTENSION'"
+        exit 1
+        ;;
+esac
