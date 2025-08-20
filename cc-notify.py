@@ -15,7 +15,9 @@ def main():
     parser.add_argument('-m', '--message', help='Notification message', default='please pass a message')
     parser.add_argument('-s', '--sound', help='Sound name (from /System/Library/Sounds)', default='')
     parser.add_argument('-d', '--debug', action='store_true', help='Enable debug mode')
-    parser.add_argument('--icon', help='Custom icon path (overrides default)')
+    parser.add_argument(
+        '-t', '--type', help='Notification type (alert or banner)', default='alert', choices=['alert', 'banner']
+    )
     args = parser.parse_args()
 
     # Configure logging
@@ -42,21 +44,6 @@ def main():
     # Debug: print CLAUDE_PROJECT_DIR
     logger.debug(f'CLAUDE_PROJECT_DIR: {project_dir}')
 
-    # Get the icon path
-    if args.icon:
-        icon_path = Path(args.icon)
-    else:
-        script_dir = Path(__file__).parent
-        icon_path = script_dir / 'assets/icons/claude.icns'
-
-    # Debug: print icon path and its stat
-    logger.debug(f'Icon path: {icon_path}')
-    if icon_path.exists():
-        stat = icon_path.stat()
-        logger.debug(f'Icon file stat: size={stat.st_size} bytes, mode={oct(stat.st_mode)}, modified={stat.st_mtime}')
-    else:
-        logger.debug(f'Icon file does not exist at {icon_path}')
-
     # Prepare notification title and message
     hook_event_name = hook_input.get('hook_event_name', 'Unknown Event')
     title = f'{project_name}: {hook_event_name}'
@@ -64,24 +51,26 @@ def main():
     # Use provided message or construct default
     message = args.message
 
-    # Build terminal-notifier command
-    cmd = ['terminal-notifier', '-title', title, '-message', message, '-appIcon', str(icon_path)]
+    # Build Notifier command
+    notifier_path = '/Applications/Utilities/Notifier.app/Contents/MacOS/Notifier'
+    cmd = [notifier_path, '--type', args.type, '--title', title, '--message', message]
 
-    # Add sound if not default
+    # Add sound if specified
     if args.sound:
-        cmd.extend(['-sound', args.sound])
+        cmd.extend(['--sound', args.sound])
 
-    # Debug: print the whole terminal-notifier command
-    logger.debug(f'Terminal-notifier command: {" ".join(cmd)}')
+    # Debug: print the whole Notifier command
+    logger.debug(f'Notifier command: {" ".join(cmd)}')
 
     # Send notification
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True)
     except subprocess.CalledProcessError as e:
         logger.error(f'Error sending notification: {e}')
+        logger.error(f'stderr: {e.stderr}')
         sys.exit(1)
     except FileNotFoundError:
-        logger.error('terminal-notifier not found. Please install it: brew install terminal-notifier')
+        logger.error(f'Notifier not found at {notifier_path}. Please install Notifier.app')
         sys.exit(1)
 
 

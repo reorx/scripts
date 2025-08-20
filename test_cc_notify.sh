@@ -16,7 +16,6 @@ echo '{
   "transcript_path": "/tmp/claude/transcript.json",
   "cwd": "/Users/reorx/Code/test-project",
   "hook_event_name": "tool-before-bash"
-}' | ./cc-notify.py -m "Running bash command" -s "$SOUND" -d \
-    --icon '/Applications/Ani.app/Contents/Resources/Ani.icns'
+}' | ./cc-notify.py -m "Running bash command" -s "$SOUND" -d
 
 echo "Test completed!"
