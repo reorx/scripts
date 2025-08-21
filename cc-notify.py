@@ -147,6 +147,8 @@ def main():
 
     # Use provided message or construct default
     message = args.message
+    # reconstruct message by adding project_name in front
+    message = f'{project_name}: {message}'
 
     # Validate icon option
     if args.icon and args.type != 'alert':
