@@ -18,6 +18,7 @@ def main():
     parser.add_argument(
         '-t', '--type', help='Notification type (alert or banner)', default='alert', choices=['alert', 'banner']
     )
+    parser.add_argument('--use-notifier', action='store_true', help='Use Notifier app instead of osascript')
     args = parser.parse_args()
 
     # Configure logging
@@ -51,27 +52,52 @@ def main():
     # Use provided message or construct default
     message = args.message
 
-    # Build Notifier command
-    notifier_path = '/Applications/Utilities/Notifier.app/Contents/MacOS/Notifier'
-    cmd = [notifier_path, '--type', args.type, '--title', title, '--message', message]
-
-    # Add sound if specified
-    if args.sound:
-        cmd.extend(['--sound', args.sound])
-
-    # Debug: print the whole Notifier command
-    logger.debug(f'Notifier command: {" ".join(cmd)}')
-
     # Send notification
-    try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        logger.error(f'Error sending notification: {e}')
-        logger.error(f'stderr: {e.stderr}')
-        sys.exit(1)
-    except FileNotFoundError:
-        logger.error(f'Notifier not found at {notifier_path}. Please install Notifier.app')
-        sys.exit(1)
+    if args.use_notifier:
+        # Use Notifier app
+        notifier_path = '/Applications/Utilities/Notifier.app/Contents/MacOS/Notifier'
+        cmd = [notifier_path, '--type', args.type, '--title', title, '--message', message]
+
+        # Add sound if specified
+        if args.sound:
+            cmd.extend(['--sound', args.sound])
+
+        # Debug: print the whole Notifier command
+        logger.debug(f'Notifier command: {" ".join(cmd)}')
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f'Error sending notification: {e}')
+            logger.error(f'stderr: {e.stderr}')
+            sys.exit(1)
+        except FileNotFoundError:
+            logger.error(f'Notifier not found at {notifier_path}. Please install Notifier.app')
+            sys.exit(1)
+    else:
+        # Use osascript
+        # Escape quotes in strings for AppleScript
+        escaped_message = message.replace('"', '\\"')
+        escaped_title = title.replace('"', '\\"')
+
+        # Build osascript command
+        script = f'display notification "{escaped_message}" with title "{escaped_title}"'
+
+        # Add sound if specified
+        if args.sound:
+            script += f' sound name "{args.sound}"'
+
+        cmd = ['osascript', '-e', script]
+
+        # Debug: print the whole osascript command
+        logger.debug(f'osascript command: {" ".join(cmd)}')
+
+        try:
+            subprocess.run(cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as e:
+            logger.error(f'Error sending notification: {e}')
+            logger.error(f'stderr: {e.stderr}')
+            sys.exit(1)
 
 
 if __name__ == '__main__':
