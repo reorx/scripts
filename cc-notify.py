@@ -156,7 +156,10 @@ def main():
     if args.type == 'notification':
         send_notification(title, message, args.sound, args.use_notifier, logger)
     elif args.type == 'alert':
-        send_alert(title, message, args.icon, logger)
+        icon = args.icon
+        if not icon:
+            icon = str(Path(__file__).parent / 'assets/icons/claude.icns')
+        send_alert(title, message, icon, logger)
 
 
 if __name__ == '__main__':
