@@ -11,7 +11,9 @@
       "WebFetch(domain:github.com)",
       "Bash(./test-myws-tui.sh:*)",
       "Bash(python:*)",
-      "Bash(timeout:*)"
+      "Bash(timeout:*)",
+      "WebSearch",
+      "Bash(rm:*)"
     ],
     "deny": []
   }
