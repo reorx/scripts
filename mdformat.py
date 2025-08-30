@@ -264,8 +264,8 @@ def is_end_of_block(line: str, lines: list, idx: int) -> bool:
                             return False  # Don't add spacing, this is continuing the parent list
                         else:
                             return True  # Different list types, add spacing
-                    # If we find a list item at higher level, stop looking
-                    if back_indent < current_indent:
+                    # Only stop looking if we find a list item at higher level than both current and next
+                    if back_indent < min(current_indent, next_indent):
                         break
                 else:
                     # Non-list item, stop looking backwards
