@@ -1,16 +1,72 @@
 #!/bin/bash
 # Made for Claude Code hooks
 
+CONFIG_DIR="$HOME/.config/cc-format"
+IS_OFF_FILE="$CONFIG_DIR/is_off"
+
 usage() {
-    echo "Usage: $0 <filename>"
-    echo "Formats files based on their extension:"
-    echo "  .py       - formatted with ruff"
-    echo "  .ts/.tsx/.js - formatted with biome"
+    if [ -n "$CONTROL_MODE" ]; then
+        echo "Usage: $0 <action>"
+        echo "Control actions:"
+        echo "  toggle    - turn on or off cc-format"
+        echo "  status    - show status of cc-format"
+    else
+        echo "Usage: $0 <filename>"
+        echo "Formats files based on their extension:"
+        echo "  .py       - formatted with ruff"
+        echo "  .ts/.tsx/.js - formatted with biome"
+    fi
     exit 1
+}
+
+control_mode() {
+    local action="$1"
+    
+    # Ensure config directory exists
+    mkdir -p "$CONFIG_DIR"
+    
+    case "$action" in
+        toggle)
+            if [ -f "$IS_OFF_FILE" ]; then
+                # Turn on
+                rm "$IS_OFF_FILE"
+                echo "cc-format is now ON"
+            else
+                # Turn off
+                touch "$IS_OFF_FILE"
+                echo "cc-format is now OFF"
+            fi
+            ;;
+        status)
+            if [ -f "$IS_OFF_FILE" ]; then
+                echo "cc-format is OFF"
+            else
+                echo "cc-format is ON"
+            fi
+            ;;
+        *)
+            echo "Error: Unknown action '$action'"
+            usage
+            ;;
+    esac
 }
 
 # Check arguments
 [ $# -eq 0 ] && usage
+
+# Check if CONTROL_MODE is set
+if [ -n "$CONTROL_MODE" ]; then
+    control_mode "$1"
+    exit 0
+fi
+
+# Check if cc-format is disabled
+if [ -f "$IS_OFF_FILE" ]; then
+    if [ -n "$DEBUG" ]; then
+        echo "cc-format is disabled, skipping formatting" >&2
+    fi
+    exit 0
+fi
 
 # Get the file path from the first argument
 FILE="$1"
