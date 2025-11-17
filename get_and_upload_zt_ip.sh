@@ -20,7 +20,7 @@ set -eu
 
 zt_ip=$(ifconfig | grep $IP_PREFIX | awk '{ print $2 }')
 
-if [ -z "zt_ip" ]; then
+if [ -z "$zt_ip" ]; then
     echo "cannot get zt ip"
     exit 1
 fi
