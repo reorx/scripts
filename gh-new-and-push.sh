@@ -8,5 +8,5 @@ set -x
 
 gh repo create "$reponame" --private
 
-git remote add origin "git@github.com:$username/$basename.git"
+git remote add origin "git@github.com:$username/$reponame.git"
 git push -u origin master
