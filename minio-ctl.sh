@@ -93,6 +93,19 @@ status_minio() {
     fi
 }
 
+logs_minio() {
+    if [ ! -f "$LOG_FILE" ]; then
+        echo "No log file found at $LOG_FILE"
+        return 1
+    fi
+
+    if [ "$1" = "-f" ]; then
+        tail -f "$LOG_FILE"
+    else
+        tail -n 50 "$LOG_FILE"
+    fi
+}
+
 case "$1" in
     start)
         start_minio
@@ -111,8 +124,11 @@ case "$1" in
         sleep 1
         start_minio
         ;;
+    logs)
+        logs_minio "$2"
+        ;;
     *)
-        echo "Usage: $0 {start|stop|status|restart}"
+        echo "Usage: $0 {start|stop|status|restart|webui|logs [-f]}"
         exit 1
         ;;
 esac
