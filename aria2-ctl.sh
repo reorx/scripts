@@ -4,6 +4,11 @@ ARIA2_DIR="$HOME/.local/share/aria2"
 PID_FILE="$ARIA2_DIR/aria2.pid"
 LOG_FILE="$ARIA2_DIR/aria2.log"
 CONCURRENCY=8
+TOKEN_FILE="$HOME/.config/aria2-token.txt"
+if [ -z "$SECRET" ] && [ -f "$TOKEN_FILE" ]; then
+    echo "Use secret from file"
+    SECRET=$(cat "$TOKEN_FILE")
+fi
 : ${SECRET:=YOUR_SECRET_TOKEN}
 
 start_aria2() {
@@ -22,7 +27,7 @@ start_aria2() {
     mkdir -p "$ARIA2_DIR"
 
     nohup aria2c --enable-rpc \
-           --rpc-listen-all=true \
+           --rpc-listen-all=false \
            --rpc-allow-origin-all \
            --rpc-listen-port=6800 \
            --rpc-secret=$SECRET \
