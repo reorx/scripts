@@ -90,12 +90,12 @@ def find_original(filepath: Path, device_patterns: list[str]) -> tuple[Path, str
 
         # Patterns to check, from most specific to least specific.
         patterns = [
-            rf"^(.+)-({escaped_device})-(\d+)$",  # name-device-number
-            rf"^(.+)-({escaped_device})$",  # name-device
+            re.compile(rf"^(.+)-({escaped_device})-(\d+)$"),  # name-device-number
+            re.compile(rf"^(.+)-({escaped_device})$"),  # name-device
         ]
 
         for pattern in patterns:
-            match = re.match(pattern, stem)
+            match = pattern.match(stem)
             if match:
                 base = match.group(1)
                 original = filepath.parent / f"{base}{ext}"
