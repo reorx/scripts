@@ -88,23 +88,19 @@ def find_original(filepath: Path, device_patterns: list[str]) -> tuple[Path, str
         # Escape special regex chars in device name
         escaped_device = re.escape(device)
 
-        # Pattern 1: name-device-number (e.g., "file-Xiao's Mac mini-2")
-        pattern1 = rf"^(.+)-({escaped_device})-(\d+)$"
-        match = re.match(pattern1, stem)
-        if match:
-            base = match.group(1)
-            original = filepath.parent / f"{base}{ext}"
-            if original.exists() and original != filepath:
-                return (original, device)
+        # Patterns to check, from most specific to least specific.
+        patterns = [
+            re.compile(rf"^(.+)-({escaped_device})-(\d+)$"),  # name-device-number
+            re.compile(rf"^(.+)-({escaped_device})$"),  # name-device
+        ]
 
-        # Pattern 2: name-device (e.g., "file-Xiao's Mac mini")
-        pattern2 = rf"^(.+)-({escaped_device})$"
-        match = re.match(pattern2, stem)
-        if match:
-            base = match.group(1)
-            original = filepath.parent / f"{base}{ext}"
-            if original.exists() and original != filepath:
-                return (original, device)
+        for pattern in patterns:
+            match = pattern.match(stem)
+            if match:
+                base = match.group(1)
+                original = filepath.parent / f"{base}{ext}"
+                if original.exists() and original != filepath:
+                    return (original, device)
 
     return None
 
