@@ -80,18 +80,27 @@ fi
 # Extract the file extension
 EXTENSION="${FILE##*.}"
 
+# Set extra args based on NO_WRITE
+if [ -n "$NO_WRITE" ]; then
+    RUFF_EXTRA="--diff"
+    BIOME_EXTRA=""
+else
+    RUFF_EXTRA=""
+    BIOME_EXTRA="--write"
+fi
+
 # Format based on extension
 case "$EXTENSION" in
     py)
         #echo "Formatting Python file with ruff..."
-        ruff format \
+        ruff format $RUFF_EXTRA \
             --line-length 120 \
             --config "format.quote-style = 'single'" \
             "$FILE"
         ;;
     ts|tsx|js)
         #echo "Formatting $EXTENSION file with biome..."
-        biome format --write \
+        biome format $BIOME_EXTRA \
             --indent-style=space --line-width=120 \
             --javascript-formatter-quote-style=single \
             "$FILE"
