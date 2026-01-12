@@ -10,8 +10,27 @@
 hn-flat.py - Fetch and flatten Hacker News discussions into readable markdown.
 
 Usage:
-    uv run hn-flat.py <url> [-o <output>] [--stdout] [--condense <rate>] [--verbose]
-                      [--cache-dir <dir>] [--condense-step-size <n>]
+    uv run hn-flat.py <url> [options]
+
+Examples:
+    # Basic usage - saves to hn.<id>.md in current directory
+    uv run hn-flat.py "https://news.ycombinator.com/item?id=12345"
+
+    # Print to stdout
+    uv run hn-flat.py "https://news.ycombinator.com/item?id=12345" --stdout
+
+    # Save to specific file or directory
+    uv run hn-flat.py "https://news.ycombinator.com/item?id=12345" -o discussion.md
+    uv run hn-flat.py "https://news.ycombinator.com/item?id=12345" --out-dir ./hn-posts
+
+    # Use cache to avoid repeated fetching
+    uv run hn-flat.py "https://news.ycombinator.com/item?id=12345" --cache-dir ~/.cache/hn
+
+    # Condense long discussions to 50% of original size
+    uv run hn-flat.py "https://news.ycombinator.com/item?id=12345" --condense 0.5
+
+    # Skip frontmatter for plain markdown
+    uv run hn-flat.py "https://news.ycombinator.com/item?id=12345" --no-frontmatter --stdout
 """
 
 import argparse
@@ -412,8 +431,27 @@ def extract_id_from_url(url: str) -> str:
 
 
 def main():
+    epilog = """
+Examples:
+  %(prog)s "https://news.ycombinator.com/item?id=12345"
+      Fetch and save to hn.12345.md
+
+  %(prog)s "https://news.ycombinator.com/item?id=12345" --stdout
+      Print to stdout instead of file
+
+  %(prog)s "https://news.ycombinator.com/item?id=12345" --cache-dir ~/.cache/hn
+      Cache HTML to avoid repeated fetching
+
+  %(prog)s "https://news.ycombinator.com/item?id=12345" --condense 0.5
+      Condense to 50%% of original size by removing low-weight comments
+
+  %(prog)s "https://news.ycombinator.com/item?id=12345" --no-frontmatter -o out.md
+      Save without YAML frontmatter
+"""
     parser = argparse.ArgumentParser(
-        description="Fetch and flatten Hacker News discussions into readable markdown."
+        description="Fetch and flatten Hacker News discussions into readable markdown.",
+        epilog=epilog,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("url", help="Hacker News item URL")
 
