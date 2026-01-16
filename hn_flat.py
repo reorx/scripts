@@ -93,15 +93,13 @@ def fetch_html(url: str, verbose: bool = False, cache_dir: str | None = None) ->
     if cache_dir:
         cache_path = get_cache_path(url, cache_dir)
         if cache_path.exists():
-            if verbose:
-                print(f"Loading from cache: {cache_path}", file=sys.stderr)
+            print(f"Loading from cache: {cache_path}", file=sys.stderr)
             html = cache_path.read_text(encoding="utf-8")
             if verbose:
                 print(f"Loaded {len(html)} bytes from cache", file=sys.stderr)
             return html
 
-    if verbose:
-        print(f"Fetching {url}...", file=sys.stderr)
+    print(f"Fetching {url}...", file=sys.stderr)
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
@@ -508,8 +506,10 @@ Examples:
             output_path = filename
         with open(output_path, "w") as f:
             f.write(markdown)
-        if args.verbose:
-            print(f"Written to {output_path}", file=sys.stderr)
+        print(f"Output: {output_path}", file=sys.stderr)
+        if args.cache_dir:
+            cache_path = get_cache_path(args.url, args.cache_dir)
+            print(f"Cache:  {cache_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
