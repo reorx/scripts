@@ -23,11 +23,12 @@ Rime QuickAdd - 快速添加词条到 Rime 词库
 # ============ 配置 ============
 # 词库文件路径，默认使用 quickadd.dict.yaml（可参与造句）
 DICT_FILE_PATH = '~/Library/Rime/quickadd.dict.yaml'
+DICT_NAME = 'quickadd'
 # =============================
 
 import subprocess
 import sys
-import time
+from datetime import date
 from pathlib import Path
 
 from pypinyin import lazy_pinyin
@@ -35,32 +36,62 @@ from pypinyin import lazy_pinyin
 DICT_FILE = Path(DICT_FILE_PATH).expanduser()
 SQUIRREL_BIN = '/Library/Input Methods/Squirrel.app/Contents/MacOS/Squirrel'
 
+# Rime 词典文件的 YAML 头部模板
+DICT_HEADER_TEMPLATE = """---
+name: {name}
+version: "{version}"
+sort: by_weight
+...
+
+"""
+
 
 def notify(title: str, message: str):
     """发送 macOS 系统通知"""
     subprocess.run(['osascript', '-e', f'display notification "{message}" with title "{title}"'], check=False)
 
 
-def copy_selection():
-    """发送 Cmd+C 复制选中文字到剪贴板"""
-    subprocess.run(
-        ['osascript', '-e', 'tell application "System Events" to keystroke "c" using command down'], check=False
+APPLESCRIPT_GET_SELECTION = """
+-- 1. 保存当前剪贴板内容
+set savedClipboard to the clipboard
+
+-- 2. 模拟 Command + C
+tell application "System Events"
+    keystroke "c" using command down
+end tell
+
+-- 等待系统完成复制动作
+delay 0.1
+
+-- 3. 获取选中文字
+set selectedText to the clipboard
+
+-- 4. 恢复之前的剪贴板内容
+set the clipboard to savedClipboard
+
+-- 5. 输出结果
+return selectedText
+"""
+
+
+def get_selection() -> str:
+    """通过 AppleScript 获取选中文字，并恢复剪贴板"""
+    result = subprocess.run(
+        ['osascript', '-e', APPLESCRIPT_GET_SELECTION], capture_output=True, text=True, encoding='utf-8'
     )
-    time.sleep(0.1)
-
-
-def get_clipboard() -> str:
-    """获取剪贴板内容"""
-    result = subprocess.run(['pbpaste'], capture_output=True, text=True)
     return result.stdout.strip()
 
 
 def get_input() -> str:
-    """获取输入文字：优先 stdin，否则从剪贴板"""
+    """获取输入文字：优先 stdin，否则从选中文字"""
     if not sys.stdin.isatty():
-        return sys.stdin.read().strip()
-    copy_selection()
-    return get_clipboard()
+        text = sys.stdin.read().strip()
+        if text:
+            return text
+    text = get_selection()
+    if not text:
+        raise ValueError('could not get text')
+    return text
 
 
 def to_pinyin(text: str) -> str:
@@ -68,17 +99,36 @@ def to_pinyin(text: str) -> str:
     return ' '.join(lazy_pinyin(text))
 
 
+def ensure_dict_file():
+    """确保词库文件存在，不存在则创建带有正确头部的文件"""
+    if DICT_FILE.exists():
+        return
+    header = DICT_HEADER_TEMPLATE.format(
+        name=DICT_NAME,
+        version=date.today().isoformat(),
+    )
+    DICT_FILE.write_text(header, encoding='utf-8')
+
+
 def word_exists(word: str) -> bool:
     """检查词条是否已存在于词库中"""
     if not DICT_FILE.exists():
         return False
     content = DICT_FILE.read_text(encoding='utf-8')
-    in_header = True
-    for line in content.splitlines():
+    lines = content.splitlines()
+
+    # 检测是否有 YAML 头部（以 --- 开头）
+    has_header = lines and lines[0].strip() == '---'
+    in_header = has_header
+
+    for line in lines:
         # 跳过 YAML 头部（... 之前的内容）
         if in_header:
-            if line == '...':
+            if line.strip() == '...':
                 in_header = False
+            continue
+        # 跳过空行和注释
+        if not line or line.startswith('#'):
             continue
         if line.startswith(word + '\t') or line == word:
             return True
@@ -100,7 +150,11 @@ def main():
     debug = '--debug' in sys.argv
 
     # 获取输入文字
-    word = get_input()
+    try:
+        word = get_input()
+    except Exception as e:
+        notify('Rime QuickAdd', f'Error: {e}')
+        return
 
     if debug:
         print(f'[DEBUG] 输入文字: {word}')
@@ -121,12 +175,15 @@ def main():
             notify('Rime QuickAdd', f'文字过长：{word[:10]}...')
         sys.exit(1)
 
+    # 确保词库文件存在
+    ensure_dict_file()
+
     # 检查是否已存在
     if word_exists(word):
         if debug:
-            print(f'[DEBUG] 词条已存在于词库中')
+            print('[DEBUG] 已添加过该词条')
         else:
-            notify('Rime QuickAdd', f'词条已存在：{word}')
+            notify('Rime QuickAdd', f'已添加过：{word}')
         sys.exit(0)
 
     # 转换拼音
@@ -143,11 +200,11 @@ def main():
     # 添加到词库
     add_word(word, pinyin)
 
-    # 重新部署
-    reload_rime()
-
     # 通知成功
     notify('Rime QuickAdd', f'已添加：{word} ({pinyin})')
+
+    # 重新部署
+    reload_rime()
 
 
 if __name__ == '__main__':
