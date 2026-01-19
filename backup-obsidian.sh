@@ -9,8 +9,7 @@
 #   ./backup-obsidian.sh
 #
 # Environment variables (configure these before running):
-#   OBSIDIAN_VAULT          - Path to the Obsidian vault directory (required)
-#   OBSIDIAN_VAULT_NAME     - Name used in the backup filename (required)
+#   OBSIDIAN_VAULT_PATH     - Path to the Obsidian vault directory (required)
 #   OBSIDIAN_BACKUP_DIR     - Primary backup destination directory (required)
 #   OBSIDIAN_BACKUP_ALT_DIR - Secondary backup destination (optional, skipped if not set)
 #
@@ -28,16 +27,16 @@ Usage: backup-obsidian.sh
 Backup an Obsidian vault to a timestamped ZIP archive.
 
 Environment Variables:
-  OBSIDIAN_VAULT          Path to the Obsidian vault directory (required)
-  OBSIDIAN_VAULT_NAME     Name used in the backup filename (required)
-                          e.g., "MyVault" produces "MyVault-20240115120000.zip"
+  OBSIDIAN_VAULT_PATH     Path to the Obsidian vault directory (required)
+                          The vault's basename is used in the backup filename
   OBSIDIAN_BACKUP_DIR     Primary backup destination directory (required)
+                          Backup is saved as "VaultName.zip" (overwrites previous)
   OBSIDIAN_BACKUP_ALT_DIR Secondary backup destination (optional)
-                          If set, a copy is also placed here
+                          If set, timestamped copy is also placed here
+                          e.g., "MyVault-20240115120000.zip"
 
 Example:
-  export OBSIDIAN_VAULT="$HOME/Documents/MyVault"
-  export OBSIDIAN_VAULT_NAME="MyVault"
+  export OBSIDIAN_VAULT_PATH="$HOME/Documents/MyVault"
   export OBSIDIAN_BACKUP_DIR="$HOME/OneDrive/Backups/Obsidian"
   ./backup-obsidian.sh
 EOF
@@ -62,10 +61,7 @@ fi
 # =============================================================================
 
 # Path to the Obsidian vault to be backed up
-OBSIDIAN_VAULT="${OBSIDIAN_VAULT:-}"
-
-# Name identifier for the backup file (e.g., "Base" produces "Base-20240115120000.zip")
-OBSIDIAN_VAULT_NAME="${OBSIDIAN_VAULT_NAME:-}"
+OBSIDIAN_VAULT_PATH="${OBSIDIAN_VAULT_PATH:-}"
 
 # Primary destination directory for the backup
 OBSIDIAN_BACKUP_DIR="${OBSIDIAN_BACKUP_DIR:-}"
@@ -78,12 +74,11 @@ OBSIDIAN_BACKUP_ALT_DIR="${OBSIDIAN_BACKUP_ALT_DIR:-}"
 # =============================================================================
 
 # Ensure required environment variables are set
-[[ -z "$OBSIDIAN_VAULT" ]] && die_with_help "OBSIDIAN_VAULT is not set"
-[[ -z "$OBSIDIAN_VAULT_NAME" ]] && die_with_help "OBSIDIAN_VAULT_NAME is not set"
+[[ -z "$OBSIDIAN_VAULT_PATH" ]] && die_with_help "OBSIDIAN_VAULT_PATH is not set"
 [[ -z "$OBSIDIAN_BACKUP_DIR" ]] && die_with_help "OBSIDIAN_BACKUP_DIR is not set"
 
 # Verify the vault directory exists
-[[ ! -d "$OBSIDIAN_VAULT" ]] && die_with_help "Vault directory does not exist: $OBSIDIAN_VAULT"
+[[ ! -d "$OBSIDIAN_VAULT_PATH" ]] && die_with_help "Vault directory does not exist: $OBSIDIAN_VAULT_PATH"
 
 # Verify the primary backup directory exists
 [[ ! -d "$OBSIDIAN_BACKUP_DIR" ]] && die_with_help "Backup directory does not exist: $OBSIDIAN_BACKUP_DIR"
@@ -92,13 +87,19 @@ OBSIDIAN_BACKUP_ALT_DIR="${OBSIDIAN_BACKUP_ALT_DIR:-}"
 # Backup Process
 # =============================================================================
 
-# Generate timestamped filename (format: VaultName-YYYYMMDDHHMMSS.zip)
-filename="${OBSIDIAN_VAULT_NAME}-$(date +%Y%m%d%H%M%S).zip"
+# Derive vault name from the path's basename
+vault_name="$(basename "$OBSIDIAN_VAULT_PATH")"
+
+# Timestamped filename (created by zip, used for alt backup)
+filename="${vault_name}-$(date +%Y%m%d%H%M%S).zip"
+
+# Base filename (for primary backup destination, overwrites previous)
+filename_base="${vault_name}.zip"
 
 # Change to vault directory so zip paths are relative
-cd "$OBSIDIAN_VAULT"
+cd "$OBSIDIAN_VAULT_PATH"
 
-echo "Creating backup of vault: $OBSIDIAN_VAULT"
+echo "Creating backup of vault: $OBSIDIAN_VAULT_PATH"
 echo "Backup filename: $filename"
 
 # Create the ZIP archive with exclusions:
@@ -136,19 +137,15 @@ echo "Backup created successfully, verified integrity"
 # Copy to Destinations
 # =============================================================================
 
-# Copy to secondary backup location if configured
-if [[ -n "$OBSIDIAN_BACKUP_ALT_DIR" ]]; then
-    if [[ -d "$OBSIDIAN_BACKUP_ALT_DIR" ]]; then
-        echo "Copying to secondary backup: $OBSIDIAN_BACKUP_ALT_DIR"
-        cp "$filename" "$OBSIDIAN_BACKUP_ALT_DIR/"
-    else
-        echo "Warning: Secondary backup directory does not exist: $OBSIDIAN_BACKUP_ALT_DIR" >&2
-    fi
+# Copy timestamped version to secondary backup location if configured and exists
+if [[ -n "$OBSIDIAN_BACKUP_ALT_DIR" && -d "$OBSIDIAN_BACKUP_ALT_DIR" ]]; then
+    echo "Copying timestamped backup to: $OBSIDIAN_BACKUP_ALT_DIR/$filename"
+    cp "$filename" "$OBSIDIAN_BACKUP_ALT_DIR/"
 fi
 
-# Move to primary backup location
-echo "Moving to primary backup: $OBSIDIAN_BACKUP_DIR"
-mv "$filename" "$OBSIDIAN_BACKUP_DIR/"
+# Move to primary backup location with base name (overwrites existing)
+echo "Moving to primary backup: $OBSIDIAN_BACKUP_DIR/$filename_base"
+mv "$filename" "$OBSIDIAN_BACKUP_DIR/$filename_base"
 
 # =============================================================================
 # Summary
@@ -156,4 +153,4 @@ mv "$filename" "$OBSIDIAN_BACKUP_DIR/"
 
 echo ""
 echo "Backup complete:"
-ls -lh "$OBSIDIAN_BACKUP_DIR/$filename"
+ls -lh "$OBSIDIAN_BACKUP_DIR/$filename_base"
