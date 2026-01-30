@@ -23,7 +23,7 @@ filename="$(basename "$url_without_protocol").md"
 echo "Downloading from: $puremd_url"
 echo "Saving to: $filename"
 
-curl -sL "$puremd_url" -o "$filename"
+curl -sL ${PUREMD_API_TOKEN:+-H "x-puremd-api-token: ${PUREMD_API_TOKEN}"} "$puremd_url" -o "$filename"
 
 if [ $? -eq 0 ]; then
     echo "Successfully saved to $filename"
