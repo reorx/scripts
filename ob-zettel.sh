@@ -2,13 +2,16 @@
 set -euo pipefail
 
 DIR_PATH="${DIR_PATH:-80 Zettelkasten Notes}"
-TAG=""
+TAGS=()
+if [[ -n "${OPENCLAW_SERVICE_MARKER:-}" ]]; then
+    TAGS+=("agent-created")
+fi
 TITLE=""
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --tag)
-            TAG="$2"
+        -t)
+            TAGS+=("$2")
             shift 2
             ;;
         *)
@@ -19,14 +22,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$TITLE" ]]; then
-    echo "Usage: cat foo.md | ob-zettel.sh [--tag TAG] TITLE" >&2
+    echo "Usage: cat foo.md | ob-zettel.sh [-t TAG]... TITLE" >&2
     exit 1
 fi
 
 CONTENT=$(cat)
 
-if [[ -n "$TAG" ]]; then
-    CONTENT="#${TAG}
+if [[ ${#TAGS[@]} -gt 0 ]]; then
+    TAG_LINE=$(printf '#%s ' "${TAGS[@]}")
+    TAG_LINE="${TAG_LINE% }"
+    CONTENT="${TAG_LINE}
 
 ${CONTENT}"
 fi
