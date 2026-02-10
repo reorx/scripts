@@ -6,7 +6,11 @@ reponame=$(basename "$PWD")
 if [ -n "$SKIP_CREATE" ]; then
     echo "skip creating the repo"
 else
-    gh repo create "$reponame" --private
+    visibility="--private"
+    if [ -n "$PUBLIC" ]; then
+        visibility="--public"
+    fi
+    gh repo create "$reponame" $visibility
 fi
 
 set -eu
