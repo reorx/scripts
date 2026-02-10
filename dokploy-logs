@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# dokploy-logs - View logs for Dokploy applications
+# Usage: dokploy-logs [project/app] [options]
+#        dokploy-logs --list
+#        dokploy-logs vocalflow/rt --tail 100 -f
+
+set -euo pipefail
+
+# Config
+DOKPLOY_CONFIG="/opt/homebrew/lib/node_modules/@dokploy/cli/config.json"
+LOGS_ENV="$HOME/.dokploy-logs.env"
+
+# Load SSH host from env file
+if [[ ! -f "$LOGS_ENV" ]]; then
+    echo "Error: Config file not found: $LOGS_ENV" >&2
+    echo "Create it with: echo 'SSH_HOST=your-server' > $LOGS_ENV" >&2
+    exit 1
+fi
+source "$LOGS_ENV"
+
+if [[ -z "${SSH_HOST:-}" ]]; then
+    echo "Error: SSH_HOST not set in $LOGS_ENV" >&2
+    exit 1
+fi
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# Read Dokploy config
+if [[ ! -f "$DOKPLOY_CONFIG" ]]; then
+    echo -e "${RED}Error: Dokploy config not found at $DOKPLOY_CONFIG${NC}" >&2
+    echo "Run 'dokploy authenticate' first" >&2
+    exit 1
+fi
+
+DOKPLOY_URL=$(jq -r '.url' "$DOKPLOY_CONFIG")
+DOKPLOY_TOKEN=$(jq -r '.token' "$DOKPLOY_CONFIG")
+
+# API helper
+api_get() {
+    curl -sf "${DOKPLOY_URL}api/$1" -H "x-api-key: $DOKPLOY_TOKEN"
+}
+
+# List all projects and apps
+list_apps() {
+    echo -e "${CYAN}Projects and Applications:${NC}"
+    echo
+    api_get "project.all" | jq -r '
+        .[] | 
+        .name as $proj |
+        .environments[] |
+        .applications[] |
+        "\($proj)/\(.name)\t\(.appName)"
+    ' | while IFS=$'\t' read -r path appName; do
+        printf "  ${GREEN}%-30s${NC} %s\n" "$path" "$appName"
+    done
+}
+
+# Find appName by project/app path
+find_app() {
+    local path="$1"
+    local project="${path%%/*}"
+    local app="${path#*/}"
+    
+    api_get "project.all" | jq -r --arg proj "$project" --arg app "$app" '
+        .[] | 
+        select(.name == $proj) |
+        .environments[] |
+        .applications[] |
+        select(.name == $app) |
+        .appName
+    ' | head -1
+}
+
+# Show usage
+usage() {
+    cat << EOF
+Usage: dokploy-logs [OPTIONS] [project/app]
+
+Options:
+  --list, -l        List all projects and applications
+  --tail N          Number of lines to show (default: 100)
+  -f, --follow      Follow log output
+  -h, --help        Show this help
+
+Examples:
+  dokploy-logs --list
+  dokploy-logs vocalflow/rt
+  dokploy-logs vocalflow/rt --tail 50 -f
+  dokploy-logs ideachat/app -f
+EOF
+}
+
+# Parse arguments
+APP_PATH=""
+TAIL_LINES="100"
+FOLLOW=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --list|-l)
+            list_apps
+            exit 0
+            ;;
+        --tail)
+            TAIL_LINES="$2"
+            shift 2
+            ;;
+        -f|--follow)
+            FOLLOW="-f"
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        -*)
+            echo -e "${RED}Unknown option: $1${NC}" >&2
+            usage
+            exit 1
+            ;;
+        *)
+            APP_PATH="$1"
+            shift
+            ;;
+    esac
+done
+
+# Require app path
+if [[ -z "$APP_PATH" ]]; then
+    echo -e "${RED}Error: No application specified${NC}" >&2
+    echo
+    usage
+    exit 1
+fi
+
+# Validate path format
+if [[ ! "$APP_PATH" =~ ^[^/]+/[^/]+$ ]]; then
+    echo -e "${RED}Error: Invalid format. Use: project/app${NC}" >&2
+    exit 1
+fi
+
+# Find the app
+echo -e "${CYAN}Finding application: $APP_PATH${NC}" >&2
+APP_NAME=$(find_app "$APP_PATH")
+
+if [[ -z "$APP_NAME" ]]; then
+    echo -e "${RED}Error: Application not found: $APP_PATH${NC}" >&2
+    echo -e "Run 'dokploy-logs --list' to see available apps" >&2
+    exit 1
+fi
+
+echo -e "${GREEN}Found: $APP_NAME${NC}" >&2
+echo >&2
+
+# Find container and get logs
+ssh "$SSH_HOST" "
+    CONTAINER=\$(docker ps --filter \"name=$APP_NAME\" --format '{{.Names}}' | head -1)
+    if [[ -z \"\$CONTAINER\" ]]; then
+        echo 'Error: Container not running' >&2
+        exit 1
+    fi
+    docker logs \"\$CONTAINER\" --tail $TAIL_LINES $FOLLOW
+"
