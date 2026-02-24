@@ -6,7 +6,48 @@ import os
 import subprocess
 import argparse
 import logging
+import ctypes
+import ctypes.util
 from pathlib import Path
+
+
+def is_display_asleep():
+    """Check if the main display is asleep using CoreGraphics."""
+    try:
+        cg_path = ctypes.util.find_library('CoreGraphics')
+        if not cg_path:
+            return False
+        cg = ctypes.cdll.LoadLibrary(cg_path)
+        cg.CGMainDisplayID.restype = ctypes.c_uint32
+        main_display = cg.CGMainDisplayID()
+        cg.CGDisplayIsAsleep.restype = ctypes.c_bool
+        cg.CGDisplayIsAsleep.argtypes = [ctypes.c_uint32]
+        return bool(cg.CGDisplayIsAsleep(main_display))
+    except Exception:
+        return False
+
+
+def is_screen_locked():
+    """Check if the screen is locked by querying IORegistry."""
+    try:
+        result = subprocess.run(
+            ['ioreg', '-n', 'Root', '-d1'],
+            capture_output=True, text=True, timeout=5,
+        )
+        return 'CGSSessionScreenIsLocked' in result.stdout
+    except Exception:
+        return False
+
+
+def is_screen_available(logger=None):
+    """Check if screen is on and unlocked.
+    Returns False if screen is locked or display is sleeping.
+    """
+    locked = is_screen_locked()
+    asleep = is_display_asleep()
+    if logger:
+        logger.debug(f'Screen locked: {locked}, Display asleep: {asleep}')
+    return not locked and not asleep
 
 
 def send_notification(title, message, sound='', use_notifier=False, logger=None):
@@ -115,6 +156,7 @@ def main():
         '--use-notifier', action='store_true', help='Use Notifier app instead of osascript (only for notification type)'
     )
     parser.add_argument('--icon', help='Icon path for alert dialog (only works with -t alert)', default='')
+    parser.add_argument('--force', action='store_true', help='Send notification regardless of screen state')
     args = parser.parse_args()
 
     # Configure logging
@@ -149,6 +191,11 @@ def main():
     message = args.message
     # reconstruct message by adding project_name in front
     message = f'{project_name}: {message}'
+
+    # Check if screen is available (skip notification if screen is off or locked)
+    if not args.force and not is_screen_available(logger):
+        logger.debug('Screen is locked or display is sleeping, skipping notification')
+        sys.exit(0)
 
     # Validate icon option
     if args.icon and args.type != 'alert':
