@@ -1,0 +1,210 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["psutil"]
+# ///
+"""Mac health check: CPU temp, network traffic, CPU load, memory, disk."""
+
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import psutil
+
+# ── Thresholds ──────────────────────────────────────────────
+DEFAULT_THRESHOLDS = {
+    "cpu_temp_c": 80,
+    "net_rx_mbps": 50,
+    "net_tx_mbps": 50,
+    "cpu_load_pct": 80,
+    "mem_used_pct": 85,
+    "swap_used_gb": 4,
+    "disk_used_pct": 90,
+}
+
+CONFIG_PATH = Path.home() / ".config" / "machealth.json"
+
+
+def load_thresholds() -> dict[str, float]:
+    """Load thresholds from config file, CLI -t flags, or defaults.
+
+    Priority: CLI -t > config file > defaults.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Mac health check")
+    parser.add_argument(
+        "-t",
+        action="append",
+        metavar="key=value",
+        help="Override threshold, e.g. -t cpu_temp_c=55",
+    )
+    parser.add_argument(
+        "-c",
+        "--config",
+        metavar="path",
+        help=f"Config file path (default: {CONFIG_PATH})",
+    )
+    parser.add_argument(
+        "--init-config",
+        action="store_true",
+        help="Create config file with current defaults and exit",
+    )
+    args = parser.parse_args()
+
+    config_path = Path(args.config) if args.config else CONFIG_PATH
+
+    # --init-config: write defaults and exit
+    if args.init_config:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(json.dumps(DEFAULT_THRESHOLDS, indent=2) + "\n")
+        print(f"Config written to {config_path}")
+        sys.exit(0)
+
+    # Start with defaults
+    thresholds = dict(DEFAULT_THRESHOLDS)
+
+    # Layer config file on top
+    if config_path.exists():
+        try:
+            data = json.loads(config_path.read_text())
+            for k, v in data.items():
+                if k in thresholds:
+                    thresholds[k] = float(v)
+                else:
+                    print(f"Warning: unknown key '{k}' in {config_path}", file=sys.stderr)
+        except (json.JSONDecodeError, ValueError) as e:
+            print(f"Warning: failed to parse {config_path}: {e}", file=sys.stderr)
+
+    # Layer CLI -t flags on top (highest priority)
+    if args.t:
+        for item in args.t:
+            k, _, v = item.partition("=")
+            if k in thresholds:
+                thresholds[k] = float(v)
+            else:
+                print(f"Unknown threshold key: {k}", file=sys.stderr)
+                print(f"Available: {', '.join(sorted(thresholds))}", file=sys.stderr)
+                sys.exit(1)
+
+    return thresholds
+
+
+THRESHOLDS = load_thresholds()
+
+DANGER_MARKER = "⚠️"
+
+
+def fmt(label: str, value: str, current: float, key: str) -> str:
+    threshold = THRESHOLDS.get(key)
+    if threshold is not None and current > threshold:
+        return f"{label}: {value}  {DANGER_MARKER} {current:.1f} > {threshold:.1f}"
+    elif threshold is not None:
+        return f"{label}: {value}  ✅ {current:.1f} <= {threshold:.1f}"
+    return f"{label}: {value}"
+
+
+# ── CPU Temperature ─────────────────────────────────────────
+def get_cpu_temp() -> float | None:
+    """Read CPU temperature via smctemp (supports Apple Silicon M1-M4)."""
+    try:
+        out = subprocess.run(
+            ["smctemp", "-c"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        return float(out.stdout.strip())
+    except (subprocess.TimeoutExpired, FileNotFoundError, ValueError):
+        pass
+    return None
+
+
+# ── Network Traffic (1-second sample) ───────────────────────
+def get_net_rates() -> tuple[float, float]:
+    c1 = psutil.net_io_counters()
+    time.sleep(1)
+    c2 = psutil.net_io_counters()
+    rx_mbps = (c2.bytes_recv - c1.bytes_recv) * 8 / 1_000_000
+    tx_mbps = (c2.bytes_sent - c1.bytes_sent) * 8 / 1_000_000
+    return rx_mbps, tx_mbps
+
+
+# ── Main ────────────────────────────────────────────────────
+def main() -> bool:
+    lines: list[str] = []
+
+    # 1. CPU Temperature
+    temp = get_cpu_temp()
+    if temp is not None:
+        lines.append(fmt("CPU Temp", f"{temp:.1f} °C", temp, "cpu_temp_c"))
+    else:
+        lines.append("CPU Temp: N/A (install smctemp: brew tap narugit/tap && brew install smctemp)")
+
+    # 2. Network Traffic
+    rx, tx = get_net_rates()
+    lines.append(fmt("Net RX", f"{rx:.2f} Mbps", rx, "net_rx_mbps"))
+    lines.append(fmt("Net TX", f"{tx:.2f} Mbps", tx, "net_tx_mbps"))
+
+    # 3. CPU Load
+    # load average = avg number of processes waiting to run.
+    # Normalize to percentage: (load1 / cores) * 100
+    # e.g. load=5 on 10 cores → 50% utilization.
+    load1, load5, load15 = os.getloadavg()
+    cores = psutil.cpu_count() or 1
+    load_pct = (load1 / cores) * 100
+    lines.append(
+        fmt(
+            "CPU Load",
+            f"{load1:.2f} / {load5:.2f} / {load15:.2f}  ({load_pct:.0f}% of {cores} cores)",
+            load_pct,
+            "cpu_load_pct",
+        )
+    )
+
+    # 4. Memory
+    mem = psutil.virtual_memory()
+    lines.append(
+        fmt(
+            "Memory",
+            f"{mem.used / 2**30:.1f} / {mem.total / 2**30:.1f} GB ({mem.percent}%)",
+            mem.percent,
+            "mem_used_pct",
+        )
+    )
+    swap = psutil.swap_memory()
+    swap_gb = swap.used / 2**30
+    lines.append(fmt("Swap", f"{swap_gb:.1f} / {swap.total / 2**30:.1f} GB", swap_gb, "swap_used_gb"))
+
+    # 5. Disk
+    # On macOS APFS, user data lives on /System/Volumes/Data.
+    # Use shutil.disk_usage("/") which reports the full volume correctly,
+    # unlike psutil which may only see the read-only system snapshot.
+    import shutil
+
+    disk_paths: list[tuple[str, str]] = [("/", "/")]
+    for part in psutil.disk_partitions():
+        if part.mountpoint.startswith("/Volumes"):
+            disk_paths.append((part.mountpoint, part.mountpoint.split("/")[-1]))
+    for path, name in disk_paths:
+        usage = shutil.disk_usage(path)
+        pct = usage.used / usage.total * 100
+        lines.append(
+            fmt(
+                f"Disk [{name}]",
+                f"{usage.used / 2**30:.1f} / {usage.total / 2**30:.1f} GB ({pct:.1f}%)",
+                pct,
+                "disk_used_pct",
+            )
+        )
+
+    print("\n".join(lines))
+    return any(DANGER_MARKER in line for line in lines)
+
+
+if __name__ == "__main__":
+    has_danger = main()
+    sys.exit(1 if has_danger else 0)
