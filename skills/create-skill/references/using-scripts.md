@@ -1,7 +1,3 @@
-> ## Documentation Index
-> Fetch the complete documentation index at: https://agentskills.io/llms.txt
-> Use this file to discover all available pages before exploring further.
-
 # Using scripts in skills
 
 > How to run commands and bundle executable scripts in your skills.
@@ -12,35 +8,21 @@ Skills can instruct agents to run shell commands and bundle reusable scripts in 
 
 When an existing package already does what you need, you can reference it directly in your `SKILL.md` instructions without a `scripts/` directory. Many ecosystems provide tools that auto-resolve dependencies at runtime.
 
-<Tabs sync={false}>
-  <Tab title="uvx">
+- uvx:
     [uvx](https://docs.astral.sh/uv/guides/tools/) runs Python packages in isolated environments with aggressive caching. It ships with [uv](https://docs.astral.sh/uv/).
 
-    ```bash  theme={null}
+    ```bash
     uvx ruff@0.8.0 check .
     uvx black@24.10.0 .
     ```
 
     * Not bundled with Python — requires a separate install.
     * Fast. Caches aggressively so repeat runs are near-instant.
-  </Tab>
 
-  <Tab title="pipx">
-    [pipx](https://pipx.pypa.io/) runs Python packages in isolated environments. Available via OS package managers (`apt install pipx`, `brew install pipx`).
-
-    ```bash  theme={null}
-    pipx run 'black==24.10.0' .
-    pipx run 'ruff==0.8.0' check .
-    ```
-
-    * Not bundled with Python — requires a separate install.
-    * A mature alternative to `uvx`. While `uvx` has become the standard recommendation, `pipx` remains a reliable option with broader OS package manager availability.
-  </Tab>
-
-  <Tab title="npx">
+- npx:
     [npx](https://docs.npmjs.com/cli/commands/npx) runs npm packages, downloading them on demand. It ships with npm (which ships with Node.js).
 
-    ```bash  theme={null}
+    ```bash
     npx eslint@9 --fix .
     npx create-vite@6 my-app
     ```
@@ -48,44 +30,28 @@ When an existing package already does what you need, you can reference it direct
     * Bundled with Node.js — no extra install needed.
     * Downloads the package, runs it, and caches it for future use.
     * Pin versions with `npx package@version` for reproducibility.
-  </Tab>
 
-  <Tab title="bunx">
+- bunx:
     [bunx](https://bun.sh/docs/cli/bunx) is Bun's equivalent of `npx`. It ships with [Bun](https://bun.sh/).
 
-    ```bash  theme={null}
+    ```bash
     bunx eslint@9 --fix .
     bunx create-vite@6 my-app
     ```
 
     * Drop-in replacement for `npx` in Bun-based environments.
     * Only appropriate when the user's environment has Bun rather than Node.js.
-  </Tab>
 
-  <Tab title="deno run">
-    [deno run](https://docs.deno.com/runtime/reference/cli/run/) runs scripts directly from URLs or specifiers. It ships with [Deno](https://deno.com/).
-
-    ```bash  theme={null}
-    deno run npm:create-vite@6 my-app
-    deno run --allow-read npm:eslint@9 -- --fix .
-    ```
-
-    * Permission flags (`--allow-read`, etc.) are required for filesystem/network access.
-    * Use `--` to separate Deno flags from the tool's own flags.
-  </Tab>
-
-  <Tab title="go run">
+- go run:
     [go run](https://pkg.go.dev/cmd/go#hdr-Compile_and_run_Go_program) compiles and runs Go packages directly. It is built into the `go` command.
 
-    ```bash  theme={null}
+    ```bash
     go run golang.org/x/tools/cmd/goimports@v0.28.0 .
     go run github.com/golangci/golangci-lint/cmd/golangci-lint@v1.62.0 run
     ```
 
     * Built into Go — no extra tooling needed.
     * Pin versions or use `@latest` to make the command explicit.
-  </Tab>
-</Tabs>
 
 **Tips for one-off commands in skills:**
 
@@ -99,7 +65,7 @@ Use **relative paths from the skill directory root** to reference bundled files.
 
 List available scripts in your `SKILL.md` so the agent knows they exist:
 
-```markdown SKILL.md theme={null}
+```
 ## Available scripts
 
 - **`scripts/validate.sh`** — Validates configuration files
@@ -108,7 +74,7 @@ List available scripts in your `SKILL.md` so the agent knows they exist:
 
 Then instruct the agent to run them:
 
-````markdown SKILL.md theme={null}
+````
 ## Workflow
 
 1. Run the validation script:
@@ -132,8 +98,7 @@ When you need reusable logic, bundle a script in `scripts/` that declares its ow
 
 Several languages support inline dependency declarations:
 
-<Tabs sync={false}>
-  <Tab title="Python">
+- Python:
     [PEP 723](https://peps.python.org/pep-0723/) defines a standard format for inline script metadata. Declare dependencies in a TOML block inside `# ///` markers:
 
     ```python scripts/extract.py theme={null}
@@ -151,7 +116,7 @@ Several languages support inline dependency declarations:
 
     Run with [uv](https://docs.astral.sh/uv/) (recommended):
 
-    ```bash  theme={null}
+    ```bash
     uv run scripts/extract.py
     ```
 
@@ -160,32 +125,8 @@ Several languages support inline dependency declarations:
     * Pin versions with [PEP 508](https://peps.python.org/pep-0508/) specifiers: `"beautifulsoup4>=4.12,<5"`.
     * Use `requires-python` to constrain the Python version.
     * Use `uv lock --script` to create a lockfile for full reproducibility.
-  </Tab>
 
-  <Tab title="Deno">
-    Deno's `npm:` and `jsr:` import specifiers make every script self-contained by default:
-
-    ```typescript scripts/extract.ts theme={null}
-    #!/usr/bin/env -S deno run
-
-    import * as cheerio from "npm:cheerio@1.0.0";
-
-    const html = `<html><body><h1>Welcome</h1><p class="info">This is a test.</p></body></html>`;
-    const $ = cheerio.load(html);
-    console.log($("p.info").text());
-    ```
-
-    ```bash  theme={null}
-    deno run scripts/extract.ts
-    ```
-
-    * Use `npm:` for npm packages, `jsr:` for Deno-native packages.
-    * Version specifiers follow semver: `@1.0.0` (exact), `@^1.0.0` (compatible).
-    * Dependencies are cached globally. Use `--reload` to force re-fetch.
-    * Packages with native addons (node-gyp) may not work — packages that ship pre-built binaries work best.
-  </Tab>
-
-  <Tab title="Bun">
+- Bun:
     Bun auto-installs missing packages at runtime when no `node_modules` directory is found. Pin versions directly in the import path:
 
     ```typescript scripts/extract.ts theme={null}
@@ -198,16 +139,15 @@ Several languages support inline dependency declarations:
     console.log($("p.info").text());
     ```
 
-    ```bash  theme={null}
+    ```bash
     bun run scripts/extract.ts
     ```
 
     * No `package.json` or `node_modules` needed. TypeScript works natively.
     * Packages are cached globally. First run downloads; subsequent runs are near-instant.
     * If a `node_modules` directory exists anywhere up the directory tree, auto-install is disabled and Bun falls back to standard Node.js resolution.
-  </Tab>
 
-  <Tab title="Ruby">
+- Ruby:
     Bundler ships with Ruby since 2.6. Use `bundler/inline` to declare gems directly in the script:
 
     ```ruby scripts/extract.rb theme={null}
@@ -223,14 +163,12 @@ Several languages support inline dependency declarations:
     puts doc.at_css('p.info').text
     ```
 
-    ```bash  theme={null}
+    ```bash
     ruby scripts/extract.rb
     ```
 
     * Pin versions explicitly (`gem 'nokogiri', '~> 1.16'`) — there is no lockfile.
     * An existing `Gemfile` or `BUNDLE_GEMFILE` env var in the working directory can interfere.
-  </Tab>
-</Tabs>
 
 ## Designing scripts for agentic use
 
