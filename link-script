@@ -1,0 +1,103 @@
+#!/bin/bash
+
+set -euo pipefail
+
+BINDIR="$HOME/.local/bin"
+
+usage() {
+    echo "Usage: link-script [-l] [-d <name>] [<relative-path-to-script>]" >&2
+    echo "  <path>   Link a script into $BINDIR" >&2
+    echo "  -l       List all symlinks in $BINDIR" >&2
+    echo "  -d <name> Remove a symlink from $BINDIR" >&2
+    exit 1
+}
+
+list_links() {
+    if [[ ! -d "$BINDIR" ]]; then
+        echo "No directory: $BINDIR"
+        exit 0
+    fi
+    printf "NAME\tTARGET\n"
+    for f in "$BINDIR"/*; do
+        [[ -e "$f" || -L "$f" ]] || continue
+        if [[ -L "$f" ]]; then
+            printf "%s\t%s\n" "$(basename "$f")" "$(readlink "$f")"
+        fi
+    done
+}
+
+delete_link() {
+    local name="$1"
+    local dest="$BINDIR/$name"
+
+    if [[ ! -e "$dest" && ! -L "$dest" ]]; then
+        echo "Error: '$dest' does not exist" >&2
+        exit 1
+    fi
+    if [[ ! -L "$dest" ]]; then
+        echo "Error: '$dest' is not a symlink, refusing to remove" >&2
+        exit 1
+    fi
+
+    local target
+    target="$(readlink "$dest")"
+    rm "$dest"
+    echo "Removed: $dest -> $target"
+}
+
+link_script() {
+    local src_rel="$1"
+
+    # resolve to absolute path
+    local src
+    src="$(cd "$(dirname "$src_rel")" && pwd)/$(basename "$src_rel")"
+
+    if [[ ! -f "$src" ]]; then
+        echo "Error: '$src' is not a file" >&2
+        exit 1
+    fi
+
+    mkdir -p "$BINDIR"
+
+    local name dest
+    name="$(basename "$src")"
+    dest="$BINDIR/$name"
+
+    if [[ -L "$dest" ]]; then
+        local old_target
+        old_target="$(readlink "$dest")"
+        if [[ "$old_target" == "$src" ]]; then
+            echo "Already linked: $dest -> $src"
+            exit 0
+        fi
+        echo "Overriding existing link: $dest -> $old_target"
+        ln -sf "$src" "$dest"
+        echo "Updated: $dest -> $src"
+    elif [[ -e "$dest" ]]; then
+        echo "Warning: $dest exists and is not a symlink, overriding" >&2
+        ln -sf "$src" "$dest"
+        echo "Replaced: $dest -> $src"
+    else
+        ln -s "$src" "$dest"
+        echo "Linked: $dest -> $src"
+    fi
+}
+
+if [[ $# -eq 0 ]]; then
+    usage
+fi
+
+while getopts ":ld:" opt; do
+    case "$opt" in
+        l) list_links; exit 0 ;;
+        d) delete_link "$OPTARG"; exit 0 ;;
+        *) usage ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+if [[ $# -eq 0 ]]; then
+    usage
+fi
+
+link_script "$1"
