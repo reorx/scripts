@@ -3,7 +3,9 @@ name: create-skill
 description: This is the skill to create skills. Use when user want to create a new skill. 中文语境下，当用户需要创建一个新技能时，使用这个技能。
 ---
 
-When you are prepared, ask user to provide information about the skill to create.
+Create an agent skill based on what user describes. If no input, ask user to provide information about the skill to create.
+
+The skill directory should be created under the skills/ dir of the current project.
 
 ## Directory structure
 
