@@ -2,13 +2,13 @@
 name: kb
 description: >-
   Manage the project's kb/ knowledge base folder. Use this skill when notes, plans, session summaries,
-  or todo files are produced during development, or when the user wants to write, organize, or move
-  such files into the kb/ directory. Also triggers for /kb summarize session or /kb 总结 session.
+  todo files, or reference documents are produced during development, or when the user wants to write, organize, move,
+  download, or search files in the kb/ directory. Also triggers for /kb summarize session or /kb 总结 session.
 ---
 
 # KB - Project Knowledge Base
 
-Maintain a `kb/` folder at the project root as the project's evolving knowledge base. The folder has four sub-directories:
+Maintain a `kb/` folder at the project root as the project's evolving knowledge base. The folder has five sub-directories:
 
 | Directory | Purpose |
 |-----------|---------|
@@ -16,14 +16,20 @@ Maintain a `kb/` folder at the project root as the project's evolving knowledge 
 | `kb/sessions/` | Session summaries (what was done on a given date) |
 | `kb/notes/` | Research findings, ideas, discussion notes |
 | `kb/todos/` | Task checklists for a piece of work, using `- [x]` / `- [ ]` syntax |
+| `kb/docs/` | Downloaded reference documents (web pages saved as markdown) |
 
 ## Initialization
 
 Before writing any file, ensure the target directory exists. Create it if needed:
 
 ```bash
-mkdir -p kb/plans kb/sessions kb/notes kb/todos
+mkdir -p kb/plans kb/sessions kb/notes kb/todos kb/docs
 ```
+
+## Available Scripts
+
+- **`scripts/puremd.sh`** — Download a web page as markdown via pure.md
+- **`scripts/search-docs.sh`** — Search downloaded documents using ripgrep
 
 ## File Naming Convention
 
@@ -35,6 +41,8 @@ YYYY-MM-DD-<slug>.md
 
 - Date is today's date (obtain via `date +%Y-%m-%d`)
 - `<slug>` is a short English phrase summarizing the content, words joined by `-`
+
+> **Note**: Files in `kb/docs/` are an exception — they use URL-derived filenames from the download script, not the date-slug pattern.
 
 ## Frontmatter
 
@@ -56,7 +64,7 @@ tags:
 
 The user invokes this skill with `/kb <intent>`. Interpret the intent to determine:
 
-1. **Which directory** the file belongs in (plans, sessions, notes, or todos)
+1. **Which directory** the file belongs in (plans, sessions, notes, todos, or docs)
 2. **What action** to take — create a new file, move an existing file, or update an existing file
 
 Examples:
@@ -67,6 +75,8 @@ Examples:
 | `/kb 将刚才生成的文件放到 plans 下面` | Move/copy the plan file from context into `kb/plans/` |
 | `/kb create a todo for the auth feature` | Create a todo checklist in `kb/todos/` |
 | `/kb summarize session` or `/kb 总结 session` | Create a session summary in `kb/sessions/` — see below |
+| `/kb https://example.com/docs` | Download URL as markdown into `kb/docs/` |
+| `/kb search "auth" in docs` | Search `kb/docs/` for the pattern |
 
 When the intent is ambiguous, ask the user which directory to use.
 
@@ -89,7 +99,7 @@ Files in `kb/todos/` use Markdown checkbox lists:
 ## Workflow
 
 1. Parse the user's intent from the arguments after `/kb`
-2. Determine the target directory (plans / sessions / notes / todos)
+2. Determine the target directory (plans / sessions / notes / todos / docs)
 3. Ensure the directory exists (`mkdir -p`)
 4. Determine file content:
    - If the user wants to **move/place** an existing file from context: read it, add frontmatter if missing, write to the target directory
@@ -97,6 +107,34 @@ Files in `kb/todos/` use Markdown checkbox lists:
    - If the user wants to **summarize a session**: follow [summarize-session](references/summarize-session.md) instructions
 5. Name the file as `YYYY-MM-DD-<slug>.md`
 6. Write the file and confirm the path to the user
+
+## Downloading and Searching Documents
+
+### Download a Document
+
+To save a web page as markdown into `kb/docs/`:
+
+```bash
+bash scripts/puremd.sh -o kb/docs "<url>"
+```
+
+The file is saved as `<url-basename>.md` inside `kb/docs/`. The script creates the directory automatically.
+
+### Search Documents
+
+```bash
+# basic search
+bash scripts/search-docs.sh "<pattern>"
+
+# case-insensitive with more context
+bash scripts/search-docs.sh -i -c 5 "<pattern>"
+
+# list matching filenames only
+bash scripts/search-docs.sh -l "<pattern>"
+
+# search a subdirectory
+bash scripts/search-docs.sh "<pattern>" kb/docs/some-subdir/
+```
 
 ## Proactive Trigger
 
