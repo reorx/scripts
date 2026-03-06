@@ -115,10 +115,20 @@ Files in `kb/todos/` use Markdown checkbox lists:
 To save a web page as markdown into `kb/docs/`:
 
 ```bash
-bash scripts/puremd.sh -o kb/docs "<url>"
+bash scripts/puremd.sh "<url>" kb/docs/
 ```
 
-The file is saved as `<url-basename>.md` inside `kb/docs/`. The script creates the directory automatically.
+The second argument can be a directory (trailing `/`) or a specific file path. Use a file path when the URL basename doesn't make a good filename:
+
+```bash
+# URL basename is fine — saves as kb/docs/route-module.md
+bash scripts/puremd.sh "https://reactrouter.com/start/framework/route-module" kb/docs/
+
+# URL basename is not descriptive — specify a better name
+bash scripts/puremd.sh "https://example.com/docs/v2/api" kb/docs/example-api-v2.md
+```
+
+The script creates the target directory automatically.
 
 ### Search Documents
 
