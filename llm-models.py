@@ -53,6 +53,17 @@ def parse_query(query):
     return query, None
 
 
+def list_providers():
+    """List all available provider IDs and names."""
+    data = load_cache()
+    for provider_id in sorted(data.keys()):
+        name = data[provider_id].get('name', '')
+        if name and name != provider_id:
+            print(f'- {provider_id}  ({name})')
+        else:
+            print(f'- {provider_id}')
+
+
 def list_models(queries, show_price=False):
     """Filter and display models by provider and optional regex pattern."""
     data = load_cache()
@@ -98,6 +109,7 @@ def main():
     subparsers = parser.add_subparsers(dest='command', required=True)
 
     subparsers.add_parser('update', help='Fetch API and update local cache')
+    subparsers.add_parser('providers', help='List all available providers')
 
     list_parser = subparsers.add_parser('list', help='List models filtered by provider and pattern')
     list_parser.add_argument(
@@ -116,6 +128,8 @@ def main():
 
     if args.command == 'update':
         update()
+    elif args.command == 'providers':
+        list_providers()
     elif args.command == 'list':
         list_models(args.queries, show_price=args.price)
 
