@@ -53,9 +53,13 @@ def parse_query(query):
     return query, None
 
 
-def list_models(queries):
+def list_models(queries, show_price=False):
     """Filter and display models by provider and optional regex pattern."""
     data = load_cache()
+
+    if show_price:
+        print('(price: USD per 1M tokens)')
+        print()
 
     for query in queries:
         provider_id, pattern = parse_query(query)
@@ -78,7 +82,12 @@ def list_models(queries):
         print(f'{provider_id}:')
         if matched:
             for model_id in matched:
-                print(f'- {model_id}')
+                line = f'- {model_id}'
+                if show_price:
+                    cost = models[model_id].get('cost')
+                    if cost:
+                        line += f'  (in: ${cost["input"]}, out: ${cost["output"]})'
+                print(line)
         else:
             print('  (no matches)')
         print()
@@ -92,6 +101,11 @@ def main():
 
     list_parser = subparsers.add_parser('list', help='List models filtered by provider and pattern')
     list_parser.add_argument(
+        '-p', '--price',
+        action='store_true',
+        help='Show pricing info (input/output cost per 1M tokens)',
+    )
+    list_parser.add_argument(
         'queries',
         nargs='+',
         metavar='QUERY',
@@ -103,7 +117,7 @@ def main():
     if args.command == 'update':
         update()
     elif args.command == 'list':
-        list_models(args.queries)
+        list_models(args.queries, show_price=args.price)
 
 
 if __name__ == '__main__':
