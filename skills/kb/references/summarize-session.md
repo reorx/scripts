@@ -1,4 +1,4 @@
-总结当前 session 所做的事情，写入项目根目录下的 `kb/sessions/` 目录中（即 `<project-root>/docs/sessions/`）。如果目录不存在，先创建它。
+总结当前 session 所做的事情，写入项目根目录下的 `kb/sessions/` 目录中（即 `<project-root>/kb/sessions/`）。如果目录不存在，先创建它。
 
 ## 文件命名
 

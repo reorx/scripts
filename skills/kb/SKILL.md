@@ -4,6 +4,9 @@ description: >-
   Manage the project's kb/ knowledge base folder. Use this skill when notes, plans, session summaries,
   todo files, or reference documents are produced during development, or when the user wants to write, organize, move,
   download, or search files in the kb/ directory. Also triggers for /kb summarize session or /kb 总结 session.
+  IMPORTANT: Proactively trigger this skill when a development plan has been written or finalized in conversation,
+  or when research/investigation results are ready — offer to save them to kb/ even if the user didn't explicitly
+  ask. Any time content is produced that would be valuable to preserve as project knowledge, this skill should activate.
 ---
 
 # KB - Project Knowledge Base
@@ -148,7 +151,9 @@ bash scripts/search-docs.sh "<pattern>" kb/docs/some-subdir/
 
 ## Proactive Trigger
 
-Auto-invoke this skill in cases like:
+Without waiting for the user to say `/kb`, proactively ask the user whether they'd like to save content to `kb/` in these situations:
 
-- A **Plan** has been written/finalized in the conversation — offer to save it to `kb/plans/`
-- **Research or investigation** results are ready — offer to save as a note in `kb/notes/`
+- A **development plan** has been written or finalized in the conversation → ask: "Want me to save this plan to `kb/plans/`?"
+- **Research or investigation** results are ready (e.g. after exploring a codebase, comparing approaches, or summarizing findings) → ask: "Want me to save these findings to `kb/notes/`?"
+
+Keep it lightweight — a single-line question at the end of your response. Don't interrupt the flow or force it if the content is trivial.
