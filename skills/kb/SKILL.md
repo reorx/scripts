@@ -3,7 +3,7 @@ name: kb
 description: >-
   Manage the project's kb/ knowledge base folder. Use this skill when notes, plans, session summaries,
   todo files, or reference documents are produced during development, or when the user wants to write, organize, move,
-  download, or search files in the kb/ directory. Also triggers for /kb summarize session or /kb 总结 session.
+  download, or search files in the kb/ directory. Also triggers for /kb summarize session, /kb ss, or /kb 总结 session.
   IMPORTANT: Proactively trigger this skill when a development plan has been written or finalized in conversation,
   or when research/investigation results are ready — offer to save them to kb/ even if the user didn't explicitly
   ask. Any time content is produced that would be valuable to preserve as project knowledge, this skill should activate.
@@ -77,7 +77,7 @@ Examples:
 | `/kb 将调研情况记录到笔记中` | Create a note in `kb/notes/` summarizing the research from context |
 | `/kb 将刚才生成的文件放到 plans 下面` | Move/copy the plan file from context into `kb/plans/` |
 | `/kb create a todo for the auth feature` | Create a todo checklist in `kb/todos/` |
-| `/kb summarize session` or `/kb 总结 session` | Create a session summary in `kb/sessions/` — see below |
+| `/kb summarize session`, `/kb ss`, or `/kb 总结 session` | Create a session summary in `kb/sessions/` — see below |
 | `/kb https://example.com/docs` | Download URL as markdown into `kb/docs/` |
 | `/kb search "auth" in docs` | Search `kb/docs/` for the pattern |
 
@@ -85,7 +85,7 @@ When the intent is ambiguous, ask the user which directory to use.
 
 ## Summarize Session
 
-When the user says `/kb summarize session` or `/kb 总结 session`, create a session summary file in `kb/sessions/` following the instructions in [summarize-session](references/summarize-session.md).
+When the user says `/kb summarize session`, `/kb ss`, or `/kb 总结 session`, create a session summary file in `kb/sessions/` following the instructions in [summarize-session](references/summarize-session.md).
 
 The session file must also include the standard frontmatter with `created` date and `tags`.
 
