@@ -89,6 +89,8 @@ When the user says `/kb summarize session`, `/kb ss`, or `/kb 总结 session`, c
 
 The session file must also include the standard frontmatter with `created` date and `tags`.
 
+After writing the session file, invoke `/commit-commands:commit` to commit the new session file.
+
 ## Todos Format
 
 Files in `kb/todos/` use Markdown checkbox lists:
