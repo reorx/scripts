@@ -56,7 +56,4 @@ FILEPATH="${VAULT_PATH}/${FILENAME}"
 mkdir -p "$(dirname "$FILEPATH")"
 printf '%s' "$CONTENT" > "$FILEPATH"
 
-if command -v obsidian-cli &>/dev/null; then
-    obsidian-cli open "$FILENAME"
-fi
 echo "\`$FILENAME\` created in obsidian"
