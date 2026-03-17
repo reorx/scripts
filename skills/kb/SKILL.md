@@ -89,7 +89,41 @@ When the user says `/kb summarize session`, `/kb ss`, or `/kb 总结 session`, c
 
 The session file must also include the standard frontmatter with `created` date and `tags`.
 
-After writing the session file, invoke `/commit-commands:commit` to commit the new session file.
+After writing the session file, update `AGENTS.md` — see the section below. Then invoke `/commit-commands:commit` to commit the new session file and updated `AGENTS.md`.
+
+## AGENTS.md — Living Project Overview
+
+`AGENTS.md` lives at the project root. It gives coding agents a quick, accurate picture of the project's current state — what exists, how things are organized, key decisions, and anything an agent should know before working on the codebase.
+
+### Structure
+
+There's no rigid template. Organize it in whatever way best describes the project. Typical sections might include:
+
+- Project purpose and architecture overview
+- Key directories and files
+- Important patterns, conventions, or constraints
+- Active features and their status
+- Known quirks or gotchas
+
+The file should stay compact — think reference card, not documentation site. Aim for something an agent can absorb in one read.
+
+### When to create
+
+If `AGENTS.md` doesn't exist yet when a session summary is written, create it from scratch based on what you know about the project from the current session context.
+
+### How to update after a session summary
+
+After writing a session file to `kb/sessions/`, read `AGENTS.md` and the session summary, then analyze what changed:
+
+- **New feature or component** → Add it to the relevant section (or create a new section if nothing fits)
+- **Refactor or rename** → Update existing descriptions to match the new reality. Remove references to old names/structures.
+- **Bug fix** → Usually no AGENTS.md change needed, unless it reveals a gotcha worth documenting
+- **Deleted or removed something** → Remove it from AGENTS.md
+- **New convention or pattern established** → Document it
+
+The goal is that AGENTS.md always reflects the *current* state of the project, not its history. Session summaries in `kb/sessions/` track history — AGENTS.md tracks "what is true right now."
+
+Use the Edit tool to make surgical updates. Don't rewrite the whole file unless the structure itself needs rethinking.
 
 ## Todos Format
 
@@ -112,6 +146,7 @@ Files in `kb/todos/` use Markdown checkbox lists:
    - If the user wants to **summarize a session**: follow [summarize-session](references/summarize-session.md) instructions
 5. Name the file as `YYYY-MM-DD-<slug>.md`
 6. Write the file and confirm the path to the user
+7. **If a session summary was written**: read `AGENTS.md` (or note its absence), analyze the session changes, and update or create `AGENTS.md` accordingly
 
 ## Downloading and Searching Documents
 
