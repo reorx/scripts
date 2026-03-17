@@ -4,9 +4,12 @@ description: >-
   Manage the project's kb/ knowledge base folder. Use this skill when notes, plans, session summaries,
   todo files, or reference documents are produced during development, or when the user wants to write, organize, move,
   download, or search files in the kb/ directory. Also triggers for /kb summarize session, /kb ss, or /kb 总结 session.
+  Also triggers for /kb archive task or /kb at — archives planning-with-files task artifacts (task_plan.md, progress.md,
+  findings.md) from the project root into kb/tasks/.
   IMPORTANT: Proactively trigger this skill when a development plan has been written or finalized in conversation,
   or when research/investigation results are ready — offer to save them to kb/ even if the user didn't explicitly
   ask. Any time content is produced that would be valuable to preserve as project knowledge, this skill should activate.
+  Also proactively offer to archive task files when a planning-with-files task appears to be complete.
 ---
 
 # KB - Project Knowledge Base
@@ -20,13 +23,14 @@ Maintain a `kb/` folder at the project root as the project's evolving knowledge 
 | `kb/notes/` | Research findings, ideas, discussion notes |
 | `kb/todos/` | Task checklists for a piece of work, using `- [x]` / `- [ ]` syntax |
 | `kb/docs/` | Downloaded reference documents (web pages saved as markdown) |
+| `kb/tasks/` | Archived task artifacts from planning-with-files (task_plan.md, progress.md, findings.md) |
 
 ## Initialization
 
 Before writing any file, ensure the target directory exists. Create it if needed:
 
 ```bash
-mkdir -p kb/plans kb/sessions kb/notes kb/todos kb/docs
+mkdir -p kb/plans kb/sessions kb/notes kb/todos kb/docs kb/tasks
 ```
 
 ## Available Scripts
@@ -80,6 +84,7 @@ Examples:
 | `/kb summarize session`, `/kb ss`, or `/kb 总结 session` | Create a session summary in `kb/sessions/` — see below |
 | `/kb https://example.com/docs` | Download URL as markdown into `kb/docs/` |
 | `/kb search "auth" in docs` | Search `kb/docs/` for the pattern |
+| `/kb archive task`, `/kb at` | Archive planning-with-files artifacts into `kb/tasks/` — see below |
 
 When the intent is ambiguous, ask the user which directory to use.
 
@@ -90,6 +95,46 @@ When the user says `/kb summarize session`, `/kb ss`, or `/kb 总结 session`, c
 The session file must also include the standard frontmatter with `created` date and `tags`.
 
 After writing the session file, update `AGENTS.md` — see the section below. Then invoke `/commit-commands:commit` to commit the new session file and updated `AGENTS.md`.
+
+## Archive Task
+
+When the user says `/kb archive task` or `/kb at`, archive the planning-with-files task artifacts from the project root into `kb/tasks/`.
+
+### What gets archived
+
+The planning-with-files skill creates these files at the project root:
+
+- `task_plan.md` — the task plan with phases and status
+- `progress.md` — progress log of completed steps
+- `findings.md` — research findings and investigation notes
+
+All three files are moved into a single task directory. If only some of these files exist, archive whatever is present.
+
+### Task directory naming
+
+Each archived task gets its own directory under `kb/tasks/`, named as:
+
+```
+YYYY-MM-DD-<descriptive-slug>
+```
+
+- Date is today's date
+- `<descriptive-slug>` is a comprehensive hyphenated name derived from the task plan's title or objective (e.g. `2026-03-17-implement-user-auth-api`, `2026-03-17-migrate-database-to-postgres`)
+
+Read `task_plan.md` first to determine the slug from the task's title/objective.
+
+### Workflow
+
+1. Check that at least one of `task_plan.md`, `progress.md`, `findings.md` exists at the project root
+2. Read `task_plan.md` to determine the task name for the directory slug
+3. Create the target directory: `mkdir -p kb/tasks/YYYY-MM-DD-<slug>`
+4. Move each existing file: `mv task_plan.md progress.md findings.md kb/tasks/YYYY-MM-DD-<slug>/`
+5. Confirm to the user which files were archived and the target path
+6. Invoke `/commit-commands:commit` to commit the archived task files
+
+### Proactive archiving
+
+When a planning-with-files task appears complete (all phases marked done in task_plan.md, or the user says the task is finished), proactively ask: "Want me to archive the task files to `kb/tasks/`?"
 
 ## AGENTS.md — Living Project Overview
 
@@ -138,12 +183,13 @@ Files in `kb/todos/` use Markdown checkbox lists:
 ## Workflow
 
 1. Parse the user's intent from the arguments after `/kb`
-2. Determine the target directory (plans / sessions / notes / todos / docs)
+2. Determine the target directory (plans / sessions / notes / todos / docs / tasks)
 3. Ensure the directory exists (`mkdir -p`)
 4. Determine file content:
    - If the user wants to **move/place** an existing file from context: read it, add frontmatter if missing, write to the target directory
    - If the user wants to **create** new content: gather information from the conversation context, compose the content with proper frontmatter
    - If the user wants to **summarize a session**: follow [summarize-session](references/summarize-session.md) instructions
+   - If the user wants to **archive a task**: follow the Archive Task workflow above
 5. Name the file as `YYYY-MM-DD-<slug>.md`
 6. Write the file and confirm the path to the user
 7. **If a session summary was written**: read `AGENTS.md` (or note its absence), analyze the session changes, and update or create `AGENTS.md` accordingly
@@ -192,5 +238,6 @@ Without waiting for the user to say `/kb`, proactively ask the user whether they
 
 - A **development plan** has been written or finalized in the conversation → ask: "Want me to save this plan to `kb/plans/`?"
 - **Research or investigation** results are ready (e.g. after exploring a codebase, comparing approaches, or summarizing findings) → ask: "Want me to save these findings to `kb/notes/`?"
+- A **planning-with-files task is complete** (all phases done, or user says it's finished) → ask: "Want me to archive the task files to `kb/tasks/`?"
 
 Keep it lightweight — a single-line question at the end of your response. Don't interrupt the flow or force it if the content is trivial.
