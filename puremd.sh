@@ -12,14 +12,17 @@ fi
 # Get the URL from first argument
 url="$1"
 
-# Remove https:// prefix
-url_without_protocol="${url#https://}"
-
-# Build pure.md URL
-puremd_url="https://pure.md/${url_without_protocol}"
-
-# Extract filename from last segment of URL
-filename="$(basename "$url_without_protocol").md"
+# Check if URL is already a .md or .txt file
+if [[ "$url" == *.md ]] || [[ "$url" == *.txt ]]; then
+    download_url="$url"
+    filename="$(basename "$url")"
+else
+    # Remove https:// prefix
+    url_without_protocol="${url#https://}"
+    # Build pure.md URL
+    download_url="https://pure.md/${url_without_protocol}"
+    filename="$(basename "$url_without_protocol").md"
+fi
 
 # Determine output path
 if [ -n "$2" ]; then
@@ -34,10 +37,10 @@ else
 fi
 
 # Download content using curl
-echo "Downloading from: $puremd_url"
+echo "Downloading from: $download_url"
 echo "Saving to: $output"
 
-curl -sL ${PUREMD_API_TOKEN:+-H "x-puremd-api-token: ${PUREMD_API_TOKEN}"} "$puremd_url" -o "$output"
+curl -sL ${PUREMD_API_TOKEN:+-H "x-puremd-api-token: ${PUREMD_API_TOKEN}"} "$download_url" -o "$output"
 
 if [ $? -eq 0 ]; then
     echo "Successfully saved to $output"
