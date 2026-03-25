@@ -43,7 +43,19 @@ echo "Saving to: $output"
 curl -sL ${PUREMD_API_TOKEN:+-H "x-puremd-api-token: ${PUREMD_API_TOKEN}"} "$download_url" -o "$output"
 
 if [ $? -eq 0 ]; then
-    echo "Successfully saved to $output"
+    filesize=$(stat -f '%z' "$output")
+    if [ "$filesize" -ge 1048576 ]; then
+        human_size="$(awk "BEGIN {printf \"%.1fM\", $filesize/1048576}")"
+    elif [ "$filesize" -ge 1024 ]; then
+        human_size="$(awk "BEGIN {printf \"%.1fK\", $filesize/1024}")"
+    else
+        human_size="${filesize}B"
+    fi
+    echo "Successfully saved to $output ($human_size)"
+    if [ -n "$PREVIEW" ]; then
+        echo "--- Preview ---"
+        head -n 20 "$output"
+    fi
 else
     echo "Error downloading content"
     exit 1
