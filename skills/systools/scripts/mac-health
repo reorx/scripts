@@ -100,9 +100,9 @@ DANGER_MARKER = "⚠️"
 
 def fmt(label: str, value: str, current: float, key: str) -> str:
     threshold = THRESHOLDS.get(key)
-    if threshold is not None and current > threshold:
+    if threshold is not None and threshold > 0 and current > threshold:
         return f"{label}: {value}  {DANGER_MARKER} {current:.1f} > {threshold:.1f}"
-    elif threshold is not None:
+    elif threshold is not None and threshold > 0:
         return f"{label}: {value}  ✅ {current:.1f} <= {threshold:.1f}"
     return f"{label}: {value}"
 
