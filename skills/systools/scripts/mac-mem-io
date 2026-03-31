@@ -1,0 +1,171 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Sample macOS virtual-memory activity and estimate current memory I/O pressure."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import subprocess
+import sys
+import time
+
+
+VM_STAT_KEY_MAP = {
+    "Pages free": "pages_free",
+    "Pages active": "pages_active",
+    "Pages inactive": "pages_inactive",
+    "Pages purgeable": "pages_purgeable",
+    "Pages occupied by compressor": "pages_compressor_physical",
+    "Pages stored in compressor": "pages_compressor_logical",
+    "Pageins": "pageins",
+    "Pageouts": "pageouts",
+    "Swapins": "swapins",
+    "Swapouts": "swapouts",
+    "Compressions": "compressions",
+    "Decompressions": "decompressions",
+}
+
+
+def run_command(*args: str) -> str:
+    result = subprocess.run(args, capture_output=True, text=True, check=True)
+    return result.stdout
+
+
+def parse_vm_stat() -> tuple[int, dict[str, int]]:
+    output = run_command("vm_stat")
+    page_size_match = re.search(r"page size of (\d+) bytes", output)
+    if not page_size_match:
+        raise RuntimeError("failed to parse page size from vm_stat")
+    page_size = int(page_size_match.group(1))
+
+    stats: dict[str, int] = {}
+    for line in output.splitlines():
+        if ":" not in line:
+            continue
+        key, raw_value = line.split(":", 1)
+        key = key.strip().strip('"')
+        mapped_key = VM_STAT_KEY_MAP.get(key)
+        if not mapped_key:
+            continue
+        value = raw_value.strip().rstrip(".").replace(".", "").strip()
+        if value:
+            stats[mapped_key] = int(value)
+    return page_size, stats
+
+
+def parse_swap_usage() -> tuple[float, float, float]:
+    output = run_command("sysctl", "vm.swapusage")
+    match = re.search(r"total = ([\d.]+)M\s+used = ([\d.]+)M\s+free = ([\d.]+)M", output)
+    if not match:
+        raise RuntimeError("failed to parse sysctl vm.swapusage")
+    total_mb, used_mb, free_mb = (float(group) for group in match.groups())
+    return total_mb, used_mb, free_mb
+
+
+def parse_memory_pressure_free_pct() -> int | None:
+    output = run_command("memory_pressure")
+    match = re.search(r"System-wide memory free percentage:\s+(\d+)%", output)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def format_rate_pages(delta_pages: int, interval: float, page_size: int) -> str:
+    bytes_per_sec = delta_pages * page_size / interval
+    mib_per_sec = bytes_per_sec / (1024 * 1024)
+    return f"{mib_per_sec:7.2f} MiB/s"
+
+
+def format_count_rate(delta_count: int, interval: float) -> str:
+    return f"{delta_count / interval:8.0f}/s"
+
+
+def sample(interval: float, samples: int) -> int:
+    if samples < 1:
+        raise ValueError("samples must be >= 1")
+
+    page_size, previous = parse_vm_stat()
+    _, swap_used_mb, swap_free_mb = parse_swap_usage()
+    mem_free_pct = parse_memory_pressure_free_pct()
+
+    print(
+        "swap_used  swap_free  mem_free  pageins     pageouts    swapins     swapouts    "
+        "compress    decompress"
+    )
+    print(
+        f"{swap_used_mb / 1024:8.2f}G  {swap_free_mb / 1024:8.2f}G  "
+        f"{f'{mem_free_pct:>3d}%' if mem_free_pct is not None else ' N/A':>8}  "
+        f"{'-':>10}  {'-':>10}  {'-':>10}  {'-':>10}  {'-':>10}  {'-':>10}"
+    )
+
+    exit_code = 0
+    for _ in range(samples):
+        time.sleep(interval)
+        _, current = parse_vm_stat()
+        _, swap_used_mb, swap_free_mb = parse_swap_usage()
+        mem_free_pct = parse_memory_pressure_free_pct()
+
+        deltas = {key: current.get(key, 0) - previous.get(key, 0) for key in current}
+        previous = current
+
+        pageins_rate = format_rate_pages(deltas.get("pageins", 0), interval, page_size)
+        pageouts_rate = format_rate_pages(deltas.get("pageouts", 0), interval, page_size)
+        swapins_rate = format_rate_pages(deltas.get("swapins", 0), interval, page_size)
+        swapouts_rate = format_rate_pages(deltas.get("swapouts", 0), interval, page_size)
+        compress_rate = format_count_rate(deltas.get("compressions", 0), interval)
+        decompress_rate = format_count_rate(deltas.get("decompressions", 0), interval)
+
+        print(
+            f"{swap_used_mb / 1024:8.2f}G  {swap_free_mb / 1024:8.2f}G  "
+            f"{f'{mem_free_pct:>3d}%' if mem_free_pct is not None else ' N/A':>8}  "
+            f"{pageins_rate}  {pageouts_rate}  {swapins_rate}  {swapouts_rate}  "
+            f"{compress_rate}  {decompress_rate}"
+        )
+
+        if any(deltas.get(key, 0) > 0 for key in ("pageouts", "swapins", "swapouts")):
+            exit_code = 1
+
+    return exit_code
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Watch macOS memory paging/swap activity.",
+        epilog=(
+            "Columns:\n"
+            "  swap_used: current swap space in use. High values can be historical residue.\n"
+            "  swap_free: free swap space remaining.\n"
+            "  mem_free: system-wide memory free percentage from memory_pressure.\n"
+            "  pageins: rate of VM pages read into memory. Small non-zero values are common.\n"
+            "  pageouts: rate of VM pages written out from memory. Sustained non-zero values suggest pressure.\n"
+            "  swapins: rate of pages read back from swap. Sustained non-zero values suggest real swap churn.\n"
+            "  swapouts: rate of pages written to swap. Sustained non-zero values suggest real swap churn.\n"
+            "  compress: pages compressed per second. High sustained values can indicate tightening memory.\n"
+            "  decompress: pages decompressed per second. Some activity is normal.\n"
+            "\n"
+            "How to read it:\n"
+            "  High swap_used alone does not mean current performance trouble.\n"
+            "  If pageouts, swapins, and swapouts stay near zero, current memory I/O pressure is low.\n"
+            "  If pageouts or swap traffic keep rising every sample and the machine feels slow, memory pressure is real."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-i", "--interval", type=float, default=1.0, help="Sampling interval in seconds.")
+    parser.add_argument("-n", "--samples", type=int, default=5, help="Number of samples to collect.")
+    args = parser.parse_args()
+
+    try:
+        return sample(args.interval, args.samples)
+    except subprocess.CalledProcessError as exc:
+        print(exc.stderr or exc.stdout or str(exc), file=sys.stderr)
+        return 2
+    except Exception as exc:  # pragma: no cover - script path
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

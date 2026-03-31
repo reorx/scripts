@@ -1,6 +1,6 @@
 ---
 name: systools
-description: "System operations toolkit for local development and debugging. Use when the user needs to: (1) check what's running on a port, kill a process on a port, free up a port, or deal with 'address already in use' errors — even casual phrases like 'what's on port 3000' or 'kill whatever is on 8080'; (2) check macOS system health — CPU temperature, memory/swap usage, disk space, CPU load, network traffic — triggered by phrases like 'how's my system', 'check health', 'is my mac overheating', 'memory usage', 'disk space', 'swap is high', 'cpu temp', 'system stats', or any question about the machine's overall condition. Only use the health check on macOS."
+description: "System operations toolkit for local development and debugging. Use when the user needs to: (1) check what's running on a port, kill a process on a port, free up a port, or deal with 'address already in use' errors — even casual phrases like 'what's on port 3000' or 'kill whatever is on 8080'; (2) check macOS system health — CPU temperature, memory/swap usage, disk space, CPU load, network traffic — triggered by phrases like 'how's my system', 'check health', 'is my mac overheating', 'memory usage', 'disk space', 'swap is high', 'cpu temp', 'system stats', or any question about the machine's overall condition; (3) monitor memory I/O pressure — page-in/out rates, swap churn, compression activity — triggered by phrases like 'memory pressure', 'is my mac swapping', 'paging activity', 'why is my mac slow', 'swap thrashing', 'pageouts', 'memory I/O', 'vm_stat', 'compressor pressure', or any question about whether the system is actively under memory pressure right now. Only use health/memory tools on macOS."
 ---
 
 # systools
@@ -82,3 +82,53 @@ A single command that checks CPU temperature, network throughput, CPU load, memo
 - "My mac feels slow" → run `mac-health` to check CPU load, memory, and swap — high swap or memory pressure often explains perceived slowness
 - "How much disk space do I have?" → run `mac-health` and highlight the Disk lines (it auto-detects external volumes under /Volumes)
 - "Swap is too high" → run `mac-health -t swap_used_gb=0` to flag any swap usage
+
+## macOS Memory I/O Analytics
+
+### Monitor memory paging and swap activity
+
+**Script:** `scripts/mac-mem-io`
+
+**Prerequisites:** macOS only. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Calls `vm_stat`, `sysctl vm.swapusage`, and `memory_pressure` under the hood.
+
+This script samples virtual-memory counters at regular intervals and reports real-time I/O rates — page-ins/outs, swap-ins/outs, and compressor activity. It answers the question: "Is my Mac *actively* under memory pressure right now?" as opposed to `mac-health` which gives a point-in-time snapshot of total usage.
+
+**How to use:**
+
+```bash
+# Default: 5 samples at 1-second intervals
+<skill-path>/scripts/mac-mem-io
+
+# Custom: 10 samples at 2-second intervals
+<skill-path>/scripts/mac-mem-io -i 2 -n 10
+```
+
+**Output columns:**
+
+| Column | Meaning |
+|--------|---------|
+| `swap_used` | Current swap in use (GB). High alone doesn't mean trouble — can be historical residue. |
+| `swap_free` | Free swap remaining (GB). |
+| `mem_free` | System-wide memory free % from `memory_pressure`. |
+| `pageins` | Rate of VM pages read into memory (MiB/s). Small non-zero values are common. |
+| `pageouts` | Rate of VM pages written out (MiB/s). Sustained non-zero = pressure. |
+| `swapins` | Rate of pages read back from swap (MiB/s). Sustained non-zero = swap churn. |
+| `swapouts` | Rate of pages written to swap (MiB/s). Sustained non-zero = swap churn. |
+| `compress` | Pages compressed per second. High sustained values = tightening memory. |
+| `decompress` | Pages decompressed per second. Some activity is normal. |
+
+**Exit code:** 0 if no pageouts/swapins/swapouts detected across all samples, 1 if any were observed. This makes it composable in scripts or health checks.
+
+**How to interpret results:**
+
+- High `swap_used` alone does NOT mean current performance trouble — it may be left over from earlier.
+- If `pageouts`, `swapins`, and `swapouts` stay near zero, current memory I/O pressure is low regardless of swap_used.
+- If `pageouts` or swap traffic keep rising every sample and the machine feels slow, memory pressure is real.
+- Use `mac-health` first for a quick snapshot; reach for `mac-mem-io` when you need to see whether pressure is *active and ongoing*.
+
+**Typical scenarios:**
+- "Is my mac swapping right now?" / "memory pressure?" → run `mac-mem-io` and check if pageouts/swapins/swapouts are non-zero
+- "My mac feels slow, is it memory?" → run `mac-health` first for overview, then `mac-mem-io` to see if there's active paging
+- "Watch memory for the next 30 seconds" → run `mac-mem-io -i 2 -n 15`
+- "Is the compressor working hard?" → run `mac-mem-io` and look at compress/decompress columns
+- After closing heavy apps: "Did that help?" → run `mac-mem-io -n 3` to confirm pressure dropped
