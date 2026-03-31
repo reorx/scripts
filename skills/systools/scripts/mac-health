@@ -185,21 +185,16 @@ def main() -> bool:
     # unlike psutil which may only see the read-only system snapshot.
     import shutil
 
-    disk_paths: list[tuple[str, str]] = [("/", "/")]
-    for part in psutil.disk_partitions():
-        if part.mountpoint.startswith("/Volumes"):
-            disk_paths.append((part.mountpoint, part.mountpoint.split("/")[-1]))
-    for path, name in disk_paths:
-        usage = shutil.disk_usage(path)
-        pct = usage.used / usage.total * 100
-        lines.append(
-            fmt(
-                f"Disk [{name}]",
-                f"{usage.used / 2**30:.1f} / {usage.total / 2**30:.1f} GB ({pct:.1f}%)",
-                pct,
-                "disk_used_pct",
-            )
+    usage = shutil.disk_usage("/")
+    pct = usage.used / usage.total * 100
+    lines.append(
+        fmt(
+            "Disk [/]",
+            f"{usage.used / 2**30:.1f} / {usage.total / 2**30:.1f} GB ({pct:.1f}%)",
+            pct,
+            "disk_used_pct",
         )
+    )
 
     print("\n".join(lines))
     return any(DANGER_MARKER in line for line in lines)
