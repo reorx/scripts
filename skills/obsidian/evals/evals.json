@@ -1,0 +1,26 @@
+{
+  "skill_name": "obsidian",
+  "evals": [
+    {
+      "id": 1,
+      "name": "search-notes-by-content",
+      "prompt": "Search my Obsidian vault for notes that mention 'API documentation' and show me the top 5 matches with the matching lines, not just filenames.",
+      "expected_output": "List of up to 5 notes with surrounding line context showing the match",
+      "files": []
+    },
+    {
+      "id": 2,
+      "name": "list-tags-by-frequency",
+      "prompt": "List all tags in my Obsidian vault sorted by how often they're used, top 15 only.",
+      "expected_output": "Ranked list of tags with usage counts",
+      "files": []
+    },
+    {
+      "id": 3,
+      "name": "create-zettel-with-tags",
+      "prompt": "Create a new zettelkasten note in Obsidian titled 'Filesystem vs CLI for Note Access' with tags 'meta' and 'tooling'. Content: a short argument (3-4 sentences) that using filesystem operations on markdown files is more robust than wrapping a GUI app's CLI, because the vault is just plain text and doesn't need the app to be running.",
+      "expected_output": "A new .md file in the zettelkasten folder with proper naming (YYYYMMDD.HH Title.md), correct tags in frontmatter, and the requested content",
+      "files": []
+    }
+  ]
+}
