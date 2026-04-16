@@ -1,6 +1,6 @@
 ---
 name: systools
-description: "System operations toolkit for local development and debugging. Use when the user needs to: (1) check what's running on a port, kill a process on a port, free up a port, or deal with 'address already in use' errors — even casual phrases like 'what's on port 3000' or 'kill whatever is on 8080'; (2) check macOS system health — CPU temperature, memory/swap usage, disk space, CPU load, network traffic — triggered by phrases like 'how's my system', 'check health', 'is my mac overheating', 'memory usage', 'disk space', 'swap is high', 'cpu temp', 'system stats', or any question about the machine's overall condition; (3) monitor memory I/O pressure — page-in/out rates, swap churn, compression activity — triggered by phrases like 'memory pressure', 'is my mac swapping', 'paging activity', 'why is my mac slow', 'swap thrashing', 'pageouts', 'memory I/O', 'vm_stat', 'compressor pressure', or any question about whether the system is actively under memory pressure right now. Only use health/memory tools on macOS."
+description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing processes on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots — CPU temp, load, memory, swap, disk, network (\"how's my mac\", \"is it overheating\"); live memory I/O pressure — pageouts, swap churn, compressor activity (\"why is my mac slow\", \"is it swapping\"); and WindowServer CPU/GPU diagnostics (\"WindowServer is hot\", \"UI feels laggy\"). macOS-only except port management."
 ---
 
 # systools
@@ -132,3 +132,58 @@ This script samples virtual-memory counters at regular intervals and reports rea
 - "Watch memory for the next 30 seconds" → run `mac-mem-io -i 2 -n 15`
 - "Is the compressor working hard?" → run `mac-mem-io` and look at compress/decompress columns
 - After closing heavy apps: "Did that help?" → run `mac-mem-io -n 3` to confirm pressure dropped
+
+## macOS WindowServer Diagnostics
+
+### Find out why WindowServer is hot
+
+**Script:** `scripts/window-server-doctor.py`
+
+**Prerequisites:** macOS only. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Wraps `ps`, `top`, `lsappinfo`, `system_profiler`, `log show`, `ioreg`, optionally `powermetrics` and `sample` (those two need sudo).
+
+When WindowServer is burning CPU, the goal is to find which *other* app is driving its rendering work — so the user can fix it without logging out or quitting apps. This script runs 8 checks and emits a verdict that names likely contributors.
+
+**How to use:**
+
+```bash
+# Fast partial run (no sudo): process stats, foreground apps, displays, log, ioreg
+<skill-path>/scripts/window-server-doctor.py --quick
+
+# Full diagnostic with sudo (enables powermetrics GPU-by-process + sample hot frames)
+sudo -E <skill-path>/scripts/window-server-doctor.py
+
+# Opt in to exact window counts per app (15-25s, needs Automation permission)
+<skill-path>/scripts/window-server-doctor.py --slow-windows
+
+# Machine-readable output
+<skill-path>/scripts/window-server-doctor.py --json
+```
+
+**What it checks:**
+
+| # | Check | Needs sudo? |
+|---|-------|-------------|
+| 1 | WindowServer PID/CPU/RSS/uptime (`ps`) | No |
+| 2 | Live thread count + CPU (`top`) | No |
+| 3 | Foreground apps (`lsappinfo`) — or exact windows/app with `--slow-windows` (System Events) | No |
+| 4 | Connected displays, resolution, refresh rate (`system_profiler`) | No |
+| 5 | Per-process GPU ms/s (`powermetrics --show-process-gpu`) | **Yes** |
+| 6 | WindowServer hot call stacks, top-of-stack aggregation (`sample`) | **Yes** |
+| 7 | Recent WindowServer warnings/errors (`log show`) | No |
+| 8 | GPU utilization counters (`ioreg` / `PerformanceStatistics`) | No |
+
+**Exit code:** 0 if WindowServer CPU < 20%, 1 if elevated (≥20%), 2 on hard errors. Composable in scripts.
+
+**How to interpret results:**
+
+- WindowServer itself is almost never the root cause — it reflects compositing work driven by *other* apps. Check #5 (GPU ms/s by process) names the real culprit.
+- High CPU + multiple 120Hz displays + many foreground apps is a common "death by a thousand cuts" pattern, not a single rogue process.
+- Hot frame `CGXComposeSurfaces` / `CARenderServer*` means compositing load (too many surfaces updating). `mach_msg_trap` on top usually means WS is mostly idle.
+- Log errors like "pid X failed to act on a ping" point at a specific misbehaving client process — resolve PID X with `ps -p X` to see who.
+
+**Typical scenarios:**
+- "WindowServer is using 60% CPU, what's wrong?" → run with `sudo -E` for full coverage, focus on section 5 + verdict
+- "My Mac UI is laggy but Activity Monitor doesn't show a CPU hog" → run `--quick` first; if WS is the top, rerun with sudo for GPU breakdown
+- "Which app is burning the GPU?" → `sudo -E window-server-doctor.py --quick` then look at section 5 isn't available under `--quick`; drop `--quick` instead
+- "Do I have too many windows open?" → run with `--slow-windows` to see per-app window counts
+- Non-disruptive fixes: Cmd+H the top GPU consumer, reduce transparency/motion in Accessibility, switch dynamic wallpaper to static, unplug unused external displays
