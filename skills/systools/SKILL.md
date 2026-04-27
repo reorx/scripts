@@ -1,6 +1,6 @@
 ---
 name: systools
-description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing processes on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots — CPU temp, load, memory, swap, disk, network (\"how's my mac\", \"is it overheating\"); live memory I/O pressure — pageouts, swap churn, compressor activity (\"why is my mac slow\", \"is it swapping\"); and WindowServer CPU/GPU diagnostics (\"WindowServer is hot\", \"UI feels laggy\"). macOS-only except port management."
+description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing processes on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots — CPU temp, load, memory, swap, disk, network (\"how's my mac\", \"is it overheating\"); live memory I/O pressure — pageouts, swap churn, compressor activity (\"why is my mac slow\", \"is it swapping\"); WindowServer CPU/GPU diagnostics (\"WindowServer is hot\", \"UI feels laggy\"); and listing/managing macOS Background Task Management items shown in System Settings. macOS-only except port management."
 ---
 
 # systools
@@ -187,3 +187,72 @@ sudo -E <skill-path>/scripts/window-server-doctor.py
 - "Which app is burning the GPU?" → `sudo -E window-server-doctor.py --quick` then look at section 5 isn't available under `--quick`; drop `--quick` instead
 - "Do I have too many windows open?" → run with `--slow-windows` to see per-app window counts
 - Non-disruptive fixes: Cmd+H the top GPU consumer, reduce transparency/motion in Accessibility, switch dynamic wallpaper to static, unplug unused external displays
+
+## macOS Background Task Management (Login Items & Extensions)
+
+### List, search, and locate background items
+
+**Script:** `scripts/btmlist.py`
+
+**Prerequisites:** macOS only. Pure stdlib Python ≥3.10 — no `uv`, no third-party deps. Wraps `sfltool dumpbtm` (built into macOS).
+
+System Settings > General > Login Items & Extensions is backed by the Background Task Management (BTM) database. The UI is awkward: developer-account names (e.g. "won fen", "Bjango Pty Ltd") appear as parent group headers without a "Show in Finder" option, so users often can't tell what a mystery entry actually points to. This script parses `sfltool dumpbtm` and exposes every item as a flat, filterable, locatable list.
+
+**How to use:**
+
+```bash
+# Default: table of every real item (skips developer group headers)
+<skill-path>/scripts/btmlist.py
+
+# Include developer-account group headers (rows like "won fen" with no path)
+<skill-path>/scripts/btmlist.py --all
+
+# Find a mystery entry by name (case-insensitive substring; --all so groups are included)
+<skill-path>/scripts/btmlist.py --name 'won fen' --all
+
+# All items signed by a given developer
+<skill-path>/scripts/btmlist.py --developer 'won fen'
+
+# Status / type filters
+<skill-path>/scripts/btmlist.py --enabled
+<skill-path>/scripts/btmlist.py --disabled
+<skill-path>/scripts/btmlist.py --type 'legacy agent'
+
+# Other output formats
+<skill-path>/scripts/btmlist.py --json     # structured, includes URL + identifier + parent
+<skill-path>/scripts/btmlist.py --paths    # one path per line, scriptable
+
+# Open the matching item's executable in Finder (useful for the mystery-entry case)
+<skill-path>/scripts/btmlist.py --reveal --name 'Clash Verge'
+
+# Offline analysis: feed in a saved dump
+sfltool dumpbtm > /tmp/btm.txt
+<skill-path>/scripts/btmlist.py --input /tmp/btm.txt
+```
+
+**Output columns (table mode):**
+
+| Column | Meaning |
+|--------|---------|
+| `STATUS` | `on` (enabled), `off` (disabled), `?` (unknown disposition) |
+| `TYPE` | `app`, `login item`, `agent`, `legacy agent`, `daemon`, `legacy daemon`, `dock tile`, `quicklook`, `spotlight`, `developer` (group header) |
+| `NAME` | Item name as registered with BTM |
+| `DEVELOPER` | Apple developer-account name (the parent grouping in System Settings) |
+| `PATH` | Resolved filesystem path — `Executable Path` if present, otherwise the decoded `URL` |
+
+**How to interpret results:**
+
+- "Developer" rows are not real background items — they are the parent group header that shows up in System Settings (e.g. the spooky "won fen" or "Serhiy Mytrovtsiy" entries). They contain other items as children.
+- `legacy agent` / `legacy daemon` items come from old-style `LaunchAgents`/`LaunchDaemons` plists. The `URL:` field in `--json` output points at the actual `.plist`, and `PATH`/`Executable Path` points at the binary — both are what you'd remove for full uninstall.
+- `app` and `login item` types correspond to the SMAppService-registered entries used by modern apps to autostart.
+- A mystery name in System Settings is almost always either (a) a developer-account name styled differently from the app's marketing name, or (b) a privileged helper bundled inside an app's `Contents/Library/...`. `--name <x> --all` finds (a); `--developer <x>` lists all the children behind it.
+
+**Typical scenarios:**
+
+- "What is this WONFEN / unknown entry in Login Items?" → `btmlist.py --name '<entry>' --all` to see the developer row, then `btmlist.py --developer '<entry>'` to list the actual apps/helpers underneath
+- "List everything autostarting on my Mac" → `btmlist.py --enabled` for a clean overview
+- "Where is this login item actually located? System Settings won't tell me." → `btmlist.py --name '<name>' --reveal` opens Finder at the binary
+- "Show me all launch daemons" → `btmlist.py --type daemon` (or `--type 'legacy daemon'`)
+- "Audit disabled-but-still-installed background items" → `btmlist.py --disabled`
+- "Diff what's registered before/after installing an app" → save `btmlist.py --json` snapshots and compare
+- Removal workflow: disable in System Settings (or `launchctl bootout`), then delete the `.plist` shown in the `URL` field and the `Executable Path` binary; `sudo sfltool resetbtm` rebuilds the BTM list if it gets corrupt (re-prompts for everything, use sparingly)
