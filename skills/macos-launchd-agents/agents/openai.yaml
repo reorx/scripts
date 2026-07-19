@@ -1,0 +1,4 @@
+interface:
+  display_name: "macOS Launchd Agents"
+  short_description: "Inspect and control app-installed LaunchDaemons, LaunchAgents, and privileged helpers."
+  default_prompt: "Inspect or disable this macOS launchd agent safely:"
