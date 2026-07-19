@@ -1,6 +1,6 @@
 ---
 name: systools
-description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing processes on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots — CPU temp, load, memory, swap, disk, network (\"how's my mac\", \"is it overheating\"); live memory I/O pressure — pageouts, swap churn, compressor activity (\"why is my mac slow\", \"is it swapping\"); WindowServer CPU/GPU diagnostics (\"WindowServer is hot\", \"UI feels laggy\"); and listing/managing macOS Background Task Management items shown in System Settings. macOS-only except port management."
+description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing processes on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots — CPU temp, load, memory, swap, disk, network (\"how's my mac\", \"is it overheating\"); live memory I/O pressure — pageouts, swap churn, compressor activity (\"why is my mac slow\", \"is it swapping\"); WindowServer CPU/GPU diagnostics (\"WindowServer is hot\", \"UI feels laggy\"); managing the daily wake/sleep schedule via pmset (\"schedule my mac to sleep at 1am\", \"change the auto sleep time\", \"自动休眠计划\"); and listing/managing macOS Background Task Management items shown in System Settings. macOS-only except port management."
 ---
 
 # systools
@@ -187,6 +187,47 @@ sudo -E <skill-path>/scripts/window-server-doctor.py
 - "Which app is burning the GPU?" → `sudo -E window-server-doctor.py --quick` then look at section 5 isn't available under `--quick`; drop `--quick` instead
 - "Do I have too many windows open?" → run with `--slow-windows` to see per-app window counts
 - Non-disruptive fixes: Cmd+H the top GPU consumer, reduce transparency/motion in Accessibility, switch dynamic wallpaper to static, unplug unused external displays
+
+## macOS Sleep/Wake Schedule
+
+### View, set, or clear the daily wake/sleep schedule
+
+**Script:** `scripts/mac-sleep-schedule.py`
+
+**Prerequisites:** macOS only. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Wraps `pmset repeat` / `pmset -g sched`. Modifying the schedule requires sudo (the script prepends `sudo` itself); viewing status does not.
+
+Thin, opinionated wrapper around `pmset repeat`, which stores exactly one repeating wake-like event and one sleep-like event with a shared day-of-week mask. The script mirrors that contract: set both times together, or clear both.
+
+**How to use:**
+
+```bash
+# Show current schedule + relevant power settings (no sudo)
+<skill-path>/scripts/mac-sleep-schedule.py
+
+# Set schedule for every day (requires sudo password if not root)
+<skill-path>/scripts/mac-sleep-schedule.py --wake 06:00 --sleep 23:00
+
+# Weekdays only
+<skill-path>/scripts/mac-sleep-schedule.py --wake 07:30 --sleep 23:30 --days MTWRF
+
+# Remove all repeating wake/sleep events
+<skill-path>/scripts/mac-sleep-schedule.py --clear
+```
+
+Day codes (pmset): `M`=Mon `T`=Tue `W`=Wed `R`=Thu `F`=Fri `S`=Sat `U`=Sun. Default `MTWRFSU` = every day; `MTWRF` = weekdays; `SU` = weekend.
+
+**Notes:**
+
+- `--wake` and `--sleep` must be given together (pmset stores exactly one of each); to change only one time, pass the current value for the other.
+- Status view also prints relevant `pmset -g` settings (sleep, standby, powernap, womp, etc.) for context.
+- One-off system wake events (calendar alarms, DND timers) shown under "Scheduled power events" are macOS-managed and not touched by this script.
+- Sudo caveat for agents: if sudo cannot prompt for a password in the session, ask the user to run the set/clear command themselves (e.g. via the `!` prefix in Claude Code).
+
+**Typical scenarios:**
+- "What's my mac's sleep schedule?" → run with no args
+- "Make my mac sleep at 1:30am and wake at 5:30am" → `--wake 05:30 --sleep 01:30`
+- "Change the auto-sleep time, keep wake as is" → run with no args first to read the current wake time, then set both
+- "Stop the scheduled sleep/wake" → `--clear`
 
 ## macOS Background Task Management (Login Items & Extensions)
 
