@@ -1,6 +1,6 @@
 ---
 name: systools
-description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing processes on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots — CPU temp, load, memory, swap, disk, network (\"how's my mac\", \"is it overheating\"); live memory I/O pressure — pageouts, swap churn, compressor activity (\"why is my mac slow\", \"is it swapping\"); WindowServer CPU/GPU diagnostics (\"WindowServer is hot\", \"UI feels laggy\"); managing the daily wake/sleep schedule via pmset (\"schedule my mac to sleep at 1am\", \"change the auto sleep time\", \"自动休眠计划\"); and listing/managing macOS Background Task Management items shown in System Settings. macOS-only except port management."
+description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing processes on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots — CPU temp, load, memory, swap, disk, network (\"how's my mac\", \"is it overheating\"); live memory I/O pressure — pageouts, swap churn, compressor activity (\"why is my mac slow\", \"is it swapping\"); releasing leaked dev test resources — booted iOS simulators and agent-browser headless Chrome (\"clean up simulators\", \"close all agent-browser\", \"清理模拟器\", teardown after browser/iOS testing); WindowServer CPU/GPU diagnostics (\"WindowServer is hot\", \"UI feels laggy\"); managing the daily wake/sleep schedule via pmset (\"schedule my mac to sleep at 1am\", \"change the auto sleep time\", \"自动休眠计划\"); auditing launchd + cron scheduled jobs and whether they are actually loaded (\"what runs periodically\", \"why isn't my launch agent running\", \"定时任务\", \"launchd 有哪些\"); and listing/managing macOS Background Task Management items shown in System Settings. macOS-only except port management."
 ---
 
 # systools
@@ -132,6 +132,73 @@ This script samples virtual-memory counters at regular intervals and reports rea
 - "Watch memory for the next 30 seconds" → run `mac-mem-io -i 2 -n 15`
 - "Is the compressor working hard?" → run `mac-mem-io` and look at compress/decompress columns
 - After closing heavy apps: "Did that help?" → run `mac-mem-io -n 3` to confirm pressure dropped
+
+## macOS Dev Resource Cleanup
+
+### Release leaked iOS simulators and agent-browser sessions
+
+**Script:** `scripts/mac-dev-cleanup`
+
+**Prerequisites:** macOS only. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Wraps `ps`, `xcrun simctl`, `agent-browser close`, `osascript`, `memory_pressure`.
+
+The two biggest recurring causes of a degraded `mac-health` reading, and neither cleans up after itself:
+
+- **Booted iOS simulators** — each booted device keeps a full `launchd_sim` tree alive: SpringBoard plus dozens of iOS widget extensions at 200–330 MB each. One booted device measured **~196 processes**.
+- **Leaked `agent-browser` sessions** — the CLI spawns a detached daemon (PPID 1) plus a ~10-process headless Chrome tree that survives the session that created it. Observed running for **days**, with renderers pinned at ~100% CPU each, ~5 of 10 cores gone.
+
+**How to use:**
+
+```bash
+# See what would be cleaned, change nothing (exit 1 = there is work to do)
+mac-dev-cleanup --dry-run
+
+# Clean both
+mac-dev-cleanup
+
+# Only one side
+mac-dev-cleanup --only sim
+mac-dev-cleanup --only browser
+
+# Safe to run mid-session: spare agent-browser sessions younger than 2h
+mac-dev-cleanup --min-age 2
+
+# Behaviour checks (29 assertions, no side effects)
+mac-dev-cleanup --selftest
+```
+
+**What it does:**
+
+| Step | Action |
+|------|--------|
+| agent-browser | Groups Chrome processes into sessions by `--user-data-dir=…/agent-browser-chrome-<uuid>`, links each to its spawning daemon via the root process's PPID, then `agent-browser close --all`, then SIGTERM→SIGKILL any survivor |
+| simulators | `xcrun simctl shutdown all`, then quit Simulator.app via AppleScript, falling back to signals when it refuses |
+| report | Free-memory % and swap before/after |
+
+**Exit code:** 0 on success. Under `--dry-run`, 1 means there is something to clean — composable as a check like `mac-health`.
+
+**Notes / gotchas:**
+
+- **The user's own Chrome is never touched.** Session membership is decided solely by the `agent-browser-chrome-<uuid>` user-data-dir; a plain `/Applications/Google Chrome.app/…/Google Chrome` has no such flag. This is covered by explicit safety assertions in `--selftest`.
+- `ps` truncates the command column to terminal width unless `-ww` is passed, which silently hides processes whose `--user-data-dir` sits past the cutoff — the script always uses `ps -Awwo`. Any ad-hoc `ps | grep` for these processes needs the same flag or it will undercount.
+- `agent-browser close --all` is all-or-nothing, so `--min-age` switches to selective signalling instead of calling it.
+- `simctl shutdown all` preserves device data; only running-app state is lost, and devices re-boot on demand.
+- Simulator.app routinely ignores `quit app "Simulator"`; the signal fallback is the normal path, not an error.
+- Counting these processes by hand with `ps -A | grep -c <pattern>` self-matches the grep and the parent shell. Use a bracket pattern (`'[s]imruntime'`) or the script's own report.
+
+**Scheduled run:** a launchd agent runs the full cleanup **daily at 06:00** (30min after the 5:30AM `pmset repeat wakepoweron`; system sleep is disabled so the machine is reliably awake). Plist lives in the repo at `launchd/com.reorx.mac-dev-cleanup.plist`, symlinked to `~/Library/LaunchAgents/`. Log: `~/Library/Logs/mac-dev-cleanup.log` (each run is stamped — the script prints a timestamp header whenever stdout is not a TTY).
+
+```bash
+launchctl print gui/$(id -u)/com.reorx.mac-dev-cleanup   # status, run count, calendar trigger
+launchctl kickstart -p gui/$(id -u)/com.reorx.mac-dev-cleanup   # force a run now
+launchctl bootout gui/$(id -u)/com.reorx.mac-dev-cleanup        # unload
+```
+
+It deliberately has **no `RunAtLoad`** — the job kills browsers and simulators, so it must only fire on schedule, never on login or reload.
+
+**Typical scenarios:**
+- "Why is my mac hot / loud / slow?" → run `mac-health`; if load or temp is high, run `mac-dev-cleanup --dry-run` **before** investigating anything else — this has been the top cause
+- After finishing browser automation or iOS testing → run `mac-dev-cleanup` as the verification teardown step
+- Periodic hygiene while other sessions may be working → `mac-dev-cleanup --min-age 2`
 
 ## macOS WindowServer Diagnostics
 
@@ -297,3 +364,50 @@ sfltool dumpbtm > /tmp/btm.txt
 - "Audit disabled-but-still-installed background items" → `btmlist.py --disabled`
 - "Diff what's registered before/after installing an app" → save `btmlist.py --json` snapshots and compare
 - Removal workflow: disable in System Settings (or `launchctl bootout`), then delete the `.plist` shown in the `URL` field and the `Executable Path` binary; `sudo sfltool resetbtm` rebuilds the BTM list if it gets corrupt (re-prompts for everything, use sparingly)
+
+## macOS Scheduled Jobs (launchd + cron)
+
+### What actually runs on a schedule, and is it really armed?
+
+**Script:** `scripts/launchd-list.py`
+
+**Prerequisites:** macOS only. Pure stdlib Python ≥3.10 — no `uv`, no third-party deps. Wraps `launchctl list`, `crontab -l`, and `plutil` (fallback for root-owned plists).
+
+`launchctl list` and the plist directories each tell half the story: **a plist can sit on disk without ever being loaded**, and a loaded job can be resident rather than scheduled. This script joins both, classifies every job by cadence, and folds in crontab — where a leading `#` silently disables an entry.
+
+**How to use:**
+
+```bash
+launchd-list.py                 # non-Apple jobs, grouped by cadence
+launchd-list.py --periodic      # only things that run on a schedule (+ cron)
+launchd-list.py --all           # include Apple's own (also scans /System/Library/Launch*)
+launchd-list.py --label grafana # filter by label or command substring
+launchd-list.py --json          # structured output
+launchd-list.py --selftest      # 39 behaviour checks, no side effects
+```
+
+**Categories:**
+
+| Category | Meaning |
+|----------|---------|
+| `PERIODIC` | `StartInterval` or `StartCalendarInterval` — plus every crontab entry |
+| `TRIGGERED` | `WatchPaths`, `QueueDirectories`, `StartOnMount` |
+| `RESIDENT` | `KeepAlive` (or `RunAtLoad` without it) — a daemon, not a schedule |
+| `ON-DEMAND` | socket/XPC activated, or run manually |
+| `UNREADABLE` | plist could not be parsed even via `plutil` |
+
+**State column:** `[on ]` loaded, `[off]` plist present but **not** loaded, `[ ? ]` unknown. A running job also shows its `pid`; a job whose last run failed shows `exit N`.
+
+**How to interpret results:**
+
+- **`[off]` is the finding worth chasing.** It means the plist exists — so it looks installed, and `ls ~/Library/LaunchAgents` suggests it is — but launchd has no record of it, so it never fires. The trailing summary lists these explicitly.
+- `[ ? ]` is normal for `/Library/LaunchDaemons`: those live in the system domain, which a non-root `launchctl list` cannot see. Re-run under `sudo` to resolve them.
+- A schedule beats `KeepAlive` in the classification: a job declaring both is reported as `PERIODIC`, because the schedule is what makes it fire.
+- Crontab entries commented out with `#` are still listed, marked `[off]` — they are easy to forget and invisible to `launchctl` entirely.
+
+**Typical scenarios:**
+- "What runs periodically on this Mac?" → `launchd-list.py --periodic`
+- "I installed a launch agent, why isn't it running?" → `launchd-list.py --label <name>`; if it shows `[off]`, `launchctl bootstrap gui/$(id -u) <plist>` it
+- "Is my scheduled cleanup/backup actually armed?" → `launchd-list.py --label cleanup` and check the state marker and schedule
+- "Which of my jobs are failing?" → run it and read the "non-zero last exit" summary line
+- Auditing a new machine, or diffing before/after an install → `launchd-list.py --json` snapshots

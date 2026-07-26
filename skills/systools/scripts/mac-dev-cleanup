@@ -1,0 +1,493 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Release macOS dev test resources: booted iOS simulators and agent-browser Chrome trees.
+
+Neither cleans up after itself. A booted simulator keeps a full launchd_sim tree of
+iOS daemons and widget extensions alive (hundreds of processes, GBs of RAM); a leaked
+agent-browser session keeps a ~10-process headless Chrome tree spinning at ~100% CPU
+per renderer, indefinitely.
+
+Exit code: 0 on success. With --dry-run, 1 means there is something to clean (so it
+composes as a check, like mac-health).
+"""
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+
+# Chrome's --user-data-dir is what ties a process to an agent-browser session, and is
+# the only reliable discriminator from the user's own Chrome.
+AGENT_BROWSER_UDD_RE = re.compile(r"--user-data-dir=\S*?agent-browser-chrome-([0-9a-fA-F-]{36})")
+AGENT_BROWSER_DAEMON_RE = re.compile(r"node_modules/agent-browser/bin/agent-browser-darwin")
+# Only the browser process itself lacks --type=; helpers all carry one.
+CHROME_ROOT_RE = re.compile(r"/Google Chrome\.app/Contents/MacOS/Google Chrome\b")
+SIM_RUNTIME_RE = re.compile(r"simruntime/Contents/Resources/RuntimeRoot")
+SIMULATOR_APP_RE = re.compile(r"Simulator\.app/Contents/MacOS/Simulator\b")
+
+# `ps` truncates the command column to terminal width unless -ww is given, which
+# silently hides processes whose --user-data-dir sits past the cutoff.
+PS_ARGS = ["ps", "-Awwo", "pid,ppid,etime,pcpu,command"]
+
+DANGER_MARKER = "⚠️"
+
+
+@dataclass
+class Instance:
+    """One agent-browser session: its Chrome process tree plus the daemon that spawned it."""
+
+    uuid: str
+    pids: set[int] = field(default_factory=set)
+    daemon_pid: int | None = None
+    root_pid: int | None = None
+    age_seconds: int = 0
+    cpu_pct: float = 0.0
+
+    @property
+    def all_pids(self) -> set[int]:
+        return self.pids | ({self.daemon_pid} if self.daemon_pid else set())
+
+
+# ── Parsing ─────────────────────────────────────────────────
+def parse_etime(etime: str) -> int:
+    """Convert a ps ELAPSED field ([[dd-]hh:]mm:ss) to seconds. Unparseable → 0."""
+    days, _, clock = etime.strip().rpartition("-")
+    parts = clock.split(":")
+    if not all(p.isdigit() for p in parts) or not 2 <= len(parts) <= 3:
+        return 0
+    if days and not days.isdigit():
+        return 0
+    nums = [int(p) for p in parts]
+    seconds = nums.pop()
+    seconds += nums.pop() * 60
+    if nums:
+        seconds += nums.pop() * 3600
+    if days:
+        seconds += int(days) * 86400
+    return seconds
+
+
+def parse_ps(ps_output: str) -> list[tuple[int, int, int, float, str]]:
+    """Split ps output into (pid, ppid, age_seconds, cpu_pct, command) rows."""
+    rows = []
+    for line in ps_output.splitlines():
+        fields = line.split(maxsplit=4)
+        if len(fields) < 5 or not fields[0].isdigit():
+            continue  # header or malformed
+        pid, ppid, etime, pcpu, command = fields
+        rows.append((int(pid), int(ppid), parse_etime(etime), float(pcpu), command))
+    return rows
+
+
+def parse_agent_browser_procs(ps_output: str) -> tuple[list[Instance], list[tuple[int, int]]]:
+    """Split ps output into agent-browser instances and orphan daemons.
+
+    Returns (instances, orphan_daemons) where orphan_daemons is [(pid, age_seconds)]
+    for daemons with no Chrome tree left. Never matches the user's own Chrome.
+    """
+    rows = parse_ps(ps_output)
+    daemons = {pid: age for pid, _, age, _, cmd in rows if AGENT_BROWSER_DAEMON_RE.search(cmd)}
+
+    instances: dict[str, Instance] = {}
+    for pid, ppid, age, cpu, command in rows:
+        match = AGENT_BROWSER_UDD_RE.search(command)
+        if not match:
+            continue
+        inst = instances.setdefault(match.group(1), Instance(uuid=match.group(1)))
+        inst.pids.add(pid)
+        inst.age_seconds = max(inst.age_seconds, age)
+        inst.cpu_pct += cpu
+        # The root browser process is the one without --type=; its parent is the daemon.
+        if CHROME_ROOT_RE.search(command) and "--type=" not in command:
+            inst.root_pid = pid
+            if ppid in daemons:
+                inst.daemon_pid = ppid
+                inst.age_seconds = max(inst.age_seconds, daemons[ppid])
+
+    claimed = {i.daemon_pid for i in instances.values() if i.daemon_pid}
+    orphans = sorted((pid, age) for pid, age in daemons.items() if pid not in claimed)
+    return list(instances.values()), orphans
+
+
+def select_instances(
+    instances: list[Instance],
+    orphans: list[tuple[int, int]],
+    min_age_hours: float,
+) -> tuple[list[Instance], list[tuple[int, int]], list[Instance]]:
+    """Partition by age. Returns (instances_to_kill, orphans_to_kill, instances_kept)."""
+    cutoff = min_age_hours * 3600
+    kill_i = [i for i in instances if i.age_seconds >= cutoff]
+    kept = [i for i in instances if i.age_seconds < cutoff]
+    kill_o = [(pid, age) for pid, age in orphans if age >= cutoff]
+    return kill_i, kill_o, kept
+
+
+def parse_booted_devices(simctl_json: str) -> list[dict[str, str]]:
+    """Extract booted devices from `simctl list devices -j` output."""
+    try:
+        data = json.loads(simctl_json)
+    except json.JSONDecodeError:
+        return []
+    booted = []
+    for runtime, devices in (data.get("devices") or {}).items():
+        for device in devices:
+            if device.get("state") == "Booted":
+                booted.append(
+                    {
+                        "udid": device.get("udid", "?"),
+                        "name": device.get("name", "?"),
+                        "runtime": runtime.rsplit(".", 1)[-1],
+                    }
+                )
+    return booted
+
+
+# ── Process helpers ─────────────────────────────────────────
+def run(cmd: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def ps_snapshot() -> str:
+    return run(PS_ARGS, timeout=20).stdout
+
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError) as e:
+        return isinstance(e, PermissionError)  # exists but not ours
+    return True
+
+
+def kill_pids(pids: set[int], grace: float = 6.0) -> tuple[int, int]:
+    """SIGTERM, wait for exit, then SIGKILL survivors. Returns (termed, force_killed)."""
+    termed = 0
+    for pid in sorted(pids):
+        try:
+            os.kill(pid, signal.SIGTERM)
+            termed += 1
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    deadline = time.monotonic() + grace
+    while time.monotonic() < deadline:
+        if not any(alive(pid) for pid in pids):
+            return termed, 0
+        time.sleep(0.3)
+
+    forced = 0
+    for pid in sorted(pids):
+        if not alive(pid):
+            continue
+        try:
+            os.kill(pid, signal.SIGKILL)
+            forced += 1
+        except (ProcessLookupError, PermissionError):
+            pass
+    return termed, forced
+
+
+def count_procs(pattern: re.Pattern, ps_output: str) -> int:
+    return sum(1 for *_, cmd in parse_ps(ps_output) if pattern.search(cmd))
+
+
+def human_age(seconds: int) -> str:
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d{hours}h"
+    if hours:
+        return f"{hours}h{minutes}m"
+    return f"{minutes}m{seconds % 60}s"
+
+
+# ── Memory snapshot ─────────────────────────────────────────
+def mem_stats() -> tuple[float | None, float | None]:
+    """Return (system free memory %, swap used GB) — both None if unavailable."""
+    free_pct = None
+    out = run(["memory_pressure", "-Q"], timeout=15).stdout
+    match = re.search(r"free percentage:\s*(\d+)", out)
+    if match:
+        free_pct = float(match.group(1))
+
+    swap_gb = None
+    out = run(["sysctl", "-n", "vm.swapusage"], timeout=10).stdout
+    match = re.search(r"used\s*=\s*([\d.]+)M", out)
+    if match:
+        swap_gb = float(match.group(1)) / 1024
+    return free_pct, swap_gb
+
+
+# ── agent-browser cleanup ───────────────────────────────────
+def cleanup_agent_browser(min_age_hours: float, dry_run: bool) -> int:
+    """Close agent-browser sessions. Returns the number of processes reaped (or found)."""
+    print("── agent-browser ──────────────────────────────────")
+    instances, orphans = parse_agent_browser_procs(ps_snapshot())
+    kill_i, kill_o, kept = select_instances(instances, orphans, min_age_hours)
+
+    if not kill_i and not kill_o:
+        suffix = f" ({len(kept)} newer than {min_age_hours}h kept)" if kept else ""
+        print(f"nothing to clean{suffix}")
+        return 0
+
+    for inst in kill_i:
+        marker = f" {DANGER_MARKER} runaway" if inst.cpu_pct > 100 else ""
+        print(
+            f"  session {inst.uuid[:8]}  age {human_age(inst.age_seconds):>7}  "
+            f"{len(inst.all_pids):>2} procs  {inst.cpu_pct:>5.0f}% CPU{marker}"
+        )
+    for pid, age in kill_o:
+        print(f"  idle daemon pid {pid}  age {human_age(age):>7}  (no browser attached)")
+    for inst in kept:
+        print(f"  keeping {inst.uuid[:8]}  age {human_age(inst.age_seconds):>7}  (newer than {min_age_hours}h)")
+
+    targets = {p for i in kill_i for p in i.all_pids} | {pid for pid, _ in kill_o}
+    if dry_run:
+        print(f"[dry-run] would reap {len(targets)} processes")
+        return len(targets)
+
+    # `agent-browser close --all` is all-or-nothing, so it is only safe when no
+    # instance is being spared by --min-age.
+    if not kept:
+        result = run(["agent-browser", "close", "--all"], timeout=90)
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if line.strip():
+                    print(f"  {line.strip()}")
+        elif result.returncode == 127 or "not found" in result.stderr:
+            print("  agent-browser CLI unavailable, falling back to signals")
+        else:
+            print(f"  {DANGER_MARKER} close --all failed: {result.stderr.strip()[:200]}")
+    else:
+        print(f"  skipping `close --all` (would also close the {len(kept)} kept session(s)); signalling instead")
+
+    survivors = {pid for pid in targets if alive(pid)}
+    if survivors:
+        termed, forced = kill_pids(survivors)
+        print(f"  reaped {termed} leftover process(es)" + (f", {forced} needed SIGKILL" if forced else ""))
+
+    remaining = count_procs(AGENT_BROWSER_UDD_RE, ps_snapshot())
+    print(f"✅ done, {remaining} agent-browser chrome process(es) left")
+    return len(targets)
+
+
+# ── simulator cleanup ───────────────────────────────────────
+def cleanup_simulators(dry_run: bool) -> int:
+    """Shut down booted simulators and quit Simulator.app. Returns processes reaped."""
+    print("── iOS simulators ─────────────────────────────────")
+    listing = run(["xcrun", "simctl", "list", "devices", "-j"], timeout=60)
+    if listing.returncode != 0:
+        print(f"{DANGER_MARKER} simctl unavailable: {listing.stderr.strip()[:200]}")
+        return 0
+
+    devices = parse_booted_devices(listing.stdout)
+    before = ps_snapshot()
+    runtime_procs = count_procs(SIM_RUNTIME_RE, before)
+    app_pids = {pid for pid, _, _, _, cmd in parse_ps(before) if SIMULATOR_APP_RE.search(cmd)}
+
+    if not devices and not runtime_procs and not app_pids:
+        print("nothing to clean")
+        return 0
+
+    for device in devices:
+        print(f"  booted  {device['name']} ({device['udid'][:8]}, {device['runtime']})")
+    print(f"  {runtime_procs} iOS runtime process(es), Simulator.app {'running' if app_pids else 'not running'}")
+
+    if dry_run:
+        todo = f"would shut down {len(devices)} device(s), reap {runtime_procs} runtime process(es)"
+        if app_pids:
+            todo += ", quit Simulator.app"
+        print(f"[dry-run] {todo}")
+        return runtime_procs + len(app_pids)
+
+    result = run(["xcrun", "simctl", "shutdown", "all"], timeout=180)
+    if result.returncode != 0:
+        print(f"  {DANGER_MARKER} shutdown all: {result.stderr.strip()[:200]}")
+
+    if app_pids:
+        run(["osascript", "-e", 'quit app "Simulator"'], timeout=30)
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline and any(alive(pid) for pid in app_pids):
+            time.sleep(0.5)
+        # Simulator.app routinely ignores the AppleScript quit; fall back to signals.
+        stubborn = {pid for pid in app_pids if alive(pid)}
+        if stubborn:
+            kill_pids(stubborn)
+            print(f"  Simulator.app ignored quit, signalled pid(s) {sorted(stubborn)}")
+
+    after = ps_snapshot()
+    left = count_procs(SIM_RUNTIME_RE, after)
+    app_left = count_procs(SIMULATOR_APP_RE, after)
+    print(
+        f"✅ done, {runtime_procs - left} runtime process(es) gone, {left} left"
+        + (f", {DANGER_MARKER} Simulator.app still up" if app_left else "")
+    )
+    return (runtime_procs - left) + (len(app_pids) - app_left)
+
+
+# ── Self tests (behaviour spec) ─────────────────────────────
+PS_FIXTURE = """\
+  PID  PPID     ELAPSED  %CPU COMMAND
+    1     0 40-12:08:47   0.0 /sbin/launchd
+ 4497 96741 01-21:18:58   0.1 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=0 --no-first-run --headless=new --user-data-dir=/var/folders/3n/07t8/T/agent-browser-chrome-78de5d01-fc2e-4218-bc6a-32e9ab6bb4b3
+ 4512  4497 01-21:18:20  99.2 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/150.0.7871.182/Helpers/Google Chrome Helper (GPU).app/Contents/MacOS/Google Chrome Helper (GPU) --type=gpu-process --headless=new --user-data-dir=/var/folders/3n/07t8/T/agent-browser-chrome-78de5d01-fc2e-4218-bc6a-32e9ab6bb4b3
+ 4518  4497 01-21:18:20 100.0 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/150.0.7871.182/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer) --type=renderer --user-data-dir=/var/folders/3n/07t8/T/agent-browser-chrome-78de5d01-fc2e-4218-bc6a-32e9ab6bb4b3
+96741     1 01-21:45:02   0.0 /Users/reorx/.npm/_npx/dbf58e00439270c6/node_modules/agent-browser/bin/agent-browser-darwin-arm64
+40587 40586    23:12:10   0.0 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/var/folders/3n/07t8/T/agent-browser-chrome-7b38b244-8dff-466b-9124-6323ec0ca515
+40586     1    23:12:36   0.0 /Users/reorx/.npm/_npx/dbf58e00439270c6/node_modules/agent-browser/bin/agent-browser-darwin-arm64
+11213     1    10:28:45   0.0 /Users/reorx/.npm/_npx/dbf58e00439270c6/node_modules/agent-browser/bin/agent-browser-darwin-arm64
+ 2843     1 40-12:05:15   0.5 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+"""
+
+SIMCTL_FIXTURE = """\
+{
+  "devices" : {
+    "com.apple.CoreSimulator.SimRuntime.iOS-26-5" : [
+      { "udid" : "286BA6DA-9436-454A-A33F-C3406AF6F74C", "name" : "iPhone 17 Pro", "state" : "Booted" },
+      { "udid" : "75620740-DAD7-45D1-8BBF-264AFB150B12", "name" : "iPhone 17", "state" : "Booted" },
+      { "udid" : "11111111-2222-3333-4444-555555555555", "name" : "iPhone 16", "state" : "Shutdown" }
+    ],
+    "com.apple.CoreSimulator.SimRuntime.watchOS-11-0" : []
+  }
+}
+"""
+
+_FAILED = 0
+
+
+def check(name: str, got, want) -> None:
+    global _FAILED
+    if got == want:
+        print(f"  ✅ {name}")
+    else:
+        _FAILED += 1
+        print(f"  ❌ {name}\n       got:  {got!r}\n       want: {want!r}")
+
+
+def selftest() -> int:
+    print("parse_etime")
+    check("mm:ss", parse_etime("08:50"), 530)
+    check("hh:mm:ss", parse_etime("23:12:10"), 83530)
+    check("dd-hh:mm:ss", parse_etime("01-21:18:20"), 163100)
+    check("multi-day", parse_etime("09-23:51:05"), 863465)
+    check("padded single digit", parse_etime("0:05"), 5)
+    check("garbage → 0", parse_etime("ELAPSED"), 0)
+
+    print("\nparse_agent_browser_procs")
+    instances, orphans = parse_agent_browser_procs(PS_FIXTURE)
+    by_uuid = {i.uuid: i for i in instances}
+    check(
+        "finds 2 instances",
+        sorted(by_uuid),
+        ["78de5d01-fc2e-4218-bc6a-32e9ab6bb4b3", "7b38b244-8dff-466b-9124-6323ec0ca515"],
+    )
+    hot = by_uuid["78de5d01-fc2e-4218-bc6a-32e9ab6bb4b3"]
+    check("groups whole chrome tree", sorted(hot.pids), [4497, 4512, 4518])
+    check("links spawning daemon", hot.daemon_pid, 96741)
+    check("identifies chrome root", hot.root_pid, 4497)
+    check("age spans daemon lifetime", hot.age_seconds, 164702)
+    check("sums cpu across tree", round(hot.cpu_pct, 1), 199.3)
+    check("orphan daemon w/o chrome", orphans, [(11213, 37725)])
+    all_touched = {p for i in instances for p in i.all_pids} | {p for p, _ in orphans}
+    check("SAFETY: user's own chrome untouched", 2843 in all_touched, False)
+    check("SAFETY: launchd untouched", 1 in all_touched, False)
+
+    print("\nselect_instances")
+    # Fixture ages: 78de5d01 = 45.7h, 7b38b244 = 23.2h, orphan 11213 = 10.5h.
+    kill_i, kill_o, kept = select_instances(instances, orphans, min_age_hours=24)
+    check("age filter kills the stale one", [i.uuid for i in kill_i], ["78de5d01-fc2e-4218-bc6a-32e9ab6bb4b3"])
+    check("age filter keeps the fresh one", [i.uuid for i in kept], ["7b38b244-8dff-466b-9124-6323ec0ca515"])
+    check("age filter keeps fresh orphan", kill_o, [])
+    kill_i, _, kept = select_instances(instances, orphans, min_age_hours=1)
+    check("1h cutoff catches both day-old sessions", (len(kill_i), len(kept)), (2, 0))
+    kill_i, kill_o, kept = select_instances(instances, orphans, min_age_hours=0)
+    check("min_age 0 takes everything", (len(kill_i), len(kill_o), len(kept)), (2, 1, 0))
+
+    print("\nparse_booted_devices")
+    devices = parse_booted_devices(SIMCTL_FIXTURE)
+    check("only booted devices", [d["name"] for d in devices], ["iPhone 17 Pro", "iPhone 17"])
+    check("keeps udid", devices[0]["udid"], "286BA6DA-9436-454A-A33F-C3406AF6F74C")
+    check("empty runtime tolerated", parse_booted_devices('{"devices":{"x":[]}}'), [])
+    check("malformed → empty", parse_booted_devices("not json"), [])
+
+    print("\nhelpers")
+    check("counts sim runtime procs", count_procs(AGENT_BROWSER_UDD_RE, PS_FIXTURE), 4)
+    check("human_age days", human_age(164702), "1d21h")
+    check("human_age hours", human_age(83530), "23h12m")
+    check("human_age minutes", human_age(530), "8m50s")
+
+    print()
+    if _FAILED:
+        print(f"❌ {_FAILED} check(s) failed")
+    else:
+        print("✅ all checks passed")
+    return 1 if _FAILED else 0
+
+
+# ── Main ────────────────────────────────────────────────────
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Release iOS simulator and agent-browser test resources",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("-n", "--dry-run", action="store_true", help="Report what would be cleaned, change nothing")
+    parser.add_argument(
+        "--only",
+        choices=["sim", "browser"],
+        help="Clean only simulators, or only agent-browser (default: both)",
+    )
+    parser.add_argument(
+        "--min-age",
+        type=float,
+        default=0,
+        metavar="HOURS",
+        help="Only reap agent-browser sessions older than HOURS (default: 0 = all). "
+        "Use e.g. --min-age 2 to run this while a session is actively driving a browser.",
+    )
+    parser.add_argument("--selftest", action="store_true", help="Run behaviour checks and exit")
+    args = parser.parse_args()
+
+    if args.selftest:
+        return selftest()
+
+    if sys.platform != "darwin":
+        print("macOS only", file=sys.stderr)
+        return 1
+
+    # Under launchd the output is appended to a log file forever, so stamp each run.
+    if not sys.stdout.isatty():
+        print(f"═══ mac-dev-cleanup {time.strftime('%Y-%m-%d %H:%M:%S')} ═══")
+
+    free_before, swap_before = mem_stats()
+
+    found = 0
+    if args.only != "sim":
+        found += cleanup_agent_browser(args.min_age, args.dry_run)
+        print()
+    if args.only != "browser":
+        found += cleanup_simulators(args.dry_run)
+        print()
+
+    free_after, swap_after = mem_stats()
+    parts = []
+    if free_before is not None and free_after is not None:
+        parts.append(f"free memory {free_before:.0f}% → {free_after:.0f}%")
+    if swap_before is not None and swap_after is not None:
+        parts.append(f"swap {swap_before:.2f}G → {swap_after:.2f}G")
+    if parts and not args.dry_run:
+        print("  ".join(parts))
+
+    # Under --dry-run, a non-zero exit means "there is something to clean".
+    return 1 if args.dry_run and found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

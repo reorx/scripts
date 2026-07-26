@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.reorx.mac-dev-cleanup</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/reorx/Code/scripts/skills/systools/scripts/mac-dev-cleanup</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- The `#!/usr/bin/env -S uv run --script` shebang needs uv (~/.local/bin),
+             and the script itself shells out to agent-browser (/opt/homebrew/bin),
+             xcrun + osascript + memory_pressure (/usr/bin) and sysctl (/usr/sbin). -->
+        <key>PATH</key>
+        <string>/Users/reorx/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- 06:00 daily = 30min after the 5:30AM `pmset repeat wakepoweron`.
+         System sleep is disabled (pmset sleep 0), so the machine is reliably
+         awake at this point and the job is not deferred to a later wake. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- Deliberately no RunAtLoad: this kills browsers and simulators, and should
+         only ever fire on the schedule, not on every login/reload. -->
+
+    <key>StandardOutPath</key>
+    <string>/Users/reorx/Library/Logs/mac-dev-cleanup.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/reorx/Library/Logs/mac-dev-cleanup.log</string>
+</dict>
+</plist>
