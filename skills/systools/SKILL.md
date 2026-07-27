@@ -1,6 +1,6 @@
 ---
 name: systools
-description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing processes on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots — CPU temp, load, memory, swap, disk, network (\"how's my mac\", \"is it overheating\"); live memory I/O pressure — pageouts, swap churn, compressor activity (\"why is my mac slow\", \"is it swapping\"); releasing leaked dev test resources — booted iOS simulators and agent-browser headless Chrome (\"clean up simulators\", \"close all agent-browser\", \"清理模拟器\", teardown after browser/iOS testing); WindowServer CPU/GPU diagnostics (\"WindowServer is hot\", \"UI feels laggy\"); managing the daily wake/sleep schedule via pmset (\"schedule my mac to sleep at 1am\", \"change the auto sleep time\", \"自动休眠计划\"); auditing launchd + cron scheduled jobs and whether they are actually loaded (\"what runs periodically\", \"why isn't my launch agent running\", \"定时任务\", \"launchd 有哪些\"); and listing/managing macOS Background Task Management items shown in System Settings. macOS-only except port management."
+description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing processes on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots — CPU temp, load, memory, swap, disk, network (\"how's my mac\", \"is it overheating\"); live memory I/O pressure — pageouts, swap churn, compressor activity (\"why is my mac slow\", \"is it swapping\"); releasing leaked dev test resources — booted iOS simulators and agent-browser headless Chrome (\"clean up simulators\", \"close all agent-browser\", \"清理模拟器\", teardown after browser/iOS testing); WindowServer CPU/GPU diagnostics (\"WindowServer is hot\", \"UI feels laggy\"); managing the daily wake/sleep schedule via pmset (\"schedule my mac to sleep at 1am\", \"change the auto sleep time\", \"自动休眠计划\"); auditing launchd + cron scheduled jobs and whether they are actually loaded (\"what runs periodically\", \"why isn't my launch agent running\", \"定时任务\", \"launchd 有哪些\"); listing/managing macOS Background Task Management items shown in System Settings; and repairing PostgreSQL instances that will not start under brew services (\"postgresql shows error in brew services\", \"postgres won't start\", \"lock file postmaster.pid already exists\", \"数据库起不来\"). macOS-only except port management."
 ---
 
 # systools
@@ -411,3 +411,73 @@ launchd-list.py --selftest      # 39 behaviour checks, no side effects
 - "Is my scheduled cleanup/backup actually armed?" → `launchd-list.py --label cleanup` and check the state marker and schedule
 - "Which of my jobs are failing?" → run it and read the "non-zero last exit" summary line
 - Auditing a new machine, or diffing before/after an install → `launchd-list.py --json` snapshots
+
+## PostgreSQL Service Recovery
+
+### `brew services` shows postgresql as `error`
+
+**Script:** `scripts/pg-doctor`
+
+**Prerequisites:** macOS + Homebrew. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Wraps `ps`, `brew services list --json`, `plutil`-free `plistlib`, `pg_isready`.
+
+The failure this exists for, in order:
+
+1. An unclean shutdown (power loss, forced reboot, panic) kills the postmaster before it can remove `postmaster.pid` from the data directory.
+2. On the next boot the PID recorded in that file gets **recycled by an unrelated system process** — low PIDs go to Apple daemons early in boot.
+3. PostgreSQL's stale-lock detection does `kill(pid, 0)`, sees a live process, and concludes another postmaster owns the directory:
+   ```
+   FATAL:  lock file "postmaster.pid" already exists
+   HINT:  Is another postmaster (PID 589) running in data directory "..."?
+   ```
+4. Homebrew's plist has `KeepAlive=true`, so launchd retries **every 10 seconds, forever**. `brew services list` shows `error 1`, the log grows by megabytes, and the database is simply down until someone notices.
+
+Normally PostgreSQL cleans up a stale lock by itself — that only works when the recorded PID no longer exists. PID reuse is what defeats it, which is why this needs a tool rather than a retry.
+
+**How to use:**
+
+```bash
+# Diagnose every brew-managed instance (read-only; exit 1 = something is wrong)
+pg-doctor
+
+# Repair: clear the stale lock, restart the service, wait for it to accept connections
+pg-doctor --fix
+
+# Narrow to one formula, or check a data directory brew knows nothing about
+pg-doctor --name postgresql@18 --fix
+pg-doctor --datadir /path/to/pgdata
+
+# Behaviour checks (45 assertions, no side effects)
+pg-doctor --selftest
+```
+
+**Verdicts:**
+
+| Verdict | Meaning | `--fix` acts? |
+|---------|---------|---------------|
+| `healthy` | The PID in the lock file is a live postmaster for this data directory | no |
+| `no-lock` | No `postmaster.pid` — normal for a stopped instance | no |
+| `stale-reused` | The PID is alive but belongs to an unrelated process (**the classic case**) | yes |
+| `stale-dead` | The PID no longer exists at all | yes |
+| `corrupt` | `postmaster.pid` has no readable PID on line 1 | yes |
+| `ambiguous` | The PID is a postgres, but serving a *different* data directory | no — resolve by hand |
+
+**Safety.** Two postmasters on one data directory corrupt it, so the tool never deletes a lock file on a guess:
+
+- Anything that is or *might* be a postmaster for that directory is classified non-fixable.
+- Before deleting, `--fix` re-scans `ps` for a live postmaster serving that exact `-D` path and aborts if one appeared since the diagnosis.
+- The removed file is backed up (`/tmp/postmaster.pid.<instance>.<timestamp>` by default, `--backup-dir` to change).
+- `--selftest` asserts `healthy` and `ambiguous` are not in the fixable set; `test-pg-doctor.sh` in the scripts repo root additionally builds synthetic data directories for every verdict and runs `--fix` against the *live* data directory, asserting the lock file's inode/mtime/size are unchanged.
+
+**Notes / gotchas:**
+
+- After the repair PostgreSQL runs crash recovery (`database system was not properly shut down; automatic recovery in progress`) before accepting connections — `--fix` polls `pg_isready` for up to 40s. Committed data is not lost; the WAL is replayed.
+- The stale-lock FATALs stay in the log after the fix. `pg-doctor` only flags them as urgent while the instance is still broken; on a healthy instance it reports them as history.
+- When an instance is broken for some *other* reason, the lock file explains nothing — the report then prints the last real `FATAL`/`PANIC` lines from the log instead (disk full, bad WAL, failed config reload).
+- `brew services list --json` is the source of truth for which formulae exist; the data directory comes from `-D` in the launchd plist, not from a guess about `/opt/homebrew/var/<name>`.
+- This has recurred at least twice on this machine (2026-05-13, 2026-07-27) — after any hard reboot, `pg-doctor` is worth a run before debugging an app that "can't connect to the database".
+
+**Typical scenarios:**
+- `brew services list` shows postgresql as `error` → `pg-doctor`, then `pg-doctor --fix`
+- An app suddenly cannot reach postgres on 5432 after a reboot → `pg-doctor`
+- The postgres log is exploding in size → `pg-doctor` reports the FATAL count and log size directly
+- Checking a non-brew or second cluster → `pg-doctor --datadir <path>`

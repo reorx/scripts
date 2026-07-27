@@ -1,0 +1,600 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Diagnose and repair PostgreSQL instances that will not start under brew services.
+
+The recurring failure this exists for: an unclean shutdown (power loss, forced reboot,
+kernel panic) leaves `postmaster.pid` behind in the data directory. On the next boot the
+PID recorded in that file gets recycled by an unrelated system process, so PostgreSQL's
+stale-lock detection sees a live PID, concludes another postmaster owns the directory,
+and refuses to start:
+
+    FATAL:  lock file "postmaster.pid" already exists
+    HINT:  Is another postmaster (PID 589) running in data directory "..."?
+
+launchd has KeepAlive=true, so it retries every 10s forever — `brew services list` shows
+`error 1` and the log grows without bound while the database is simply down.
+
+Exit code: 0 when every instance is healthy, 1 when a problem is found (so it composes as
+a check, like mac-dev-cleanup). With --fix, 0 means the repair succeeded.
+"""
+
+import argparse
+import json
+import os
+import plistlib
+import re
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+# ── Verdicts ────────────────────────────────────────────────
+NO_LOCK = "no-lock"
+HEALTHY = "healthy"
+STALE_DEAD = "stale-dead"
+STALE_REUSED = "stale-reused"
+AMBIGUOUS = "ambiguous"
+CORRUPT = "corrupt"
+
+# Only these are safe to clear automatically: in each case the PID in the lock file
+# provably does not belong to a postmaster serving this data directory.
+FIXABLE = {STALE_DEAD, STALE_REUSED, CORRUPT}
+
+DANGER_MARKER = "⚠️"
+
+# The postmaster itself; child processes present as `postgres: checkpointer` etc.
+POSTGRES_BIN_RE = re.compile(r"/bin/postgres\b")
+POSTGRES_CHILD_RE = re.compile(r"^postgres:\s")
+DATADIR_ARG_RE = re.compile(r"-D\s*(\S+)")
+STALE_FATAL_RE = re.compile(r'FATAL:\s+lock file "postmaster\.pid" already exists')
+FAILURE_RE = re.compile(r"\b(FATAL|PANIC):\s")
+
+PS_ARGS = ["ps", "-Awwo", "pid,command"]
+
+# Reading the whole log would mean pulling megabytes of restart-storm spam into memory.
+LOG_TAIL_BYTES = 2 * 1024 * 1024
+
+
+@dataclass
+class LockInfo:
+    """Parsed postmaster.pid. Fields are None when the file is truncated or malformed."""
+
+    pid: int | None = None
+    datadir: str | None = None
+    start_epoch: int | None = None
+    port: int | None = None
+    raw: str = ""
+
+
+@dataclass
+class Instance:
+    """One brew-managed PostgreSQL formula and everything known about its health."""
+
+    name: str
+    datadir: str
+    service_status: str = "unknown"
+    exit_code: int | None = None
+    log_path: str | None = None
+    lock: LockInfo | None = None
+    holder_cmd: str | None = None
+    live_postmaster: int | None = None
+    verdict: str = NO_LOCK
+    detail: str = ""
+    stale_fatals: int = 0
+    log_size: int = 0
+    listening: bool = False
+    failures: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def broken(self) -> bool:
+        # A stopped instance with no lock file is not broken, it is just off.
+        idle = self.verdict == NO_LOCK and self.service_status in ("none", "detached")
+        return self.verdict != HEALTHY and not idle
+
+    @property
+    def port(self) -> int:
+        return self.lock.port if self.lock and self.lock.port else 5432
+
+
+# ── Parsing ─────────────────────────────────────────────────
+def parse_postmaster_pid(text: str) -> LockInfo:
+    """Parse a postmaster.pid file (PG 9.1+ layout: pid, datadir, epoch, port, ...)."""
+    lines = text.splitlines()
+
+    def field_at(index: int) -> str:
+        return lines[index].strip() if index < len(lines) else ""
+
+    def as_int(value: str) -> int | None:
+        return int(value) if value.isdigit() and int(value) > 0 else None
+
+    return LockInfo(
+        pid=as_int(field_at(0)),
+        datadir=field_at(1) or None,
+        start_epoch=as_int(field_at(2)),
+        port=as_int(field_at(3)),
+        raw=text,
+    )
+
+
+def is_postgres_cmd(cmd: str) -> bool:
+    """True if a ps command line is a postmaster or one of its children."""
+    return bool(POSTGRES_BIN_RE.search(cmd) or POSTGRES_CHILD_RE.match(cmd))
+
+
+def datadir_from_cmd(cmd: str) -> str | None:
+    """Extract the -D argument from a postmaster command line."""
+    match = DATADIR_ARG_RE.search(cmd)
+    return match.group(1) if match else None
+
+
+def normalize_datadir(path: str) -> str:
+    return os.path.normpath(path)
+
+
+def parse_ps(ps_output: str) -> list[tuple[int, str]]:
+    """Split `ps -Awwo pid,command` output into (pid, command) rows."""
+    rows = []
+    for line in ps_output.splitlines():
+        fields = line.split(maxsplit=1)
+        if len(fields) == 2 and fields[0].isdigit():
+            rows.append((int(fields[0]), fields[1]))
+    return rows
+
+
+def postmaster_for_datadir(ps_output: str, datadir: str) -> int | None:
+    """PID of a live postmaster serving datadir, ignoring the lock file entirely."""
+    target = normalize_datadir(datadir)
+    for pid, cmd in parse_ps(ps_output):
+        if not is_postgres_cmd(cmd):
+            continue
+        found = datadir_from_cmd(cmd)
+        if found and normalize_datadir(found) == target:
+            return pid
+    return None
+
+
+def classify_lock(lock: LockInfo | None, holder_cmd: str | None, datadir: str) -> tuple[str, str]:
+    """Decide what the lock file means. Returns (verdict, human explanation).
+
+    holder_cmd is the ps command of the PID recorded in the lock file, or None when no
+    such process exists. Anything that is or might be a postmaster for this directory
+    must never come back FIXABLE — a second postmaster on one data directory corrupts it.
+    """
+    if lock is None:
+        return NO_LOCK, "no postmaster.pid in the data directory"
+    if lock.pid is None:
+        return CORRUPT, "postmaster.pid holds no readable pid on line 1"
+    if holder_cmd is None:
+        return STALE_DEAD, f"pid {lock.pid} no longer exists — left behind by an unclean shutdown"
+
+    if is_postgres_cmd(holder_cmd):
+        holder_dir = datadir_from_cmd(holder_cmd)
+        if holder_dir is None or normalize_datadir(holder_dir) == normalize_datadir(datadir):
+            return HEALTHY, f"pid {lock.pid} is a live postmaster for this data directory"
+        return AMBIGUOUS, f"pid {lock.pid} is a postgres serving {holder_dir} — resolve by hand"
+
+    intruder = os.path.basename(holder_cmd.split()[0]) if holder_cmd.split() else holder_cmd
+    return STALE_REUSED, f"pid {lock.pid} was recycled by an unrelated process ({intruder})"
+
+
+def parse_pg_services(services_json: str) -> list[dict]:
+    """Pick the postgresql* entries out of `brew services list --json`."""
+    try:
+        entries = json.loads(services_json)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries if str(e.get("name", "")).startswith("postgresql")]
+
+
+def count_stale_fatals(log_text: str) -> int:
+    """How many times the stale-lock FATAL was hit — i.e. the size of the restart storm."""
+    return len(STALE_FATAL_RE.findall(log_text))
+
+
+def recent_failures(log_text: str, limit: int = 3) -> list[str]:
+    """Last few FATAL/PANIC lines, minus the stale-lock storm which is reported separately.
+
+    This is what tells apart "stuck on a stale lock" from "postgres is failing for some
+    other reason entirely" — a disk full, a corrupt WAL segment, a bad config reload.
+    """
+    hits = [
+        line.strip()
+        for line in log_text.splitlines()
+        if FAILURE_RE.search(line) and not STALE_FATAL_RE.search(line)
+    ]
+    return hits[-limit:]
+
+
+# ── System access ───────────────────────────────────────────
+def run(cmd: list[str], timeout: int = 60) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def ps_snapshot() -> str:
+    return run(PS_ARGS, timeout=20).stdout
+
+
+def command_of(pid: int) -> str | None:
+    """ps command line of a pid, or None if no such process."""
+    result = run(["ps", "-p", str(pid), "-o", "command="], timeout=10)
+    cmd = result.stdout.strip()
+    return cmd or None
+
+
+def read_tail(path: Path, limit: int = LOG_TAIL_BYTES) -> str:
+    with path.open("rb") as f:
+        f.seek(0, os.SEEK_END)
+        f.seek(max(0, f.tell() - limit))
+        return f.read().decode("utf-8", "replace")
+
+
+def plist_details(plist_path: str) -> tuple[str | None, str | None]:
+    """Extract (datadir, log path) from a homebrew launchd plist."""
+    try:
+        with open(plist_path, "rb") as f:
+            data = plistlib.load(f)
+    except (OSError, plistlib.InvalidFileException):
+        return None, None
+    argv = [str(a) for a in data.get("ProgramArguments", [])]
+    datadir = None
+    if "-D" in argv and argv.index("-D") + 1 < len(argv):
+        datadir = argv[argv.index("-D") + 1]
+    log = data.get("StandardErrorPath") or data.get("StandardOutPath")
+    return datadir, log
+
+
+def pg_isready(name: str, port: int) -> bool:
+    binary = f"/opt/homebrew/opt/{name}/bin/pg_isready"
+    if not os.path.exists(binary):
+        binary = "pg_isready"
+    try:
+        return run([binary, "-h", "localhost", "-p", str(port), "-q"], timeout=15).returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+# ── Diagnosis ───────────────────────────────────────────────
+def discover_instances(only: str | None, datadir_override: str | None) -> list[Instance]:
+    if datadir_override:
+        name = only or Path(datadir_override).name
+        return [Instance(name=name, datadir=normalize_datadir(datadir_override), service_status="detached")]
+
+    services = parse_pg_services(run(["brew", "services", "list", "--json"], timeout=60).stdout)
+    instances = []
+    for service in services:
+        if only and service["name"] != only:
+            continue
+        datadir, log = plist_details(service.get("file") or "")
+        if not datadir:
+            datadir = f"/opt/homebrew/var/{service['name']}"
+        instances.append(
+            Instance(
+                name=service["name"],
+                datadir=normalize_datadir(datadir),
+                service_status=service.get("status", "unknown"),
+                exit_code=service.get("exit_code"),
+                log_path=log,
+            )
+        )
+    return instances
+
+
+def diagnose(inst: Instance) -> Instance:
+    lock_path = Path(inst.datadir) / "postmaster.pid"
+    if lock_path.exists():
+        try:
+            inst.lock = parse_postmaster_pid(lock_path.read_text(errors="replace"))
+        except OSError as e:
+            inst.lock = LockInfo()
+            inst.notes.append(f"postmaster.pid unreadable: {e}")
+
+    if inst.lock and inst.lock.pid:
+        inst.holder_cmd = command_of(inst.lock.pid)
+
+    inst.live_postmaster = postmaster_for_datadir(ps_snapshot(), inst.datadir)
+    inst.verdict, inst.detail = classify_lock(inst.lock, inst.holder_cmd, inst.datadir)
+
+    # Safety net independent of the lock file: if any postmaster is actually serving this
+    # directory, nothing here is stale, whatever the pid file says.
+    if inst.verdict in FIXABLE and inst.live_postmaster is not None:
+        inst.verdict = AMBIGUOUS
+        inst.detail = f"a live postmaster (pid {inst.live_postmaster}) is serving this directory — not touching it"
+
+    if inst.log_path and os.path.exists(inst.log_path):
+        log = Path(inst.log_path)
+        inst.log_size = log.stat().st_size
+        tail = read_tail(log)
+        inst.stale_fatals = count_stale_fatals(tail)
+        inst.failures = recent_failures(tail)
+
+    inst.listening = pg_isready(inst.name, inst.port)
+    return inst
+
+
+def report(inst: Instance) -> None:
+    print(f"── {inst.name} ──────────────────────────────────")
+    print(f"  data dir     {inst.datadir}")
+    status = inst.service_status + (f" ({inst.exit_code})" if inst.exit_code else "")
+    print(f"  brew service {status}")
+    print(f"  port {inst.port}      {'accepting connections' if inst.listening else 'not responding'}")
+
+    if inst.lock:
+        started = time.strftime("%Y-%m-%d %H:%M", time.localtime(inst.lock.start_epoch)) if inst.lock.start_epoch else "?"
+        print(f"  lock file    pid {inst.lock.pid}, written {started}")
+        if inst.holder_cmd:
+            print(f"  pid {inst.lock.pid} is   {inst.holder_cmd[:88]}")
+    else:
+        print("  lock file    absent")
+
+    icon = "✅" if inst.verdict == HEALTHY else ("·" if inst.verdict == NO_LOCK else DANGER_MARKER)
+    print(f"  {icon} {inst.verdict}: {inst.detail}")
+
+    if inst.stale_fatals:
+        size_mb = inst.log_size / 1024 / 1024
+        # Once repaired the FATALs stay in the log forever, so don't cry wolf over history.
+        if inst.broken:
+            icon, when = DANGER_MARKER, "launchd is retrying every 10s"
+        else:
+            icon, when = " ", "left over from an earlier incident"
+        print(f"  {icon} {inst.stale_fatals} stale-lock FATALs in {inst.log_path} ({size_mb:.1f} MB) — {when}")
+
+    # The lock file explains nothing here, so surface what the log actually says.
+    if inst.broken and inst.verdict not in FIXABLE and inst.failures:
+        print("  recent failures in the log:")
+        for line in inst.failures:
+            print(f"    {line[:120]}")
+
+    for note in inst.notes:
+        print(f"  {note}")
+
+
+# ── Repair ──────────────────────────────────────────────────
+def fix(inst: Instance, backup_dir: str) -> bool:
+    """Clear the stale lock and restart the service. Returns True on success."""
+    if inst.verdict not in FIXABLE:
+        print(f"  nothing to fix ({inst.verdict})")
+        return True
+
+    # Re-check right before deleting: the diagnosis above is a few seconds old, and the
+    # cost of being wrong is two postmasters writing one data directory.
+    live = postmaster_for_datadir(ps_snapshot(), inst.datadir)
+    if live is not None:
+        print(f"  {DANGER_MARKER} aborting: postmaster pid {live} appeared on this data directory")
+        return False
+
+    lock_path = Path(inst.datadir) / "postmaster.pid"
+    if lock_path.exists():
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        backup = Path(backup_dir) / f"postmaster.pid.{inst.name}.{stamp}"
+        backup.write_text(inst.lock.raw if inst.lock else "")
+        lock_path.unlink()
+        print(f"  removed {lock_path} (backup: {backup})")
+
+    if inst.service_status in ("none", "detached"):
+        print("  not managed by brew services here — start it yourself when ready")
+        return True
+    if inst.service_status in ("started", "error"):
+        result = run(["brew", "services", "restart", inst.name], timeout=180)
+    else:
+        result = run(["brew", "services", "start", inst.name], timeout=180)
+
+    for line in result.stdout.splitlines():
+        if line.strip():
+            print(f"  {line.strip()}")
+    if result.returncode != 0:
+        print(f"  {DANGER_MARKER} brew services failed: {result.stderr.strip()[:200]}")
+        return False
+
+    # Crash recovery replays WAL before the postmaster accepts connections.
+    deadline = time.monotonic() + 40
+    while time.monotonic() < deadline:
+        if pg_isready(inst.name, inst.port):
+            print(f"  ✅ port {inst.port} accepting connections")
+            return True
+        time.sleep(1)
+    print(f"  {DANGER_MARKER} still not accepting connections after 40s — check {inst.log_path}")
+    return False
+
+
+# ── Fixtures ────────────────────────────────────────────────
+# Real postmaster.pid recovered from the 2026-07-27 incident.
+POSTMASTER_PID_FIXTURE = """589
+/opt/homebrew/var/postgresql@18
+1781576841
+5432
+/tmp
+localhost
+137451772     65536
+ready
+"""
+
+PS_FIXTURE = """\
+  PID COMMAND
+  589 /System/Library/Frameworks/FinanceKit.framework/financed
+57368 /opt/homebrew/opt/postgresql@18/bin/postgres -D /opt/homebrew/var/postgresql@18
+57374 postgres: checkpointer
+ 1234 /opt/homebrew/opt/postgresql@14/bin/postgres -D /opt/homebrew/var/postgresql@14
+"""
+
+BREW_JSON_FIXTURE = """[
+  {"name": "mysql", "status": "started", "user": "reorx", "file": "/x/homebrew.mxcl.mysql.plist", "exit_code": null},
+  {"name": "postgresql@14", "status": "none", "user": null, "file": "/x/homebrew.mxcl.postgresql@14.plist", "exit_code": null},
+  {"name": "postgresql@18", "status": "error", "user": "reorx", "file": "/x/homebrew.mxcl.postgresql@18.plist", "exit_code": 1}
+]"""
+
+LOG_FIXTURE = """\
+2026-07-26 00:29:36.388 CST [1652] LOG:  checkpoint complete: wrote 54 buffers
+2026-07-27 09:41:13.915 CST [707] FATAL:  lock file "postmaster.pid" already exists
+2026-07-27 09:41:13.915 CST [707] HINT:  Is another postmaster (PID 589) running in data directory "/x"?
+2026-07-27 09:41:23.915 CST [712] FATAL:  lock file "postmaster.pid" already exists
+"""
+
+OTHER_FAILURE_FIXTURE = """\
+2026-07-27 09:41:13.915 CST [707] FATAL:  lock file "postmaster.pid" already exists
+2026-07-27 09:42:00.000 CST [800] FATAL:  could not create shared memory segment: Invalid argument
+2026-07-27 09:43:00.000 CST [801] PANIC:  could not write to file "pg_wal/xlogtemp.801": No space left on device
+"""
+
+DATADIR = "/opt/homebrew/var/postgresql@18"
+
+
+# ── Selftest ────────────────────────────────────────────────
+_FAILED = 0
+
+
+def check(name: str, got, want) -> None:
+    global _FAILED
+    if got == want:
+        print(f"  ✅ {name}")
+    else:
+        _FAILED += 1
+        print(f"  ❌ {name}\n       got:  {got!r}\n       want: {want!r}")
+
+
+def selftest() -> int:
+    print("parse_postmaster_pid")
+    lock = parse_postmaster_pid(POSTMASTER_PID_FIXTURE)
+    check("pid", lock.pid, 589)
+    check("datadir", lock.datadir, DATADIR)
+    check("start epoch", lock.start_epoch, 1781576841)
+    check("port", lock.port, 5432)
+    check("empty file → no pid", parse_postmaster_pid("").pid, None)
+    check("garbage first line → no pid", parse_postmaster_pid("not-a-pid\n/x\n").pid, None)
+    check("truncated file keeps pid", parse_postmaster_pid("589\n").pid, 589)
+    check("truncated file has no port", parse_postmaster_pid("589\n").port, None)
+
+    print("\nis_postgres_cmd / datadir_from_cmd")
+    postmaster = "/opt/homebrew/opt/postgresql@18/bin/postgres -D /opt/homebrew/var/postgresql@18"
+    check("postmaster", is_postgres_cmd(postmaster), True)
+    check("child process", is_postgres_cmd("postgres: checkpointer"), True)
+    check("unrelated daemon", is_postgres_cmd("/System/.../FinanceKit.framework/financed"), False)
+    check("pgadmin is not postgres", is_postgres_cmd("/Applications/pgAdmin.app/Contents/MacOS/pgAdmin"), False)
+    check("datadir", datadir_from_cmd(postmaster), DATADIR)
+    check("no -D → None", datadir_from_cmd("postgres: checkpointer"), None)
+
+    print("\npostmaster_for_datadir")
+    check("finds live postmaster", postmaster_for_datadir(PS_FIXTURE, DATADIR), 57368)
+    check("other instance", postmaster_for_datadir(PS_FIXTURE, "/opt/homebrew/var/postgresql@14"), 1234)
+    check("nothing serving it", postmaster_for_datadir(PS_FIXTURE, "/opt/homebrew/var/postgresql@17"), None)
+    check("trailing slash tolerated", postmaster_for_datadir(PS_FIXTURE, DATADIR + "/"), 57368)
+
+    print("\nclassify_lock")
+    lock589 = parse_postmaster_pid(POSTMASTER_PID_FIXTURE)
+    check("no lock file", classify_lock(None, None, DATADIR)[0], NO_LOCK)
+    check(
+        "pid recycled by unrelated process",  # the 2026-07-27 incident
+        classify_lock(lock589, "/System/Library/Frameworks/FinanceKit.framework/financed", DATADIR)[0],
+        STALE_REUSED,
+    )
+    check("pid holder is gone", classify_lock(lock589, None, DATADIR)[0], STALE_DEAD)
+    check(
+        "real postmaster on this datadir",
+        classify_lock(lock589, f"/opt/homebrew/opt/postgresql@18/bin/postgres -D {DATADIR}", DATADIR)[0],
+        HEALTHY,
+    )
+    check(
+        "postgres child process counts as running",
+        classify_lock(lock589, "postgres: checkpointer", DATADIR)[0],
+        HEALTHY,
+    )
+    check(
+        "postgres serving a different datadir",
+        classify_lock(lock589, "/opt/homebrew/opt/postgresql@14/bin/postgres -D /opt/homebrew/var/postgresql@14", DATADIR)[0],
+        AMBIGUOUS,
+    )
+    check("empty lock file", classify_lock(parse_postmaster_pid(""), None, DATADIR)[0], CORRUPT)
+    check("explanation names the intruder", "financed" in classify_lock(lock589, "/x/financed", DATADIR)[1], True)
+
+    print("\nfixability (a live postmaster must never be fixable)")
+    check("stale-reused is fixable", STALE_REUSED in FIXABLE, True)
+    check("stale-dead is fixable", STALE_DEAD in FIXABLE, True)
+    check("corrupt is fixable", CORRUPT in FIXABLE, True)
+    check("healthy is NOT fixable", HEALTHY in FIXABLE, False)
+    check("ambiguous is NOT fixable", AMBIGUOUS in FIXABLE, False)
+    check("no-lock is NOT fixable", NO_LOCK in FIXABLE, False)
+
+    print("\nparse_pg_services")
+    services = parse_pg_services(BREW_JSON_FIXTURE)
+    check("only postgres formulae", [s["name"] for s in services], ["postgresql@14", "postgresql@18"])
+    check("keeps status", services[1]["status"], "error")
+    check("keeps exit code", services[1]["exit_code"], 1)
+    check("bad json → empty", parse_pg_services("not json"), [])
+
+    print("\ncount_stale_fatals")
+    check("counts the restart storm", count_stale_fatals(LOG_FIXTURE), 2)
+    check("clean log", count_stale_fatals("2026-07-26 LOG:  checkpoint complete\n"), 0)
+
+    print("\nrecent_failures")
+    check("stale-lock storm is not a 'real' failure", recent_failures(LOG_FIXTURE), [])
+    failures = recent_failures(OTHER_FAILURE_FIXTURE)
+    check("picks up other FATAL/PANIC", len(failures), 2)
+    check("keeps the newest last", failures[-1].endswith("No space left on device"), True)
+    check("catches PANIC too", "PANIC" in failures[-1], True)
+    check("respects the limit", len(recent_failures(OTHER_FAILURE_FIXTURE, limit=1)), 1)
+    check("clean log", recent_failures("2026-07-26 LOG:  checkpoint complete\n"), [])
+
+    print()
+    if _FAILED:
+        print(f"❌ {_FAILED} check(s) failed")
+    else:
+        print("✅ all checks passed")
+    return 1 if _FAILED else 0
+
+
+# ── Main ────────────────────────────────────────────────────
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Diagnose PostgreSQL instances stuck behind a stale postmaster.pid",
+        epilog="Runs read-only by default; --fix clears the lock and restarts the service.",
+    )
+    parser.add_argument("--fix", action="store_true", help="Clear stale locks and restart affected services")
+    parser.add_argument("--name", help="Only check this formula (e.g. postgresql@18)")
+    parser.add_argument("--datadir", help="Check a data directory directly, bypassing brew")
+    parser.add_argument(
+        "--backup-dir",
+        default="/tmp",
+        metavar="DIR",
+        help="Where --fix stores the removed lock file (default: /tmp)",
+    )
+    parser.add_argument("--selftest", action="store_true", help="Run behaviour checks and exit")
+    args = parser.parse_args()
+
+    if args.selftest:
+        return selftest()
+
+    if sys.platform != "darwin":
+        print("macOS only", file=sys.stderr)
+        return 1
+
+    if not sys.stdout.isatty():
+        print(f"═══ pg-doctor {time.strftime('%Y-%m-%d %H:%M:%S')} ═══")
+
+    instances = discover_instances(args.name, args.datadir)
+    if not instances:
+        print("no postgresql formulae found in brew services")
+        return 0
+
+    broken = 0
+    for inst in instances:
+        diagnose(inst)
+        report(inst)
+        if inst.broken:
+            broken += 1
+            if args.fix:
+                fix_ok = fix(inst, args.backup_dir)
+                broken -= 1 if fix_ok else 0
+            elif inst.verdict in FIXABLE:
+                print(f"  → run: {sys.argv[0]} --fix --name {inst.name}")
+        print()
+
+    return 1 if broken else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
