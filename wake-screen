@@ -1,0 +1,62 @@
+#!/bin/bash
+# wake-screen — 唤醒屏幕并确认可截图（capture_ready=1）后退出
+#
+# macOS app 截屏 / GUI 自动化测试的前置步骤：屏幕熄屏时 screencapture / CGWindowList
+# 拿到的是全黑图，测试会静默失效。放在测试/验收脚本开头跑一次即可。
+# 背景与完整方案见 ~/Documents/macos-monitoring/screen-sleep-and-unlock.md
+
+set -euo pipefail
+
+SCREEN_STATE="$HOME/.local/share/screen-state/screen_state.py"
+TIMEOUT=15
+
+usage() {
+    echo "Usage: wake-screen [-w <seconds>]" >&2
+    echo "  Wake the display and wait until it is capture-ready" >&2
+    echo "  -w <seconds>  Max seconds to wait (default $TIMEOUT)" >&2
+    exit 1
+}
+
+while getopts ":w:" opt; do
+    case "$opt" in
+        w) TIMEOUT="$OPTARG" ;;
+        *) usage ;;
+    esac
+done
+
+capture_ready() {
+    /usr/bin/python3 "$SCREEN_STATE" | grep -q 'capture_ready=1i'
+}
+
+wake() {
+    caffeinate -u -t 5 &
+}
+
+if [[ ! -f "$SCREEN_STATE" ]]; then
+    # 采集器不在了就只做盲唤醒，别让整个测试流程卡死在这
+    echo "wake-screen: $SCREEN_STATE not found, waking without verification" >&2
+    caffeinate -u -t 5
+    sleep 1
+    exit 0
+fi
+
+if capture_ready; then
+    echo "wake-screen: screen already capture-ready"
+    exit 0
+fi
+
+wake
+for ((i = 1; i <= TIMEOUT; i++)); do
+    sleep 1
+    if capture_ready; then
+        echo "wake-screen: screen is capture-ready (after ${i}s)"
+        exit 0
+    fi
+    # 每 5 秒补一次唤醒，防止 caffeinate 断言过期后又熄屏
+    ((i % 5 == 0)) && wake
+done
+
+echo "wake-screen: screen still not capture-ready after ${TIMEOUT}s" >&2
+echo "wake-screen: raw state: $(/usr/bin/python3 "$SCREEN_STATE")" >&2
+echo "wake-screen: check 'pmset -g assertions' and external display connection (displays=0 needs a dummy plug)" >&2
+exit 1
