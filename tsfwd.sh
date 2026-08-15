@@ -1,5 +1,14 @@
 #!/bin/bash
 # tsfwd - forward TCP ports on the tailnet to localhost via tailscale serve
+#
+# GOTCHA: once a port is forwarded, tailscaled itself listens on
+# <tailscale-ip>:<port> (e.g. 100.x.y.z:5180). A local server that then binds
+# the wildcard address (Node's default `::`/0.0.0.0) will fail listen() with
+# EADDRINUSE on macOS — and some stacks swallow it: Express fires the listen
+# callback anyway and the process exits 0 silently right after "listening".
+# The tailscaled listener is invisible to lsof; use `netstat -anv | grep <port>`
+# (shows io.tailscale.ipn). Fix: make the local server bind 127.0.0.1 — the
+# forward targets localhost anyway, so tailnet access keeps working.
 set -euo pipefail
 
 TS=/Applications/Tailscale.app/Contents/MacOS/Tailscale
