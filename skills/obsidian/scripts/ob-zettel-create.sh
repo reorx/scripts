@@ -85,7 +85,7 @@ mkdir -p "$(dirname "$FILE_PATH")"
 printf '%s' "$CONTENT" > "$FILE_PATH"
 
 if [[ $OPEN_AFTER -eq 1 ]]; then
-    obsidian open path="$REL_PATH"
+    obsidian open path="$REL_PATH" newtab
 fi
 
 echo "Created: ${REL_PATH}"
