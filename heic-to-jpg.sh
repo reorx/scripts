@@ -10,7 +10,7 @@ set -euo pipefail
 
 # Defaults, can also be set via environment variables.
 : "${JPEG_QUALITY:=82}"
-: "${MAX_DIM:=2048}"
+: "${MAX_DIM:=1600}"
 OUTPUT_DIR=""
 
 usage() {
