@@ -4,28 +4,31 @@
 # The output image keeps the aspect ratio. The script downscales the long edge
 # to MAX_DIM pixels if the source is larger; it never upscales.
 #
-# Usage: heic-to-jpg.sh [-q quality] [-m max_dim] [-o output_dir] <file.heic> [more.heic ...]
+# Usage: heic-to-jpg.sh [-q quality] [-m max_dim] [-o output_dir] [-f] <file.heic> [more.heic ...]
 
 set -euo pipefail
 
 # Defaults, can also be set via environment variables.
-: "${JPEG_QUALITY:=82}"
-: "${MAX_DIM:=1600}"
+: "${JPEG_QUALITY:=95}"
+: "${MAX_DIM:=2048}"
 OUTPUT_DIR=""
+FORCE=""
 
 usage() {
-    echo "Usage: $(basename "$0") [-q quality] [-m max_dim] [-o output_dir] <file.heic> [more.heic ...]" >&2
+    echo "Usage: $(basename "$0") [-q quality] [-m max_dim] [-o output_dir] [-f] <file.heic> [more.heic ...]" >&2
     echo "  -q <1-100>   JPEG quality (default $JPEG_QUALITY)" >&2
     echo "  -m <pixels>  Max long-edge size, downscale only (default $MAX_DIM, 0 = keep original size)" >&2
     echo "  -o <dir>     Output directory (default: same directory as the source file)" >&2
+    echo "  -f           Force overwrite if the output file exists" >&2
     exit 1
 }
 
-while getopts ":q:m:o:h" opt; do
+while getopts ":q:m:o:fh" opt; do
     case "$opt" in
         q) JPEG_QUALITY="$OPTARG" ;;
         m) MAX_DIM="$OPTARG" ;;
         o) OUTPUT_DIR="$OPTARG" ;;
+        f) FORCE=1 ;;
         h | *) usage ;;
     esac
 done
@@ -57,8 +60,8 @@ convert_one() {
     mkdir -p "$out_dir"
     dst="$out_dir/$base_name.jpg"
 
-    if [ -e "$dst" ]; then
-        echo "Error: output already exists, skip: $dst" >&2
+    if [ -e "$dst" ] && [ -z "$FORCE" ]; then
+        echo "Error: output already exists, skip: $dst (use -f to overwrite)" >&2
         return 1
     fi
 
