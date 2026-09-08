@@ -6,10 +6,12 @@ Examples:
     python3 claude_session_search.py -d 3 -r user -r assistant "netdata"
     python3 claude_session_search.py -d 14 -r tool --project breeze "curl"
 
-List sessions of a project (newest first) with ID and the first prompt:
+List sessions of a project (newest first) with ID and the first prompt.
+Sessions whose transcript was removed by Claude Code's cleanup (cleanupPeriodDays,
+default 30) are recovered from ~/.claude/history.jsonl and marked [history only]:
     python3 claude_session_search.py -L ~/Code/tenderbuddy
     python3 claude_session_search.py -L . -d 30 --full
-    python3 claude_session_search.py -L tenderbuddy        # substring match on project dir names
+    python3 claude_session_search.py -L tenderbuddy -n 1000   # substring match on project dir names
 """
 
 import argparse
@@ -229,14 +231,25 @@ def search_file(path: Path, pattern: re.Pattern, roles: set[str], labels: list[s
 
 # ---------------------------------------------------------------------------
 # --list mode
+#
+# Two sources: transcripts under ~/.claude/projects/<encoded-path>/<session>.jsonl
+# (removed by Claude Code after `cleanupPeriodDays`, default 30) and the global
+# ~/.claude/history.jsonl, which keeps every typed prompt with its project path
+# and sessionId and is never cleaned up. Transcripts win; history fills the gaps.
+
+HISTORY_FILE = Path.home() / '.claude' / 'history.jsonl'
+HISTORY_GAP_MS = 2 * 3600 * 1000  # rows without sessionId (pre 2025-11) are split into sessions on this gap
 
 
 @dataclass
 class SessionInfo:
-    session_id: str
+    session_id: str  # '' when unknown (old history rows)
     started: str  # ISO timestamp of the first prompt ('' if none)
     first_prompt: str
     prompts: int  # number of human prompts
+    source: str  # 'transcript' | 'history'
+    updated: str = ''  # ISO timestamp of last activity
+    size: int | None = None  # transcript size in bytes
 
 
 def encode_project_path(path: str) -> str:
@@ -244,16 +257,39 @@ def encode_project_path(path: str) -> str:
     return re.sub(r'[^A-Za-z0-9-]', '-', path)
 
 
-def resolve_project_dirs(arg: str) -> list[Path]:
+def ms_to_iso(ts_ms: int | float) -> str:
+    return datetime.fromtimestamp(ts_ms / 1000, timezone.utc).isoformat()
+
+
+def load_history() -> dict[str, list[dict]]:
+    """history.jsonl rows grouped by encoded project name, in file (chronological) order."""
+    by_project: dict[str, list[dict]] = {}
+    if not HISTORY_FILE.is_file():
+        return by_project
+    with open(HISTORY_FILE, errors='replace') as fp:
+        for line in fp:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict) and row.get('project') and 'display' in row:
+                by_project.setdefault(encode_project_path(row['project']), []).append(row)
+    return by_project
+
+
+def resolve_project_keys(arg: str, history: dict[str, list[dict]]) -> list[str]:
+    """Encoded project names matching `arg` (a path, or a substring of a name)."""
+    known = {d.name for d in PROJECTS_DIR.iterdir() if d.is_dir()} if PROJECTS_DIR.is_dir() else set()
+    known |= history.keys()
     p = Path(arg).expanduser()
     if p.is_dir():
-        d = PROJECTS_DIR / encode_project_path(str(p.resolve()))
-        if d.is_dir():
-            return [d]
-        sys.exit(f'no sessions recorded for {p.resolve()} (expected {d})')
-    hits = [d for d in sorted(PROJECTS_DIR.iterdir()) if d.is_dir() and arg.lower() in d.name.lower()]
+        key = encode_project_path(str(p.resolve()))
+        if key in known:
+            return [key]
+        sys.exit(f'no sessions recorded for {p.resolve()} (neither {PROJECTS_DIR / key} nor {HISTORY_FILE})')
+    hits = sorted(k for k in known if arg.lower() in k.lower())
     if not hits:
-        sys.exit(f'no project dir matches {arg!r} under {PROJECTS_DIR}')
+        sys.exit(f'no project matches {arg!r} in {PROJECTS_DIR} or {HISTORY_FILE}')
     return hits
 
 
@@ -302,7 +338,42 @@ def session_info(path: Path) -> SessionInfo:
             if not first:
                 first = clean_prompt(text)
                 started = record.get('timestamp', '')
-    return SessionInfo(path.stem, started, first, prompts)
+    st = path.stat()
+    return SessionInfo(path.stem, started, first, prompts, 'transcript', ms_to_iso(st.st_mtime * 1000), st.st_size)
+
+
+def history_sessions(rows: list[dict]) -> list[SessionInfo]:
+    """Group history rows (chronological) into sessions."""
+    groups: dict[str, list[dict]] = {}
+    anon = 0
+    for row in rows:
+        sid = row.get('sessionId') or ''
+        if not sid:
+            prev = groups.get(f'\0{anon}')
+            if prev is None or row['timestamp'] - prev[-1]['timestamp'] > HISTORY_GAP_MS:
+                anon += 1
+            sid = f'\0{anon}'
+        groups.setdefault(sid, []).append(row)
+    infos = []
+    for sid, grp in groups.items():
+        first = next((r['display'] for r in grp if not r['display'].startswith('/')), grp[0]['display'])
+        infos.append(
+            SessionInfo(
+                '' if sid.startswith('\0') else sid,
+                ms_to_iso(grp[0]['timestamp']),
+                clean_prompt(first),
+                len(grp),
+                'history',
+                ms_to_iso(grp[-1]['timestamp']),
+            )
+        )
+    return infos
+
+
+def merge_sessions(transcripts: list[SessionInfo], history: list[SessionInfo]) -> list[SessionInfo]:
+    """Transcript info wins; history adds sessions whose transcript is gone."""
+    seen = {t.session_id for t in transcripts}
+    return transcripts + [h for h in history if h.session_id not in seen]
 
 
 def fmt_datetime(ts: str) -> str:
@@ -312,7 +383,7 @@ def fmt_datetime(ts: str) -> str:
         return '?'
 
 
-def human_size(n: int) -> str:
+def human_size(n: float) -> str:
     for unit in ('B', 'K', 'M', 'G'):
         if n < 1024 or unit == 'G':
             return f'{n:.0f}{unit}' if unit == 'B' else f'{n:.1f}{unit}'
@@ -323,28 +394,40 @@ def human_size(n: int) -> str:
 PROMPT_LINE_LEN = 240
 
 
+def print_session(info: SessionInfo, full: bool):
+    sid = info.session_id or '(unknown session id)'
+    meta = f'{info.prompts} prompts, updated {fmt_datetime(info.updated)}'
+    if info.size is not None:
+        meta = f'{info.prompts} prompts, {human_size(info.size)}, updated {fmt_datetime(info.updated)}'
+    tag = '' if info.source == 'transcript' else f' {C_DIM}[history only]{C_RESET}'
+    print(f'\n{C_BLUE}{fmt_datetime(info.started)}{C_RESET}  {C_BOLD}{sid}{C_RESET}  {C_GRAY}{meta}{C_RESET}{tag}')
+    prompt = info.first_prompt or f'{C_DIM}(no prompt){C_RESET}'
+    if full:
+        print('\n'.join('    ' + ln for ln in prompt.splitlines()))
+    else:
+        one = prompt.replace('\n', '⏎')
+        if len(one) > PROMPT_LINE_LEN:
+            one = one[:PROMPT_LINE_LEN] + '…'
+        print(f'    {one}')
+
+
 def list_sessions(args):
-    cutoff = time.time() - args.days * 86400 if args.days else 0
+    cutoff_iso = ms_to_iso((time.time() - args.days * 86400) * 1000) if args.days else ''
+    history = load_history()
     shown = 0
-    for proj_dir in resolve_project_dirs(args.list):
-        files = [f for f in proj_dir.glob('*.jsonl') if f.stat().st_mtime >= cutoff]
-        infos = [(session_info(f), f) for f in files]
-        infos.sort(key=lambda t: t[0].started or '', reverse=True)
-        print(f'{C_BOLD}{proj_dir.name}{C_RESET} {C_DIM}({len(infos)} sessions){C_RESET}')
-        for info, f in infos:
+    for key in resolve_project_keys(args.list, history):
+        proj_dir = PROJECTS_DIR / key
+        transcripts = [session_info(f) for f in proj_dir.glob('*.jsonl')] if proj_dir.is_dir() else []
+        infos = merge_sessions(transcripts, history_sessions(history.get(key, [])))
+        infos = [i for i in infos if i.updated >= cutoff_iso]
+        infos.sort(key=lambda i: i.started, reverse=True)
+        n_hist = sum(1 for i in infos if i.source == 'history')
+        print(f'{C_BOLD}{key}{C_RESET} {C_DIM}({len(infos)} sessions, {len(infos) - n_hist} with transcript){C_RESET}')
+        for info in infos:
             if shown >= args.limit:
+                print(f'\n{C_DIM}… limit of {args.limit} sessions reached, use -n to show more{C_RESET}')
                 break
-            st = f.stat()
-            meta = f'{info.prompts} prompts, {human_size(st.st_size)}, updated {datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")}'
-            print(f'\n{C_BLUE}{fmt_datetime(info.started)}{C_RESET}  {C_BOLD}{info.session_id}{C_RESET}  {C_GRAY}{meta}{C_RESET}')
-            prompt = info.first_prompt or f'{C_DIM}(no prompt){C_RESET}'
-            if args.full:
-                print('\n'.join('    ' + ln for ln in prompt.splitlines()))
-            else:
-                one = prompt.replace('\n', '⏎')
-                if len(one) > PROMPT_LINE_LEN:
-                    one = one[:PROMPT_LINE_LEN] + '…'
-                print(f'    {one}')
+            print_session(info, args.full)
             shown += 1
         print()
 
