@@ -5,6 +5,11 @@ Examples:
     python3 claude_session_search.py grafana
     python3 claude_session_search.py -d 3 -r user -r assistant "netdata"
     python3 claude_session_search.py -d 14 -r tool --project breeze "curl"
+
+List sessions of a project (newest first) with ID and the first prompt:
+    python3 claude_session_search.py -L ~/Code/tenderbuddy
+    python3 claude_session_search.py -L . -d 30 --full
+    python3 claude_session_search.py -L tenderbuddy        # substring match on project dir names
 """
 
 import argparse
@@ -40,8 +45,22 @@ class Match:
 
 def parse_args():
     p = argparse.ArgumentParser(description='Search recent Claude Code sessions')
-    p.add_argument('query', help="text or regex to search for, e.g. 'envops (show|copy|set|list-keys)'")
-    p.add_argument('-d', '--days', type=float, default=7, help='only sessions modified within N days (default: 7)')
+    p.add_argument('query', nargs='?', help="text or regex to search for, e.g. 'envops (show|copy|set|list-keys)'")
+    p.add_argument(
+        '-L',
+        '--list',
+        nargs='?',
+        const='.',
+        metavar='PATH',
+        help='list sessions of the project at PATH (default: cwd) newest first, with session ID and first prompt; '
+        'PATH may also be a substring of a project dir name',
+    )
+    p.add_argument(
+        '-d',
+        '--days',
+        type=float,
+        help='only sessions modified within N days (default: 7 for search, unlimited for --list)',
+    )
     p.add_argument(
         '-r', '--role', action='append', choices=ROLES, dest='roles', help='roles to search (repeatable); default: all'
     )
@@ -55,12 +74,16 @@ def parse_args():
     )
     p.add_argument('--case-sensitive', action='store_true', help='case-sensitive matching (default: insensitive)')
     p.add_argument('-C', '--context', type=int, default=80, help='chars of context around each match (default: 80)')
-    p.add_argument('-n', '--limit', type=int, default=200, help='max matches to show (default: 200)')
-    return p.parse_args()
+    p.add_argument('-n', '--limit', type=int, default=200, help='max matches/sessions to show (default: 200)')
+    p.add_argument('--full', action='store_true', help='--list: print the whole first prompt instead of one line')
+    args = p.parse_args()
+    if args.list is None and args.query is None:
+        p.error('query is required unless --list is given')
+    return args
 
 
-def iter_session_files(days: float, project_filter: str | None):
-    cutoff = time.time() - days * 86400
+def iter_session_files(days: float | None, project_filter: str | None):
+    cutoff = time.time() - days * 86400 if days else 0
     if not PROJECTS_DIR.is_dir():
         sys.exit(f'projects dir not found: {PROJECTS_DIR}')
     for proj in sorted(PROJECTS_DIR.iterdir()):
@@ -204,8 +227,135 @@ def search_file(path: Path, pattern: re.Pattern, roles: set[str], labels: list[s
     return matches
 
 
+# ---------------------------------------------------------------------------
+# --list mode
+
+
+@dataclass
+class SessionInfo:
+    session_id: str
+    started: str  # ISO timestamp of the first prompt ('' if none)
+    first_prompt: str
+    prompts: int  # number of human prompts
+
+
+def encode_project_path(path: str) -> str:
+    """Map an absolute project path to its dir name under ~/.claude/projects."""
+    return re.sub(r'[^A-Za-z0-9-]', '-', path)
+
+
+def resolve_project_dirs(arg: str) -> list[Path]:
+    p = Path(arg).expanduser()
+    if p.is_dir():
+        d = PROJECTS_DIR / encode_project_path(str(p.resolve()))
+        if d.is_dir():
+            return [d]
+        sys.exit(f'no sessions recorded for {p.resolve()} (expected {d})')
+    hits = [d for d in sorted(PROJECTS_DIR.iterdir()) if d.is_dir() and arg.lower() in d.name.lower()]
+    if not hits:
+        sys.exit(f'no project dir matches {arg!r} under {PROJECTS_DIR}')
+    return hits
+
+
+_TAG_BLOCKS = re.compile(r'<(system-reminder|command-message|ide_opened_file|ide_selection)>.*?</\1>\s*', re.S)
+_COMMAND = re.compile(r'<command-name>(.*?)</command-name>\s*(?:<command-args>(.*?)</command-args>)?', re.S)
+
+
+def clean_prompt(text: str) -> str:
+    """Strip harness-injected wrappers so the user's own words remain."""
+    text = _TAG_BLOCKS.sub('', text)
+    text = _COMMAND.sub(lambda m: f'{m.group(1).strip()} {(m.group(2) or "").strip()}'.strip(), text)
+    return text.strip()
+
+
+def human_prompt_text(record: dict) -> str | None:
+    """Return the text of a user record if it is a prompt typed by the human, else None."""
+    if record.get('type') != 'user' or record.get('isSidechain'):
+        return None
+    content = record.get('message', {}).get('content')
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        parts = [b.get('text', '') for b in content if isinstance(b, dict) and b.get('type') == 'text']
+        if not parts:
+            return None  # tool_result-only record
+        text = '\n'.join(parts)
+    else:
+        return None
+    if text.startswith('[Image: source:'):
+        return None  # image attachment carrier that follows an image prompt
+    return text
+
+
+def session_info(path: Path) -> SessionInfo:
+    first, started, prompts = '', '', 0
+    with open(path, errors='replace') as fp:
+        for line in fp:
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            text = human_prompt_text(record)
+            if text is None:
+                continue
+            prompts += 1
+            if not first:
+                first = clean_prompt(text)
+                started = record.get('timestamp', '')
+    return SessionInfo(path.stem, started, first, prompts)
+
+
+def fmt_datetime(ts: str) -> str:
+    try:
+        return datetime.fromisoformat(ts.replace('Z', '+00:00')).astimezone().strftime('%Y-%m-%d %H:%M')
+    except (ValueError, AttributeError):
+        return '?'
+
+
+def human_size(n: int) -> str:
+    for unit in ('B', 'K', 'M', 'G'):
+        if n < 1024 or unit == 'G':
+            return f'{n:.0f}{unit}' if unit == 'B' else f'{n:.1f}{unit}'
+        n /= 1024
+    return f'{n:.1f}G'
+
+
+PROMPT_LINE_LEN = 240
+
+
+def list_sessions(args):
+    cutoff = time.time() - args.days * 86400 if args.days else 0
+    shown = 0
+    for proj_dir in resolve_project_dirs(args.list):
+        files = [f for f in proj_dir.glob('*.jsonl') if f.stat().st_mtime >= cutoff]
+        infos = [(session_info(f), f) for f in files]
+        infos.sort(key=lambda t: t[0].started or '', reverse=True)
+        print(f'{C_BOLD}{proj_dir.name}{C_RESET} {C_DIM}({len(infos)} sessions){C_RESET}')
+        for info, f in infos:
+            if shown >= args.limit:
+                break
+            st = f.stat()
+            meta = f'{info.prompts} prompts, {human_size(st.st_size)}, updated {datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")}'
+            print(f'\n{C_BLUE}{fmt_datetime(info.started)}{C_RESET}  {C_BOLD}{info.session_id}{C_RESET}  {C_GRAY}{meta}{C_RESET}')
+            prompt = info.first_prompt or f'{C_DIM}(no prompt){C_RESET}'
+            if args.full:
+                print('\n'.join('    ' + ln for ln in prompt.splitlines()))
+            else:
+                one = prompt.replace('\n', '⏎')
+                if len(one) > PROMPT_LINE_LEN:
+                    one = one[:PROMPT_LINE_LEN] + '…'
+                print(f'    {one}')
+            shown += 1
+        print()
+
+
 def main():
     args = parse_args()
+    if args.list is not None:
+        list_sessions(args)
+        return
+    if args.days is None:
+        args.days = 7
     roles = set(args.roles or ROLES)
     flags = 0 if args.case_sensitive else re.IGNORECASE
     try:
