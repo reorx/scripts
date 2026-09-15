@@ -1,23 +1,5 @@
 #!/usr/bin/env python3
-"""Search text in recent Claude Code sessions.
-
-Examples:
-    python3 claude_session_search.py grafana
-    python3 claude_session_search.py -d 3 -r user -r assistant "netdata"
-    python3 claude_session_search.py -d 14 -r tool --project breeze "curl"
-
-List sessions of a project (newest first) with ID and the first prompt.
-Sessions whose transcript was removed by Claude Code's cleanup (cleanupPeriodDays,
-default 30) are recovered from ~/.claude/history.jsonl and marked [history only]:
-    python3 claude_session_search.py -L ~/Code/tenderbuddy
-    python3 claude_session_search.py -L . -d 30 --full
-    python3 claude_session_search.py -L tenderbuddy -n 1000   # substring match on project dir names
-
-Show one session (by ID or ID prefix) with its whole first prompt, also recovered from
-~/.claude/history.jsonl when the transcript is gone:
-    python3 claude_session_search.py -s 6713db6f-1959-41e0-aa93-7540895709b0
-    python3 claude_session_search.py -s 6713db6f
-"""
+"""Search, list and inspect Claude Code sessions. The manual is MANUAL below, printed by --help."""
 
 import argparse
 import glob
@@ -30,6 +12,398 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+MANUAL = r"""NAME
+       claude_session_search.py - search, list and inspect Claude Code sessions
+
+SYNOPSIS
+       claude_session_search.py [-d DAYS] [-p SUBSTRING] [-r ROLE]...
+                                [-l SUBSTRING]... [--case-sensitive]
+                                [-C CHARS] [-n LIMIT] QUERY
+       claude_session_search.py -L [PATH] [-d DAYS] [-n LIMIT] [--full]
+       claude_session_search.py -s ID [-n LIMIT]
+       claude_session_search.py -h | --help
+
+DESCRIPTION
+       claude_session_search.py reads the session data Claude Code keeps under
+       ~/.claude and works in one of three modes:
+
+       search mode (default)
+              Find QUERY in the messages of recently active sessions and
+              print every match with its time, role and surrounding text.
+
+       list mode (-L)
+              List the sessions of a project, newest first, each with its
+              session ID, a few stats and its first prompt.
+
+       session mode (-s)
+              Show the session with a given ID or ID prefix, together with
+              its project and its complete first prompt.
+
+       Claude Code deletes transcripts whose last activity is older than its
+       cleanupPeriodDays setting (default 30 days), but never cleans up
+       ~/.claude/history.jsonl, its log of every prompt you typed. Search
+       mode reads transcripts only. List and session modes read the history
+       too, so sessions whose transcript is gone still show up there, marked
+       [history only].
+
+       Options that do not apply to the selected mode are ignored.
+
+OPTIONS
+   Search mode
+       QUERY
+              A Python regular expression, matched against the text of each
+              message piece (see --role). A QUERY that is not a valid regular
+              expression is matched as literal text, so '[Image #1' needs no
+              escaping. Quote QUERY to protect it from the shell.
+
+       -d, --days DAYS
+              Only scan transcripts modified within the last DAYS days.
+              Fractions are allowed (0.25 is 6 hours); 0 scans every
+              transcript on disk. Default: 7.
+
+       -p, --project SUBSTRING
+              Only scan projects whose directory name contains SUBSTRING,
+              ignoring case. The directory name is the project path with
+              every character other than a letter, digit or "-" replaced by
+              "-": sessions started in /Users/me/Code/campus_watch are stored
+              in ~/.claude/projects/-Users-me-Code-campus-watch, so write
+              campus-watch, not campus_watch.
+
+       -r, --role ROLE
+              Only search message pieces of ROLE, which is one of:
+
+                  user       text of user messages: your prompts, and what
+                             Claude Code adds on your behalf, such as
+                             system reminders and command output
+                  assistant  Claude's replies and thinking
+                  tool       tool calls (their input) and tool results
+
+              Repeat the option to search several roles. Default: all three.
+
+       -l, --label SUBSTRING
+              Only keep matches whose label contains SUBSTRING, ignoring case.
+              Repeat the option to accept several labels. The label follows
+              the role in the output, as in [tool/tool_use:Bash]:
+
+                  thinking         Claude's thinking, if its text was saved
+                  tool_use:NAME    the input of a call to the tool NAME, e.g.
+                                   tool_use:Bash, tool_use:Edit, tool_use:Read
+                  tool_result      the output a tool returned
+
+              Prompts and replies have no label, so any -l leaves them out.
+              -l tool_use accepts calls to all tools; -l tool accepts tool
+              results as well.
+
+       --case-sensitive
+              Match QUERY case-sensitively. Default: ignore case.
+
+       -C, --context CHARS
+              Show CHARS characters on each side of a match. Default: 80.
+
+       -n, --limit LIMIT
+              Stop after printing LIMIT matches. Default: 200.
+
+   List mode
+       -L, --list [PATH]
+              List the sessions of a project instead of searching. Without
+              PATH, the project is the current directory. If a directory
+              exists at PATH (relative paths and ~ are resolved), it must be
+              the directory the sessions were started in. Otherwise PATH is a
+              substring of project directory names, matched as described
+              under --project; it can select several projects, such as a
+              repository and its worktrees, which are listed one after the
+              other.
+
+       -d, --days DAYS
+              Only list sessions whose last activity lies within the last DAYS
+              days. Default: no limit.
+
+       -n, --limit LIMIT
+              Stop after LIMIT sessions, counted across all listed projects.
+              Default: 200.
+
+       --full
+              Print first prompts in full, keeping their line breaks. By
+              default a first prompt is joined into one line, with ⏎ marking
+              the line breaks, and cut after 240 characters.
+
+   Session mode
+       -s, --session ID
+              Show the session whose ID is ID or starts with ID; the first 8
+              characters are practically always enough. Transcript file names
+              in all projects and the session IDs recorded in the history are
+              looked up. When several sessions match, all of them are shown,
+              newest first. The first prompt is always printed in full.
+
+       -n, --limit LIMIT
+              Show at most LIMIT sessions. Default: 200.
+
+   General
+       -h, --help
+              Print this manual and exit.
+
+OUTPUT
+       All modes print ANSI colors, even when the output is not a terminal
+       (see NOTES). Times are in the local time zone.
+
+   Search mode
+       Transcripts are scanned newest first. Each transcript with matches
+       gets a header naming the project directory, the transcript file (the
+       session ID plus .jsonl), when it was last modified and how many
+       matches it has. Its matches follow in conversation order:
+
+           PROJECT-DIR SESSION-ID.jsonl  (updated TIME, N matches)
+
+           MM-DD HH:MM [ROLE/LABEL] …text before MATCH text after…
+
+       The first match in a message piece is shown with CHARS characters of
+       context (-C) on each side; "…" marks cut text and "⏎" a line break.
+       A tool call is shown on several lines instead: its description as
+       "# ..." and its shell command as "$ ...", both in full and with every
+       match highlighted, then its other input fields as "field: value",
+       cut around the match when longer than 300 characters. Commands with
+       a line longer than 80 characters are reformatted by shfmt -i 2 if
+       shfmt(1) is installed.
+
+       A summary comes last:
+
+           N matches in M sessions scanned (showing first LIMIT)
+
+       M is the number of transcripts within DAYS. Scanning stops once LIMIT
+       matches have been printed, so N then only counts the matches found
+       up to that point.
+
+   List mode
+       Each project gets a header with the number of sessions listed and how
+       many of them still have a transcript, followed by two lines per
+       session:
+
+           PROJECT-DIR (N sessions, M with transcript)
+
+           STARTED  SESSION-ID  N prompts, SIZE, updated TIME [history only]
+               FIRST PROMPT
+
+       STARTED
+              Time of the first prompt.
+
+       SESSION-ID
+              The session's UUID, as accepted by -s and claude --resume.
+              Prompts from before the history recorded session IDs (about
+              2025-11) are grouped into sessions wherever two prompts are
+              more than two hours apart, and shown as (unknown session id).
+
+       N prompts
+              Number of prompts you sent (see FIRST PROMPT).
+
+       SIZE
+              Size of the transcript; absent for history-only sessions.
+
+       updated TIME
+              Last activity: the modification time of the transcript, or the
+              time of the last prompt for history-only sessions.
+
+       [history only]
+              The transcript has been deleted; the session was recovered
+              from ~/.claude/history.jsonl.
+
+       FIRST PROMPT
+              On one line, or in full with --full.
+
+   Session mode
+       Like list mode, except that each session is preceded by its project
+       directory and the first prompt is always printed in full. When no
+       session matches, the reason is printed to standard error and the exit
+       status is 1.
+
+FIRST PROMPT
+       The first prompt of a session is the first message you typed in it.
+       How it is found depends on where the session comes from.
+
+       From a transcript
+              The first user message that is none of: a message of a
+              subagent (sidechain), a tool result, the attachment record that
+              follows an image, or text injected by Claude Code (isMeta), such
+              as the <local-command-caveat> written before a slash command.
+              Wrappers like <system-reminder>, <command-message>,
+              <ide_opened_file> and <ide_selection> are removed, and a slash
+              command is shown as "/name args". Slash commands count as
+              prompts, so a session started by /clear shows /clear. The
+              prompt count follows the same rules.
+
+       From the history
+              The first prompt that does not start with "/", or the very
+              first one if all of them do; the prompt count is the number of
+              prompts recorded. The history keeps pasted text apart from the
+              prompt, which only holds a placeholder such as
+              [Pasted text #1 +12 lines]. Placeholders are replaced by the
+              pasted text, stored in the history itself or, for newer
+              prompts, in ~/.claude/paste-cache. Placeholders whose text has
+              been cleaned up stay as they are. Images are never stored.
+
+EXIT STATUS
+       0
+              Success, including a search that finds nothing.
+
+       1
+              ~/.claude/projects does not exist (search mode), no project
+              matches PATH (-L), or no session matches ID (-s). The reason is
+              printed to standard error.
+
+       2
+              Invalid command line.
+
+FILES
+       ~/.claude/projects/PROJECT-DIR/SESSION-ID.jsonl
+              Transcript of a session, stored under the directory of the
+              project it was started in. Read by all modes. Transcripts of
+              subagents, in PROJECT-DIR/SESSION-ID/subagents/, are not read.
+
+       ~/.claude/history.jsonl
+              Every prompt typed into Claude Code, with its project path,
+              time, pasted text and, since about 2025-11, session ID. Read by
+              list and session modes.
+
+       ~/.claude/paste-cache/HASH.txt
+              Pasted text of newer prompts in the history. Old entries are
+              removed, like transcripts. Read by list and session modes.
+
+HISTORY
+       2026-07-19
+              Search mode: role, label, project and time filters, context
+              size, regular expressions that fall back to literal text, and
+              tool calls shown as description plus full command, reformatted
+              with shfmt.
+
+       2026-09-08
+              List mode (-L): the sessions of a project with ID, stats and
+              first prompt. Sessions whose transcript has been deleted are
+              recovered from ~/.claude/history.jsonl. QUERY became optional
+              and the default of --days depends on the mode.
+
+       2026-09-15
+              Session mode (-s): look up a session by ID or ID prefix. Pasted
+              text in prompts from the history is expanded, and text injected
+              by Claude Code is no longer taken for the first prompt. -h and
+              --help print this manual.
+
+NOTES
+       Color codes are printed even when the output goes to a pipe or a
+       file. Page long output with less -R, or strip the codes with sed:
+
+           claude_session_search.py -L | less -R
+           claude_session_search.py -s 2149bb6d | sed 's/\x1b\[[0-9;]*m//g'
+
+       Only the Python standard library (3.10 or later) is needed; shfmt is
+       optional.
+
+BUGS
+       Search mode reads neither the history nor subagent transcripts, so it
+       cannot find text in sessions whose transcript has been deleted, or
+       text that only appears inside a subagent's own conversation.
+
+       Claude Code saves most thinking blocks without their text, so
+       -l thinking finds only the few that kept it.
+
+       A session that never received a prompt leaves neither a transcript
+       nor a history entry, so -s cannot find it, even when a tool such as
+       herdr reports its ID.
+
+       CLAUDE_CONFIG_DIR is ignored; data is always read from ~/.claude.
+
+EXAMPLES
+   Search
+       claude_session_search.py grafana
+              Find "grafana" in any message of the sessions active in the
+              last 7 days.
+
+       claude_session_search.py 'envops (show|copy|set|list-keys)'
+              QUERY is a regular expression; quote it for the shell.
+
+       claude_session_search.py '[Pasted text'
+              Not a valid regular expression, so it is searched literally.
+
+       claude_session_search.py --case-sensitive -d 30 TODO
+              Match case-sensitively, in the last 30 days.
+
+       claude_session_search.py -d 3 -r user -r assistant worktree
+              Only prompts and Claude's replies of the last 3 days, not tool
+              calls or tool output.
+
+       claude_session_search.py -r user -d 0 -n 50 resume
+              Only the user side of all transcripts on disk; stop after 50
+              matches.
+
+       claude_session_search.py -l tool_use:Bash 'docker compose'
+              Only shell commands Claude ran; each match shows the command's
+              description and the whole command.
+
+       claude_session_search.py -l tool_use:Edit -l tool_use:Write parse_args
+              Only file edits and file writes that contain "parse_args".
+
+       claude_session_search.py -l tool_result -C 200 Traceback
+              Only tool output, with 200 characters of context.
+
+       claude_session_search.py -l thinking -d 30 'the user'
+              Only Claude's thinking, over 30 days, since few thinking blocks
+              keep their text (see BUGS).
+
+       claude_session_search.py -p tenderbuddy -d 14 curl
+              Only projects whose directory name contains "tenderbuddy", its
+              worktrees included, in the last 14 days.
+
+       claude_session_search.py -d 0.25 migration
+              Only transcripts modified in the last 6 hours.
+
+   List
+       claude_session_search.py -L
+              The sessions of the project in the current directory.
+
+       claude_session_search.py -L ~/Code/tenderbuddy
+              The sessions started in ~/Code/tenderbuddy.
+
+       claude_session_search.py -L vibe-reader-hn
+              Every project whose directory name contains "vibe-reader-hn":
+              the repository, its worktrees and vibe-reader-hn-chrome, one
+              block each.
+
+       claude_session_search.py -L campus-watch
+              The substring form for ~/Code/campus_watch, which also matches
+              ~/Code/anyun-campus-watch; -L campus_watch finds nothing,
+              because "_" is stored as "-".
+
+       claude_session_search.py -L . -d 30 --full
+              Sessions active in the last 30 days, with complete first
+              prompts.
+
+       claude_session_search.py -L tenderbuddy -n 1000
+              Raise the limit of 200 sessions to reach older ones.
+
+   Session
+       claude_session_search.py -s aac00ccd-6495-4264-98de-13e9a1fa7c2b
+              Show a session by its full ID.
+
+       claude_session_search.py -s 2149bb6d
+              Show a session by an ID prefix. Its transcript is gone, so it
+              is recovered from the history, pasted text included.
+
+   Workflows
+       Find where something was done, check what that session was about,
+       then resume it from its project directory with the full ID that -s
+       prints:
+
+           claude_session_search.py -d 30 -l tool_use:Bash 'rsync -a'
+           claude_session_search.py -s 7bb051d3
+           cd ~/Code/campus_watch && claude --resume SESSION-ID
+
+       Recall what you asked in the current project during the last week:
+
+           claude_session_search.py -L -d 7 --full | less -R
+
+SEE ALSO
+       claude --help, for claude --resume and claude --continue; the Claude
+       Code settings documentation, for cleanupPeriodDays; shfmt(1), less(1).
+"""
 
 PROJECTS_DIR = Path.home() / '.claude' / 'projects'
 ROLES = ('user', 'assistant', 'tool')
@@ -51,46 +425,51 @@ class Match:
     detail: str  # e.g. tool name
 
 
-def parse_args():
-    p = argparse.ArgumentParser(description='Search recent Claude Code sessions')
-    p.add_argument('query', nargs='?', help="text or regex to search for, e.g. 'envops (show|copy|set|list-keys)'")
+_MAN_HEADING = re.compile(r'^((?:   )?)(\S.*)$', re.M)  # section (column 0) or subsection (column 3) heading
+_MAN_TAG = re.compile(r'^( {7})(\S.*)$(?=\n {14}\S)', re.M)  # tag of a paragraph indented below it
+
+
+def print_manual():
+    """Print MANUAL; on a terminal, headings and paragraph tags are bold as in man(1)."""
+    text = MANUAL
+    if sys.stdout.isatty():
+        for pattern in (_MAN_HEADING, _MAN_TAG):
+            text = pattern.sub(rf'\1{C_BOLD}\2{C_RESET}', text)
+    print(text, end='')
+
+
+class ManualAction(argparse.Action):
+    """-h/--help: print the manual and exit at once, like argparse's own help action."""
+
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, default=argparse.SUPPRESS, **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print_manual()
+        parser.exit()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    # options are documented in MANUAL, keep the two in sync
+    p = argparse.ArgumentParser(usage='%(prog)s QUERY | -L [PATH] | -s ID  [options]  (see --help)', add_help=False)
+    p.add_argument('-h', '--help', action=ManualAction)
+    p.add_argument('query', nargs='?')
     mode = p.add_mutually_exclusive_group()
-    mode.add_argument(
-        '-L',
-        '--list',
-        nargs='?',
-        const='.',
-        metavar='PATH',
-        help='list sessions of the project at PATH (default: cwd) newest first, with session ID and first prompt; '
-        'PATH may also be a substring of a project dir name',
-    )
-    mode.add_argument(
-        '-s',
-        '--session',
-        metavar='ID',
-        help='show the session with this ID (or ID prefix): project, stats and its whole first prompt',
-    )
-    p.add_argument(
-        '-d',
-        '--days',
-        type=float,
-        help='only sessions modified within N days (default: 7 for search, unlimited for --list)',
-    )
-    p.add_argument(
-        '-r', '--role', action='append', choices=ROLES, dest='roles', help='roles to search (repeatable); default: all'
-    )
-    p.add_argument('-p', '--project', help='only projects whose dir name contains this substring')
-    p.add_argument(
-        '-l',
-        '--label',
-        action='append',
-        dest='labels',
-        help="only matches whose label contains this substring, e.g. 'tool_use:Bash', 'tool_result', 'thinking' (repeatable)",
-    )
-    p.add_argument('--case-sensitive', action='store_true', help='case-sensitive matching (default: insensitive)')
-    p.add_argument('-C', '--context', type=int, default=80, help='chars of context around each match (default: 80)')
-    p.add_argument('-n', '--limit', type=int, default=200, help='max matches/sessions to show (default: 200)')
-    p.add_argument('--full', action='store_true', help='--list: print the whole first prompt instead of one line')
+    mode.add_argument('-L', '--list', nargs='?', const='.', metavar='PATH')
+    mode.add_argument('-s', '--session', metavar='ID')
+    p.add_argument('-d', '--days', type=float)
+    p.add_argument('-r', '--role', action='append', choices=ROLES, dest='roles')
+    p.add_argument('-p', '--project')
+    p.add_argument('-l', '--label', action='append', dest='labels')
+    p.add_argument('--case-sensitive', action='store_true')
+    p.add_argument('-C', '--context', type=int, default=80)
+    p.add_argument('-n', '--limit', type=int, default=200)
+    p.add_argument('--full', action='store_true')
+    return p
+
+
+def parse_args():
+    p = build_parser()
     args = p.parse_args()
     if args.list is None and args.session is None and args.query is None:
         p.error('query is required unless --list or --session is given')
