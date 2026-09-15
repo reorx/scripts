@@ -12,9 +12,15 @@ default 30) are recovered from ~/.claude/history.jsonl and marked [history only]
     python3 claude_session_search.py -L ~/Code/tenderbuddy
     python3 claude_session_search.py -L . -d 30 --full
     python3 claude_session_search.py -L tenderbuddy -n 1000   # substring match on project dir names
+
+Show one session (by ID or ID prefix) with its whole first prompt, also recovered from
+~/.claude/history.jsonl when the transcript is gone:
+    python3 claude_session_search.py -s 6713db6f-1959-41e0-aa93-7540895709b0
+    python3 claude_session_search.py -s 6713db6f
 """
 
 import argparse
+import glob
 import json
 import re
 import shutil
@@ -48,7 +54,8 @@ class Match:
 def parse_args():
     p = argparse.ArgumentParser(description='Search recent Claude Code sessions')
     p.add_argument('query', nargs='?', help="text or regex to search for, e.g. 'envops (show|copy|set|list-keys)'")
-    p.add_argument(
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument(
         '-L',
         '--list',
         nargs='?',
@@ -56,6 +63,12 @@ def parse_args():
         metavar='PATH',
         help='list sessions of the project at PATH (default: cwd) newest first, with session ID and first prompt; '
         'PATH may also be a substring of a project dir name',
+    )
+    mode.add_argument(
+        '-s',
+        '--session',
+        metavar='ID',
+        help='show the session with this ID (or ID prefix): project, stats and its whole first prompt',
     )
     p.add_argument(
         '-d',
@@ -79,8 +92,8 @@ def parse_args():
     p.add_argument('-n', '--limit', type=int, default=200, help='max matches/sessions to show (default: 200)')
     p.add_argument('--full', action='store_true', help='--list: print the whole first prompt instead of one line')
     args = p.parse_args()
-    if args.list is None and args.query is None:
-        p.error('query is required unless --list is given')
+    if args.list is None and args.session is None and args.query is None:
+        p.error('query is required unless --list or --session is given')
     return args
 
 
@@ -239,6 +252,7 @@ def search_file(path: Path, pattern: re.Pattern, roles: set[str], labels: list[s
 
 HISTORY_FILE = Path.home() / '.claude' / 'history.jsonl'
 HISTORY_GAP_MS = 2 * 3600 * 1000  # rows without sessionId (pre 2025-11) are split into sessions on this gap
+PASTE_CACHE_DIR = Path.home() / '.claude' / 'paste-cache'  # pasted text of newer history rows, by contentHash
 
 
 @dataclass
@@ -304,10 +318,30 @@ def clean_prompt(text: str) -> str:
     return text.strip()
 
 
+_PASTE_REF = re.compile(r'\[Pasted text #(\d+)(?: \+\d+ lines)?\]')
+
+
+def expand_pasted(display: str, pasted: dict) -> str:
+    """Put pasted text back into a history row's `display`, which only keeps `[Pasted text #N +M lines]`.
+
+    The text is inline in pastedContents, or (newer rows) in paste-cache/<contentHash>.txt, which
+    Claude Code cleans up as well; placeholders that can't be resolved are kept as is.
+    """
+
+    def repl(m: re.Match) -> str:
+        item = pasted.get(m.group(1)) or {}
+        if 'content' in item:
+            return item['content']
+        cached = PASTE_CACHE_DIR / f'{item.get("contentHash")}.txt'
+        return cached.read_text(errors='replace') if item.get('contentHash') and cached.is_file() else m.group(0)
+
+    return _PASTE_REF.sub(repl, display)
+
+
 def human_prompt_text(record: dict) -> str | None:
     """Return the text of a user record if it is a prompt typed by the human, else None."""
-    if record.get('type') != 'user' or record.get('isSidechain'):
-        return None
+    if record.get('type') != 'user' or record.get('isSidechain') or record.get('isMeta'):
+        return None  # isMeta: harness-injected, e.g. the <local-command-caveat> before a /command
     content = record.get('message', {}).get('content')
     if isinstance(content, str):
         text = content
@@ -356,12 +390,12 @@ def history_sessions(rows: list[dict]) -> list[SessionInfo]:
         groups.setdefault(sid, []).append(row)
     infos = []
     for sid, grp in groups.items():
-        first = next((r['display'] for r in grp if not r['display'].startswith('/')), grp[0]['display'])
+        first = next((r for r in grp if not r['display'].startswith('/')), grp[0])
         infos.append(
             SessionInfo(
                 '' if sid.startswith('\0') else sid,
                 ms_to_iso(grp[0]['timestamp']),
-                clean_prompt(first),
+                clean_prompt(expand_pasted(first['display'], first.get('pastedContents') or {})),
                 len(grp),
                 'history',
                 ms_to_iso(grp[-1]['timestamp']),
@@ -432,10 +466,42 @@ def list_sessions(args):
         print()
 
 
+# ---------------------------------------------------------------------------
+# --session mode: same two sources as --list, looked up by session ID
+
+
+def find_sessions(prefix: str) -> list[tuple[str, SessionInfo]]:
+    """Sessions whose ID starts with `prefix`, as (project key, info); a transcript wins over history rows."""
+    found = []
+    if PROJECTS_DIR.is_dir():
+        found = [(f.parent.name, session_info(f)) for f in PROJECTS_DIR.glob(f'*/{glob.escape(prefix)}*.jsonl')]
+    seen = {info.session_id for _, info in found}
+    for key, rows in load_history().items():
+        rows = [r for r in rows if (r.get('sessionId') or '').startswith(prefix)]
+        found += [(key, info) for info in history_sessions(rows) if info.session_id not in seen]
+    return sorted(found, key=lambda t: t[1].started, reverse=True)
+
+
+def show_sessions(args):
+    found = find_sessions(args.session)
+    if not found:
+        sys.exit(
+            f'no session matches {args.session!r} in {PROJECTS_DIR} or {HISTORY_FILE} '
+            '(a session that never received a prompt leaves no record)'
+        )
+    for key, info in found[: args.limit]:
+        print(f'{C_BOLD}{key}{C_RESET}')
+        print_session(info, full=True)
+        print()
+
+
 def main():
     args = parse_args()
     if args.list is not None:
         list_sessions(args)
+        return
+    if args.session is not None:
+        show_sessions(args)
         return
     if args.days is None:
         args.days = 7
