@@ -14,7 +14,7 @@ usage() {
         echo "Usage: $0 <filename>"
         echo "Formats files based on their extension:"
         echo "  .py       - formatted with ruff"
-        echo "  .ts/.tsx/.js - formatted with biome"
+        echo "  .ts/.tsx/.js - formatted with the repo's prettier if it uses one, otherwise biome"
     fi
     exit 1
 }
@@ -89,6 +89,90 @@ else
     BIOME_EXTRA="--write"
 fi
 
+PRETTIER_CONFIG_PATTERN='^(\.prettierrc(\.(json|json5|yaml|yml|toml|js|cjs|mjs|ts|cts|mts))?|prettier\.config\.(js|cjs|mjs|ts|cts|mts))$'
+
+# Print each directory from $1 up to $2 (inclusive)
+walk_up() {
+    local dir="$1" stop="$2"
+    while true; do
+        echo "$dir"
+        [ "$dir" == "$stop" ] || [ "$dir" == "/" ] && break
+        dir="$(dirname "$dir")"
+    done
+}
+
+# A dir uses prettier if it has a config file, or package.json mentions prettier (config key or dependency)
+dir_uses_prettier() {
+    local dir="$1"
+    ls -A "$dir" | grep -Eq "$PRETTIER_CONFIG_PATTERN" && return 0
+    [ -f "$dir/package.json" ] && grep -Eq '"prettier"[[:space:]]*:' "$dir/package.json"
+}
+
+# Shallowest prettier config file anywhere in the git repo, for files outside the config's own subtree
+find_repo_prettier_config() {
+    local root="$1" path
+    git -C "$root" ls-files --cached --others --exclude-standard \
+        | awk -F/ '{print NF "\t" $0}' | sort -n | cut -f2- \
+        | while read -r path; do
+            if basename "$path" | grep -Eq "$PRETTIER_CONFIG_PATTERN"; then
+                echo "$root/$path"
+                break
+            fi
+        done
+}
+
+# Decide whether the file belongs to a prettier repo, sets USE_PRETTIER and PRETTIER_CONFIG
+detect_prettier() {
+    local dir
+    USE_PRETTIER=""
+    PRETTIER_CONFIG=""
+    while read -r dir; do
+        if dir_uses_prettier "$dir"; then
+            # prettier resolves this config by itself
+            USE_PRETTIER=1
+            return
+        fi
+    done < <(walk_up "$FILE_DIR" "${GIT_ROOT:-/}")
+    [ -z "$GIT_ROOT" ] && return
+    PRETTIER_CONFIG="$(find_repo_prettier_config "$GIT_ROOT")"
+    [ -n "$PRETTIER_CONFIG" ] && USE_PRETTIER=1
+}
+
+# Prefer the repo's own prettier, then global, then npx; sets PRETTIER_CMD
+resolve_prettier_cmd() {
+    local start dir
+    for start in "$FILE_DIR" "$(dirname "${PRETTIER_CONFIG:-$FILE_DIR}")"; do
+        while read -r dir; do
+            if [ -x "$dir/node_modules/.bin/prettier" ]; then
+                PRETTIER_CMD=("$dir/node_modules/.bin/prettier")
+                return
+            fi
+        done < <(walk_up "$start" "${GIT_ROOT:-/}")
+    done
+    if command -v prettier > /dev/null; then
+        PRETTIER_CMD=(prettier)
+    else
+        PRETTIER_CMD=(npx --yes prettier)
+    fi
+}
+
+format_with_prettier() {
+    local args=(--log-level warn)
+    [ -n "$PRETTIER_CONFIG" ] && args+=(--config "$PRETTIER_CONFIG")
+    resolve_prettier_cmd
+    if [ -n "$DEBUG" ]; then
+        echo "cc-format: ${PRETTIER_CMD[*]} ${args[*]}" >&2
+    fi
+    if [ -n "$NO_WRITE" ]; then
+        "${PRETTIER_CMD[@]}" "${args[@]}" "$FILE" | diff -u "$FILE" -
+    else
+        "${PRETTIER_CMD[@]}" "${args[@]}" --write "$FILE"
+    fi
+}
+
+FILE_DIR="$(cd "$(dirname "$FILE")" && pwd)"
+GIT_ROOT="$(git -C "$FILE_DIR" rev-parse --show-toplevel 2> /dev/null)"
+
 # Format based on extension
 case "$EXTENSION" in
     py)
@@ -99,6 +183,11 @@ case "$EXTENSION" in
             "$FILE"
         ;;
     ts|tsx|js)
+        detect_prettier
+        if [ -n "$USE_PRETTIER" ]; then
+            format_with_prettier
+            exit $?
+        fi
         #echo "Formatting $EXTENSION file with biome..."
         biome format $BIOME_EXTRA \
             --indent-style=space --line-width=120 \
