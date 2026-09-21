@@ -14,7 +14,8 @@ usage() {
         echo "Usage: $0 <filename>"
         echo "Formats files based on their extension:"
         echo "  .py       - formatted with ruff"
-        echo "  .ts/.tsx/.js - formatted with the repo's prettier if it uses one, otherwise biome"
+        echo "  .ts/.tsx/.js - formatted with the repo's own prettier or biome config if it has one,"
+        echo "                 otherwise biome with cc-format's defaults"
     fi
     exit 1
 }
@@ -121,39 +122,65 @@ find_repo_prettier_config() {
         done
 }
 
-# Decide whether the file belongs to a prettier repo, sets USE_PRETTIER and PRETTIER_CONFIG
-detect_prettier() {
+# Decide which formatter the file's repo uses, the nearest config wins.
+# Sets REPO_FORMATTER (prettier | biome | empty), PRETTIER_CONFIG and BIOME_CONFIG_DIR
+detect_repo_formatter() {
     local dir
-    USE_PRETTIER=""
+    REPO_FORMATTER=""
     PRETTIER_CONFIG=""
+    BIOME_CONFIG_DIR=""
     while read -r dir; do
+        if [ -f "$dir/biome.json" ] || [ -f "$dir/biome.jsonc" ]; then
+            REPO_FORMATTER=biome
+            BIOME_CONFIG_DIR="$dir"
+            return
+        fi
         if dir_uses_prettier "$dir"; then
             # prettier resolves this config by itself
-            USE_PRETTIER=1
+            REPO_FORMATTER=prettier
             return
         fi
     done < <(walk_up "$FILE_DIR" "${GIT_ROOT:-/}")
     [ -z "$GIT_ROOT" ] && return
     PRETTIER_CONFIG="$(find_repo_prettier_config "$GIT_ROOT")"
-    [ -n "$PRETTIER_CONFIG" ] && USE_PRETTIER=1
+    [ -n "$PRETTIER_CONFIG" ] && REPO_FORMATTER=prettier
 }
 
-# Prefer the repo's own prettier, then global, then npx; sets PRETTIER_CMD
-resolve_prettier_cmd() {
-    local start dir
-    for start in "$FILE_DIR" "$(dirname "${PRETTIER_CONFIG:-$FILE_DIR}")"; do
+# Print the repo's own node_modules/.bin/$1, searching up from each given start dir
+find_local_bin() {
+    local name="$1" start dir
+    shift
+    for start in "$@"; do
         while read -r dir; do
-            if [ -x "$dir/node_modules/.bin/prettier" ]; then
-                PRETTIER_CMD=("$dir/node_modules/.bin/prettier")
+            if [ -x "$dir/node_modules/.bin/$name" ]; then
+                echo "$dir/node_modules/.bin/$name"
                 return
             fi
         done < <(walk_up "$start" "${GIT_ROOT:-/}")
     done
-    if command -v prettier > /dev/null; then
+}
+
+# Prefer the repo's own prettier, then global, then npx; sets PRETTIER_CMD
+resolve_prettier_cmd() {
+    local local_bin
+    local_bin="$(find_local_bin prettier "$FILE_DIR" "$(dirname "${PRETTIER_CONFIG:-$FILE_DIR}")")"
+    if [ -n "$local_bin" ]; then
+        PRETTIER_CMD=("$local_bin")
+    elif command -v prettier > /dev/null; then
         PRETTIER_CMD=(prettier)
     else
         PRETTIER_CMD=(npx --yes prettier)
     fi
+}
+
+# Repo has its own biome config: use it as is (and the repo's biome, config schema is tied to its version)
+format_with_repo_biome() {
+    local biome_bin
+    biome_bin="$(find_local_bin biome "$BIOME_CONFIG_DIR")"
+    if [ -n "$DEBUG" ]; then
+        echo "cc-format: ${biome_bin:-biome} format --config-path=$BIOME_CONFIG_DIR" >&2
+    fi
+    "${biome_bin:-biome}" format $BIOME_EXTRA --config-path="$BIOME_CONFIG_DIR" "$FILE"
 }
 
 format_with_prettier() {
@@ -183,11 +210,11 @@ case "$EXTENSION" in
             "$FILE"
         ;;
     ts|tsx|js)
-        detect_prettier
-        if [ -n "$USE_PRETTIER" ]; then
-            format_with_prettier
-            exit $?
-        fi
+        detect_repo_formatter
+        case "$REPO_FORMATTER" in
+            prettier) format_with_prettier; exit $? ;;
+            biome) format_with_repo_biome; exit $? ;;
+        esac
         #echo "Formatting $EXTENSION file with biome..."
         biome format $BIOME_EXTRA \
             --indent-style=space --line-width=120 \
