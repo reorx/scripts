@@ -28,6 +28,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+from rich.cells import cell_len
 from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
@@ -72,6 +73,11 @@ CATEGORY_RE = re.compile(r'^=== (.+) ===$')
 
 SORT_MODES = ['size_desc', 'size_asc', 'path']
 SORT_LABELS = {'size_desc': 'size ↓', 'size_asc': 'size ↑', 'path': 'path'}
+
+SHOW_ALL_LABEL = 'Show All Categories'
+CATEGORY_HINT = '1-9 select · 0 all'
+# background of a category row, filled for the category's share of all bytes
+BAR_STYLE = 'on #5a4a1e'
 
 
 @dataclass(frozen=True)
@@ -365,12 +371,16 @@ BUSY_ACTIONS = {'delete', 'toggle_whitelist', 'edit_whitelist', 'reload'}
 class MoleReviewApp(App):
     TITLE = 'mole-review'
     CSS = """
-    #sidebar { width: 46; border-right: solid $panel-lighten-2; }
+    #sidebar { width: 24; border-right: solid $panel-lighten-2; }
     #sidebar .section { padding: 0 1; }
     #categories { height: auto; max-height: 70%; }
-    #show-all { width: 1fr; margin: 1 1 0 1; }
+    /* ● marks the selection; a cursor left behind when unfocused would read as a size bar */
+    #categories > .option-list--option-highlighted { background: transparent; }
+    #categories:focus > .option-list--option-highlighted { background: $block-cursor-background; }
+    #show-all { width: 1fr; margin: 1 0 0 0; }
     #summary { padding: 1 1; color: $text-muted; }
     #main { width: 1fr; }
+    #category-bar { height: 1; padding: 0 1; background: $boost; }
     #table { height: 1fr; }
     #detail { height: auto; max-height: 3; padding: 0 1; color: $text-muted; }
     #status { height: 1; padding: 0 1; background: $boost; }
@@ -419,11 +429,12 @@ class MoleReviewApp(App):
         yield Header()
         with Horizontal():
             with Vertical(id='sidebar'):
-                yield Label(Text.assemble(('Categories', 'bold'), ('  1-9 select · 0 all', 'dim')), classes='section')
+                yield Label(Text.assemble(('Categories', 'bold'), '\n', (CATEGORY_HINT, 'dim')), classes='section')
                 yield CategoryList(id='categories', compact=True)
-                yield Button('Show All Categories', id='show-all', compact=True)
+                yield Button(SHOW_ALL_LABEL, id='show-all', compact=True)
                 yield Static(id='summary')
             with Vertical(id='main'):
+                yield Static(id='category-bar')
                 yield SearchInput(placeholder='/ filter by path', id='search', compact=True)
                 yield ItemTable(id='table', cursor_type='row', zebra_stripes=True)
                 yield Static(id='detail')
@@ -474,24 +485,40 @@ class MoleReviewApp(App):
 
     # --- rendering ---------------------------------------------------------
 
-    def category_prompt(self, n: int, category: str) -> Text:
-        items = filter_items(self.items, {category}, self.patterns, self.show_whitelisted, '', 'path')
-        width = max(len(c) for c in self.clean_list.categories)
+    def category_prompt(self, n: int, category: str, width: int, share: float) -> Text:
         selected = self.category in (None, category)
-        return Text.assemble(
+        text = Text.assemble(
             (' ● ', 'bold green') if selected else (' ○ ', 'dim'),
             (f'{n} ', 'bold'),
-            (category.ljust(width), 'bold' if selected else ''),
-            (f' {len(items):>4}', 'dim'),
-            (f' {format_size(total_size(items)):>8}', 'yellow'),
+            (category, 'bold' if selected else ''),
         )
+        text.pad_right(width - text.cell_len)
+        bar = max(1, round(width * share)) if share > 0 else 0
+        text.stylize(BAR_STYLE, 0, bar)
+        return text
+
+    def fit_sidebar(self, summary: Text) -> int:
+        """Size the sidebar to its longest text, return the width of a category row."""
+        rows = [f' ● {n} {c} ' for n, c in enumerate(self.clean_list.categories, 1)]
+        width = max(
+            [cell_len(row) for row in rows]
+            + [cell_len(CATEGORY_HINT) + 2, cell_len(SHOW_ALL_LABEL) + 2]
+            + [cell_len(line) + 2 for line in summary.plain.splitlines()]
+        )
+        self.query_one('#sidebar').styles.width = width + 1  # border-right
+        return width
 
     def rebuild_categories(self) -> None:
         cl = self.query_one(CategoryList)
         cats = self.clean_list.categories
         if self.category not in cats:
             self.category = None
-        prompts = [self.category_prompt(n, c) for n, c in enumerate(cats, 1)]
+        groups = {c: filter_items(self.items, {c}, self.patterns, self.show_whitelisted, '', 'path') for c in cats}
+        sizes = {c: total_size(items) for c, items in groups.items()}
+        grand = sum(sizes.values())
+        summary = self.summary_text()
+        width = self.fit_sidebar(summary)
+        prompts = [self.category_prompt(n, c, width, sizes[c] / grand if grand else 0) for n, c in enumerate(cats, 1)]
         if [cl.get_option_at_index(i).id for i in range(cl.option_count)] != cats:
             cl.clear_options()
             cl.add_options([Option(prompt, id=c) for prompt, c in zip(prompts, cats)])
@@ -500,7 +527,26 @@ class MoleReviewApp(App):
             for idx, prompt in enumerate(prompts):
                 cl.replace_option_prompt_at_index(idx, prompt)
         self.query_one('#show-all', Button).variant = 'primary' if self.category is None else 'default'
-        self.update_summary()
+        self.query_one('#summary', Static).update(summary)
+        self.update_category_bar(groups, sizes)
+
+    def update_category_bar(self, groups: dict[str, list[Item]], sizes: dict[str, int]) -> None:
+        if self.category is None:
+            name = 'All Categories'
+            items = [i for group in groups.values() for i in group]
+            size = total_size(items)  # nested paths across categories counted once
+        else:
+            name, items, size = self.category, groups[self.category], sizes[self.category]
+        text = Text.assemble(
+            (name, 'bold'),
+            f'  {len(items)} item{"" if len(items) == 1 else "s"} · ',
+            (format_size(size), 'bold yellow'),
+        )
+        grand = sum(sizes.values())
+        if self.category is not None and grand:
+            share = size / grand
+            text.append(f'  {share:.0%} of all' if share >= 0.01 or not size else '  <1% of all', style='dim')
+        self.query_one('#category-bar', Static).update(text)
 
     def show_category(self, category: str | None) -> None:
         """Show one category (None for all), then hand the arrow keys to the file list."""
@@ -559,21 +605,21 @@ class MoleReviewApp(App):
         for key, value in zip(('mark', 'size', 'path'), self.render_row(item)):
             table.update_cell(item.path, key, value)
 
-    def update_summary(self) -> None:
+    def summary_text(self) -> Text:
         wl_items = [i for i in self.items if i.path in self.wl_paths]
         rows = [
-            ('mole says', self.clean_list.potential),
-            ('dedup total', f'{format_size(total_size(self.items))} (nested counted once)'),
+            ('mole says', self.clean_list.potential.replace('At least ', '≥')),
+            ('dedup', format_size(total_size(self.items))),  # nested paths counted once
             ('entries', str(len(self.items))),
-            ('gone', f'{self.gone} no longer on disk'),
-            ('whitelisted', f'{len(wl_items)} entries · {format_size(total_size(wl_items))}'),
-            ('patterns', f'{len(self.patterns)} in {display_path(str(self.whitelist_path))}'),
+            ('gone', str(self.gone)),  # listed but no longer on disk
+            ('whitelist', f'{len(wl_items)} · {format_size(total_size(wl_items))}'),
+            ('patterns', str(len(self.patterns))),
         ]
         text = Text()
         for n, (label, value) in enumerate(rows):
-            text.append(('\n' if n else '') + f'{label:<12}', style='bold')
+            text.append(('\n' if n else '') + f'{label:<10}', style='bold')
             text.append(value)
-        self.query_one('#summary', Static).update(text)
+        return text
 
     def update_status(self, message: str = '') -> None:
         if message:

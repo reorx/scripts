@@ -18,6 +18,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from rich.style import Style
 from textual import events
 
 HERE = Path(__file__).resolve().parent
@@ -347,6 +348,52 @@ class TestAppBrowse(AppTestCase):
 class TestAppCategories(AppTestCase):
     def categories_shown(self, app):
         return {i.category for i in app.shown}
+
+    def prompt_of(self, app, category):
+        return app.query_one(mr.CategoryList).get_option(category).prompt
+
+    def bar_cells(self, prompt):
+        styles = [Style.parse(sp.style) if isinstance(sp.style, str) else sp.style for sp in prompt.spans]
+        return sum(sp.end - sp.start for sp, st in zip(prompt.spans, styles) if st.bgcolor is not None)
+
+    async def test_sidebar_is_only_as_wide_as_its_text(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            self.assertLess(app.query_one('#sidebar').outer_size.width, 30)
+            categories = app.query_one(mr.CategoryList)
+            self.assertEqual(categories.virtual_size.height, categories.option_count)  # no wrapped rows
+            plain = self.prompt_of(app, 'Developer tools').plain
+            self.assertIn('Developer tools', plain)
+            self.assertNotIn('11.82GB', plain)  # size lives in the category bar now
+
+    async def test_category_background_bar_follows_size_share(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            width = app.query_one(mr.CategoryList).content_size.width
+            sizes = {
+                c: mr.total_size([i for i in app.shown if i.category == c]) for c in app.clean_list.categories
+            }
+            grand = sum(sizes.values())
+            bars = {c: self.bar_cells(self.prompt_of(app, c)) for c in sizes}
+            for c, size in sizes.items():
+                self.assertAlmostEqual(bars[c], width * size / grand, delta=1, msg=c)
+            self.assertEqual(max(bars, key=bars.get), 'Developer tools')
+
+    async def test_category_bar_on_top_shows_name_count_and_size(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            bar = app.query_one('#category-bar')
+            self.assertLess(bar.region.y, app.query_one(mr.ItemTable).region.y)
+            text = str(bar.content)
+            self.assertIn('All Categories', text)
+            self.assertIn('7 items', text)
+            self.assertIn('14.19GB', text)
+            await pilot.press('3')
+            await pilot.pause()
+            text = str(bar.content)
+            self.assertIn('Developer tools', text)
+            self.assertIn('3 items', text)
+            self.assertIn('11.82GB', text)
 
     async def test_starts_showing_all_categories(self):
         app = self.make_app()
