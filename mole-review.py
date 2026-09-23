@@ -14,6 +14,9 @@ A separate whitelist (~/.config/mole-review/whitelist) hides entries you have
 already reviewed and decided to keep. mole never reads it; the syntax and
 matching rules are the same as ~/.config/mole/whitelist, so lines can be
 copied over when you want mole itself to skip them too.
+
+With --rescan it first runs `mo clean --dry-run` on the terminal, exactly as
+if typed in the shell, then opens the fresh list.
 """
 
 import argparse
@@ -22,6 +25,7 @@ import os
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -42,6 +46,8 @@ from textual.widgets.option_list import Option
 HOME = os.path.expanduser('~')
 DEFAULT_LIST = Path(HOME, '.config/mole/clean-list.txt')
 DEFAULT_WHITELIST = Path(HOME, '.config/mole-review/whitelist')
+# mo always writes its preview to DEFAULT_LIST
+RESCAN_CMD = ['mo', 'clean', '--dry-run']
 
 WHITELIST_HEADER = (
     '# mole-review whitelist: entries matching these patterns are hidden from review.\n'
@@ -871,6 +877,18 @@ class MoleReviewApp(App):
                 f.write(f'{stamp}\tfailed\t{i.size_text}\t{i.path}\t{err}\n')
 
 
+def rescan() -> int:
+    """Run mole's dry run in the foreground on the inherited terminal, return its exit code."""
+    proc = subprocess.Popen(RESCAN_CMD)
+    # like a shell waiting on a foreground job, Ctrl+C is mo's to handle so its traps can
+    # clean up. Ignored only after the spawn, a child started with SIGINT ignored can't trap it.
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        return proc.wait()
+    finally:
+        signal.signal(signal.SIGINT, previous)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog='mole-review',
@@ -884,7 +902,21 @@ def main() -> None:
     parser.add_argument(
         '--whitelist', type=Path, default=DEFAULT_WHITELIST, help=f'review whitelist (default: {DEFAULT_WHITELIST})'
     )
+    parser.add_argument(
+        '--rescan', action='store_true', help=f'run `{shlex.join(RESCAN_CMD)}` first to regenerate the list'
+    )
     args = parser.parse_args()
+    if args.rescan:
+        if args.list != DEFAULT_LIST:
+            parser.error(f'--rescan regenerates {DEFAULT_LIST}, it cannot be combined with another list path')
+        try:
+            code = rescan()
+        except FileNotFoundError:
+            sys.exit(f'{RESCAN_CMD[0]} not found in PATH, install mole first: brew install mole')
+        if code != 0:
+            print(f'{RESCAN_CMD[0]} exited with {code}, not opening the review', file=sys.stderr)
+            # killed by a signal shows as -N, report it the way a shell does
+            sys.exit(code if code > 0 else 128 - code)
     if not args.list.exists():
         sys.exit(f'{args.list} not found, generate it with: mo clean --dry-run')
     MoleReviewApp(args.list, args.whitelist).run()

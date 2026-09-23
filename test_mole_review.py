@@ -14,6 +14,8 @@ import asyncio
 import importlib.util
 import os
 import re
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -248,6 +250,101 @@ class TestDeletePath(unittest.TestCase):
         for bad in ('/', '/Users', os.path.expanduser('~'), 'relative/path', '/a/../b'):
             with self.assertRaises(ValueError, msg=bad):
                 mr.delete_path(bad)
+
+
+FAKE_MO = """\
+#!/bin/sh
+# stand-in for `mo`: records its args, talks on all three std streams, then writes the list
+echo "$@" >> "$FAKE_CALLS"
+if [ -z "$FAKE_QUIET" ]; then
+    echo "mo-stdout"
+    echo "mo-stderr" >&2
+    read answer && echo "mo-read:$answer"
+fi
+[ -n "$FAKE_EXIT" ] && exit "$FAKE_EXIT"
+printf '=== Developer tools ===\\n/tmp  # 1KB\\n' > "$FAKE_LIST"
+"""
+
+
+class TestRescan(unittest.TestCase):
+    """--rescan runs `mo clean --dry-run` in the foreground, then opens the TUI."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        bin_dir = self.root / 'bin'
+        bin_dir.mkdir()
+        fake = bin_dir / 'mo'
+        fake.write_text(FAKE_MO)
+        fake.chmod(0o755)
+        self.list_path = self.root / 'home' / '.config' / 'mole' / 'clean-list.txt'
+        self.list_path.parent.mkdir(parents=True)
+        self.calls = self.root / 'mo-calls'
+        self.env = {
+            'PATH': f'{bin_dir}:{os.environ["PATH"]}',
+            'HOME': str(self.root / 'home'),
+            'FAKE_LIST': str(self.list_path),
+            'FAKE_CALLS': str(self.calls),
+        }
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_main(self, argv, **env):
+        """Run main() in-process with the TUI stubbed out, return the list text the TUI would open."""
+        opened = {}
+
+        def fake_run(app):
+            opened['list'] = app.list_path.read_text()
+
+        with (
+            mock.patch.dict(os.environ, {**self.env, 'FAKE_QUIET': '1', **env}),
+            mock.patch.object(mr, 'DEFAULT_LIST', self.list_path),
+            mock.patch.object(mr.MoleReviewApp, 'run', fake_run),
+            mock.patch.object(sys, 'argv', ['mole-review', *argv]),
+        ):
+            mr.main()
+        return opened.get('list')
+
+    def test_rescan_runs_mo_dry_run_before_opening_tui(self):
+        opened = self.run_main(['--rescan'])
+        self.assertEqual(self.calls.read_text(), 'clean --dry-run\n')
+        # the TUI opened on the list mo just wrote
+        self.assertIn('=== Developer tools ===', opened)
+
+    def test_without_rescan_mo_is_not_called(self):
+        self.list_path.write_text('=== A ===\n/tmp  # 1KB\n')
+        self.run_main([])
+        self.assertFalse(self.calls.exists())
+
+    def test_mo_streams_pass_through_and_failure_skips_tui_with_mos_exit_code(self):
+        # a real child process, so stdin/stdout/stderr are genuine file descriptors
+        r = subprocess.run(
+            [sys.executable, str(HERE / 'mole-review.py'), '--rescan'],
+            input='yes\n',
+            capture_output=True,
+            text=True,
+            env={**os.environ, **self.env, 'FAKE_EXIT': '3'},
+            timeout=60,
+        )
+        self.assertEqual(r.returncode, 3)
+        self.assertIn('mo-stdout', r.stdout)
+        self.assertIn('mo-read:yes', r.stdout)
+        self.assertIn('mo-stderr', r.stderr)
+        self.assertEqual(self.calls.read_text(), 'clean --dry-run\n')
+        self.assertFalse(self.list_path.exists())
+
+    def test_missing_mo_is_a_clear_error(self):
+        with self.assertRaises(SystemExit) as cm:
+            self.run_main(['--rescan'], PATH=str(self.root / 'empty'))
+        self.assertIn('mo', str(cm.exception.code))
+        self.assertIn('not found', str(cm.exception.code))
+
+    def test_rescan_with_custom_list_path_is_rejected(self):
+        with mock.patch('sys.stderr'), self.assertRaises(SystemExit) as cm:
+            self.run_main(['--rescan', str(self.root / 'other.txt')])
+        self.assertEqual(cm.exception.code, 2)
+        self.assertFalse(self.calls.exists())
 
 
 class AppTestCase(unittest.IsolatedAsyncioTestCase):
