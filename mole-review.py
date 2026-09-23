@@ -29,14 +29,14 @@ from datetime import datetime
 from pathlib import Path
 
 from rich.text import Text
-from textual import work
+from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widget import Widget
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label, SelectionList, Static
-from textual.widgets.selection_list import Selection
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, OptionList, Static
+from textual.widgets.option_list import Option
 
 HOME = os.path.expanduser('~')
 DEFAULT_LIST = Path(HOME, '.config/mole/clean-list.txt')
@@ -52,8 +52,8 @@ keys:
   space   mark / unmark row             a      mark / unmark all shown rows
   d       delete marked (or current)    x      whitelist current/marked, or un-whitelist
   w       show / hide whitelisted       s      cycle sort: size desc, size asc, path
-  1-9     toggle category               0      show all categories
-  enter   (in sidebar) only this cat    tab    switch sidebar / table
+  1-9     show one category             0      show all categories
+  enter   (in sidebar) show category    tab    switch sidebar / table
   /       filter by path                esc    clear filter
   o       reveal in Finder              e      edit whitelist in $EDITOR
   r       reload list and whitelist     q      quit
@@ -300,8 +300,8 @@ class ItemTable(DataTable):
     BINDINGS = [Binding('space', 'app.toggle_mark', 'Mark')]
 
 
-class CategoryList(SelectionList[str]):
-    BINDINGS = [Binding('enter', 'app.solo_category', 'Only this', show=False)]
+class CategoryList(OptionList):
+    """Single-select: enter or a click picks the category (OptionSelected)."""
 
 
 class SearchInput(Input):
@@ -356,7 +356,7 @@ class ConfirmDelete(ModalScreen[bool]):
 # actions defined here, disabled while a modal is open so keys don't leak through it
 APP_ACTIONS = {
     'toggle_mark', 'mark_all', 'delete', 'toggle_whitelist', 'toggle_show_whitelisted',
-    'cycle_sort', 'toggle_category', 'all_categories', 'solo_category', 'focus_search',
+    'cycle_sort', 'select_category', 'all_categories', 'focus_search',
     'clear_search', 'reveal', 'edit_whitelist', 'reload',
 }  # fmt: skip
 BUSY_ACTIONS = {'delete', 'toggle_whitelist', 'edit_whitelist', 'reload'}
@@ -367,7 +367,8 @@ class MoleReviewApp(App):
     CSS = """
     #sidebar { width: 46; border-right: solid $panel-lighten-2; }
     #sidebar .section { padding: 0 1; }
-    #categories { height: auto; max-height: 70%; border: none; }
+    #categories { height: auto; max-height: 70%; }
+    #show-all { width: 1fr; margin: 1 1 0 1; }
     #summary { padding: 1 1; color: $text-muted; }
     #main { width: 1fr; }
     #table { height: 1fr; }
@@ -394,7 +395,7 @@ class MoleReviewApp(App):
         Binding('r', 'reload', 'Reload'),
         Binding('q', 'quit', 'Quit'),
         Binding('0', 'all_categories', 'All cats', show=False),
-        *[Binding(str(n), f'toggle_category({n - 1})', show=False) for n in range(1, 10)],
+        *[Binding(str(n), f'select_category({n - 1})', show=False) for n in range(1, 10)],
     ]
 
     def __init__(self, list_path: Path, whitelist_path: Path):
@@ -411,14 +412,16 @@ class MoleReviewApp(App):
         self.shown: list[Item] = []
         self.show_whitelisted = False
         self.sort_mode = 'size_desc'
+        self.category: str | None = None  # None shows all categories
         self.deleting = False
 
     def compose(self) -> ComposeResult:
         yield Header()
         with Horizontal():
             with Vertical(id='sidebar'):
-                yield Label(Text.assemble(('Categories', 'bold'), ('  1-9 toggle · 0 all · ⏎ only', 'dim')), classes='section')
-                yield CategoryList(id='categories')
+                yield Label(Text.assemble(('Categories', 'bold'), ('  1-9 select · 0 all', 'dim')), classes='section')
+                yield CategoryList(id='categories', compact=True)
+                yield Button('Show All Categories', id='show-all', compact=True)
                 yield Static(id='summary')
             with Vertical(id='main'):
                 yield SearchInput(placeholder='/ filter by path', id='search', compact=True)
@@ -431,7 +434,6 @@ class MoleReviewApp(App):
         table = self.query_one(ItemTable)
         table.add_column(' ', key='mark', width=1)
         table.add_column(Text('Size', justify='right'), key='size', width=9)
-        table.add_column('Category', key='category')
         table.add_column('Path', key='path')
         self.load_data()
         table.focus()
@@ -461,7 +463,9 @@ class MoleReviewApp(App):
         self.refresh_table()
 
     def selected_categories(self) -> set[str]:
-        return set(self.query_one(CategoryList).selected)
+        if self.category is None:
+            return set(self.clean_list.categories)
+        return {self.category}
 
     def current_item(self) -> Item | None:
         if not self.shown:
@@ -473,32 +477,47 @@ class MoleReviewApp(App):
     def category_prompt(self, n: int, category: str) -> Text:
         items = filter_items(self.items, {category}, self.patterns, self.show_whitelisted, '', 'path')
         width = max(len(c) for c in self.clean_list.categories)
+        selected = self.category in (None, category)
         return Text.assemble(
+            (' ● ', 'bold green') if selected else (' ○ ', 'dim'),
             (f'{n} ', 'bold'),
-            category.ljust(width),
+            (category.ljust(width), 'bold' if selected else ''),
             (f' {len(items):>4}', 'dim'),
             (f' {format_size(total_size(items)):>8}', 'yellow'),
         )
 
     def rebuild_categories(self) -> None:
-        sl = self.query_one(CategoryList)
+        cl = self.query_one(CategoryList)
         cats = self.clean_list.categories
-        current = [sl.get_option_at_index(i).value for i in range(sl.option_count)]
-        if current != cats:
-            sl.clear_options()
-            sl.add_options([Selection(self.category_prompt(n, c), c, True) for n, c in enumerate(cats, 1)])
-            sl.highlighted = 0 if cats else None
+        if self.category not in cats:
+            self.category = None
+        prompts = [self.category_prompt(n, c) for n, c in enumerate(cats, 1)]
+        if [cl.get_option_at_index(i).id for i in range(cl.option_count)] != cats:
+            cl.clear_options()
+            cl.add_options([Option(prompt, id=c) for prompt, c in zip(prompts, cats)])
+            cl.highlighted = 0 if cats else None
         else:
-            for idx, c in enumerate(cats):
-                sl.replace_option_prompt_at_index(idx, self.category_prompt(idx + 1, c))
+            for idx, prompt in enumerate(prompts):
+                cl.replace_option_prompt_at_index(idx, prompt)
+        self.query_one('#show-all', Button).variant = 'primary' if self.category is None else 'default'
         self.update_summary()
+
+    def show_category(self, category: str | None) -> None:
+        """Show one category (None for all), then hand the arrow keys to the file list."""
+        self.category = category
+        self.rebuild_categories()
+        if category is not None:
+            self.query_one(CategoryList).highlighted = self.clean_list.categories.index(category)
+        self.refresh_table()
+        table = self.query_one(ItemTable)
+        table.move_cursor(row=0)
+        self.focus_now(table)
 
     def render_row(self, item: Item) -> list[Text]:
         if item.path in self.wl_paths:
             return [
                 Text('◦', style='dim'),
                 Text(item.size_text, style='dim', justify='right'),
-                Text(item.category, style='dim'),
                 Text(display_path(item.path), style='dim'),
             ]
         marked = item.path in self.marked
@@ -511,7 +530,6 @@ class MoleReviewApp(App):
         return [
             Text('●' if marked else ' ', style='bold red'),
             Text(item.size_text, style=size_style, justify='right'),
-            Text(item.category, style='cyan'),
             Text(display_path(item.path), style='bold' if marked else ''),
         ]
 
@@ -538,7 +556,7 @@ class MoleReviewApp(App):
 
     def update_row(self, item: Item) -> None:
         table = self.query_one(ItemTable)
-        for key, value in zip(('mark', 'size', 'category', 'path'), self.render_row(item)):
+        for key, value in zip(('mark', 'size', 'path'), self.render_row(item)):
             table.update_cell(item.path, key, value)
 
     def update_summary(self) -> None:
@@ -547,7 +565,7 @@ class MoleReviewApp(App):
             ('mole says', self.clean_list.potential),
             ('dedup total', f'{format_size(total_size(self.items))} (nested counted once)'),
             ('entries', str(len(self.items))),
-            ('gone', f'{self.gone} listed but no longer on disk'),
+            ('gone', f'{self.gone} no longer on disk'),
             ('whitelisted', f'{len(wl_items)} entries · {format_size(total_size(wl_items))}'),
             ('patterns', f'{len(self.patterns)} in {display_path(str(self.whitelist_path))}'),
         ]
@@ -576,6 +594,8 @@ class MoleReviewApp(App):
         item = self.current_item()
         text = Text()
         if item:
+            if self.category is None:
+                text.append(f'[{item.category}] ', style='cyan')
             text.append(display_path(item.path))
             hits = matching_patterns(item.path, self.patterns) if item.path in self.wl_paths else []
             if hits:
@@ -591,8 +611,13 @@ class MoleReviewApp(App):
 
     # --- events ------------------------------------------------------------
 
-    def on_selection_list_selected_changed(self, event: SelectionList.SelectedChanged) -> None:
-        self.refresh_table()
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        if isinstance(event.option_list, CategoryList):
+            self.show_category(event.option_id)
+
+    @on(Button.Pressed, '#show-all')
+    def on_show_all_pressed(self) -> None:
+        self.show_category(None)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         self.refresh_table()
@@ -629,21 +654,13 @@ class MoleReviewApp(App):
         self.sort_mode = SORT_MODES[(SORT_MODES.index(self.sort_mode) + 1) % len(SORT_MODES)]
         self.refresh_table()
 
-    def action_toggle_category(self, index: int) -> None:
-        sl = self.query_one(CategoryList)
-        if index < sl.option_count:
-            sl.toggle(sl.get_option_at_index(index).value)
+    def action_select_category(self, index: int) -> None:
+        cats = self.clean_list.categories
+        if index < len(cats):
+            self.show_category(cats[index])
 
     def action_all_categories(self) -> None:
-        self.query_one(CategoryList).select_all()
-
-    def action_solo_category(self) -> None:
-        sl = self.query_one(CategoryList)
-        if sl.highlighted is None:
-            return
-        value = sl.get_option_at_index(sl.highlighted).value
-        sl.deselect_all()
-        sl.select(value)
+        self.show_category(None)
 
     def focus_now(self, widget: Widget) -> None:
         # Widget.focus() is deferred, keys the terminal delivers in the same read

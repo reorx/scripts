@@ -288,19 +288,6 @@ class TestAppBrowse(AppTestCase):
             self.assertEqual(app.shown[0].path, self.p('npm/_cacache/content-v2'))
             self.assertNotIn(self.p('Logs/Fork.log'), [i.path for i in app.shown])
 
-    async def test_number_keys_toggle_categories_and_zero_shows_all(self):
-        app = self.make_app()
-        async with app.run_test(size=(160, 40)) as pilot:
-            await pilot.press('3')  # Developer tools off
-            await pilot.pause()
-            self.assertEqual({i.category for i in app.shown}, {'User essentials', 'Browsers'})
-            await pilot.press('1')  # User essentials off
-            await pilot.pause()
-            self.assertEqual({i.category for i in app.shown}, {'Browsers'})
-            await pilot.press('0')
-            await pilot.pause()
-            self.assertEqual(len(app.shown), 7)
-
     async def test_sort_key_cycles_modes(self):
         app = self.make_app()
         async with app.run_test(size=(160, 40)) as pilot:
@@ -356,13 +343,90 @@ class TestAppBrowse(AppTestCase):
             self.assertEqual(app.query_one(mr.SearchInput).value, 'Caches/pip')
             self.assertEqual([i.path for i in app.shown], [self.p('Caches/pip')])
 
-    async def test_enter_in_sidebar_shows_only_that_category(self):
+
+class TestAppCategories(AppTestCase):
+    def categories_shown(self, app):
+        return {i.category for i in app.shown}
+
+    async def test_starts_showing_all_categories(self):
         app = self.make_app()
         async with app.run_test(size=(160, 40)) as pilot:
-            app.query_one(mr.CategoryList).focus()
+            self.assertIsNone(app.category)
+            self.assertEqual(len(app.shown), 7)
+
+    async def test_number_key_selects_one_category_and_zero_shows_all(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.press('3')
+            await pilot.pause()
+            self.assertEqual(self.categories_shown(app), {'Developer tools'})
+            await pilot.press('1')  # replaces, does not add
+            await pilot.pause()
+            self.assertEqual(self.categories_shown(app), {'User essentials'})
+            await pilot.press('0')
+            await pilot.pause()
+            self.assertIsNone(app.category)
+            self.assertEqual(len(app.shown), 7)
+
+    async def test_clicking_category_selects_it_and_focuses_files(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.click(mr.CategoryList, offset=(4, 2))  # third row: Developer tools
+            await pilot.pause()
+            self.assertEqual(app.category, 'Developer tools')
+            self.assertEqual(self.categories_shown(app), {'Developer tools'})
+            self.assertIs(app.focused, app.query_one(mr.ItemTable))
+            await pilot.press('down')
+            await pilot.pause()
+            self.assertEqual(app.query_one(mr.ItemTable).cursor_row, 1)
+            self.assertEqual(app.category, 'Developer tools')
+
+    async def test_enter_in_sidebar_selects_category_and_focuses_files(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            sidebar = app.query_one(mr.CategoryList)
+            sidebar.focus()
+            await pilot.pause()
             await pilot.press('down', 'enter')
             await pilot.pause()
-            self.assertEqual({i.category for i in app.shown}, {'Browsers'})
+            self.assertEqual(self.categories_shown(app), {'Browsers'})
+            self.assertIs(app.focused, app.query_one(mr.ItemTable))
+            highlighted = sidebar.highlighted
+            await pilot.press('down')
+            await pilot.pause()
+            self.assertEqual(app.query_one(mr.ItemTable).cursor_row, 1)
+            self.assertEqual(sidebar.highlighted, highlighted)
+
+    async def test_show_all_button_then_clicking_a_category_goes_back_to_single(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.press('2')
+            await pilot.pause()
+            self.assertEqual(self.categories_shown(app), {'Browsers'})
+            await pilot.click('#show-all')
+            await pilot.pause()
+            self.assertIsNone(app.category)
+            self.assertEqual(len(app.shown), 7)
+            self.assertIs(app.focused, app.query_one(mr.ItemTable))
+            await pilot.click(mr.CategoryList, offset=(4, 0))
+            await pilot.pause()
+            self.assertEqual(self.categories_shown(app), {'User essentials'})
+
+    async def test_file_list_has_no_category_column(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            keys = [k.value for k in app.query_one(mr.ItemTable).columns]
+            self.assertNotIn('category', keys)
+            self.assertEqual(keys[-1], 'path')
+
+    async def test_detail_line_names_the_category_when_showing_all(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            detail = app.query_one('#detail')
+            self.assertIn('Developer tools', str(detail.content))
+            await pilot.press('3')
+            await pilot.pause()
+            self.assertNotIn('Developer tools', str(detail.content))
 
 
 class TestAppWhitelist(AppTestCase):
