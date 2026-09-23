@@ -466,14 +466,58 @@ class TestAppCategories(AppTestCase):
             self.assertNotIn('category', keys)
             self.assertEqual(keys[-1], 'path')
 
-    async def test_detail_line_names_the_category_when_showing_all(self):
+    async def test_category_rows_have_no_dot_and_dim_unselected_ones(self):
         app = self.make_app()
         async with app.run_test(size=(160, 40)) as pilot:
-            detail = app.query_one('#detail')
-            self.assertIn('Developer tools', str(detail.content))
+
+            def dimmed(category):
+                prompt = self.prompt_of(app, category)  # dim may be the base style or a span
+                return 'dim' in str(prompt.style) or any('dim' in str(sp.style) for sp in prompt.spans)
+
+            for c in app.clean_list.categories:
+                self.assertNotIn('●', self.prompt_of(app, c).plain)
+                self.assertNotIn('○', self.prompt_of(app, c).plain)
+                self.assertFalse(dimmed(c), c)  # all shown: none dimmed
             await pilot.press('3')
             await pilot.pause()
-            self.assertNotIn('Developer tools', str(detail.content))
+            self.assertFalse(dimmed('Developer tools'))
+            self.assertTrue(dimmed('Browsers'))
+            self.assertTrue(dimmed('User essentials'))
+
+
+class TestAppDetailPanel(AppTestCase):
+    def lines(self, app):
+        return str(app.query_one('#detail').content).splitlines()
+
+    async def test_detail_is_a_bordered_panel(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            styles = app.query_one('#detail').styles
+            self.assertNotIn(styles.border_top[0], ('', 'none'))
+            self.assertNotIn(styles.border_bottom[0], ('', 'none'))
+
+    async def test_first_line_is_category_second_is_full_path(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            lines = self.lines(app)
+            self.assertTrue(lines[0].startswith('Developer tools'), lines)
+            self.assertEqual(lines[1], mr.display_path(self.p('npm/_cacache/content-v2')))
+            await pilot.press('1')  # category stays on line 1 when a single category is shown
+            await pilot.pause()
+            lines = self.lines(app)
+            self.assertTrue(lines[0].startswith('User essentials'), lines)
+            self.assertEqual(lines[1], mr.display_path(self.p('Caches/Google')))
+
+    async def test_notes_line_says_what_the_row_is_counted_under(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            child = self.p('Caches/Google/Chrome/Default')
+            app.query_one(mr.ItemTable).move_cursor(row=[i.path for i in app.shown].index(child))
+            await pilot.pause()
+            lines = self.lines(app)
+            self.assertEqual(lines[1], mr.display_path(child))
+            self.assertIn('counted under', lines[2])
+            self.assertIn(mr.display_path(self.p('Caches/Google')), lines[2])
 
 
 class TestAppWhitelist(AppTestCase):

@@ -374,7 +374,7 @@ class MoleReviewApp(App):
     #sidebar { width: 24; border-right: solid $panel-lighten-2; }
     #sidebar .section { padding: 0 1; }
     #categories { height: auto; max-height: 70%; }
-    /* ● marks the selection; a cursor left behind when unfocused would read as a size bar */
+    /* bold marks the selection; a cursor left behind when unfocused would read as a size bar */
     #categories > .option-list--option-highlighted { background: transparent; }
     #categories:focus > .option-list--option-highlighted { background: $block-cursor-background; }
     #show-all { width: 1fr; margin: 1 0 0 0; }
@@ -382,7 +382,10 @@ class MoleReviewApp(App):
     #main { width: 1fr; }
     #category-bar { height: 1; padding: 0 1; background: $boost; }
     #table { height: 1fr; }
-    #detail { height: auto; max-height: 3; padding: 0 1; color: $text-muted; }
+    #detail {
+        height: auto; min-height: 5; max-height: 7; padding: 0 1;
+        border-top: solid $primary 60%; border-bottom: solid $primary 60%;
+    }
     #status { height: 1; padding: 0 1; background: $boost; }
     ConfirmDelete { align: center middle; }
     #dialog { width: 100; max-width: 95%; height: auto; max-height: 85%; border: thick $error; background: $surface; padding: 1 2; }
@@ -486,12 +489,7 @@ class MoleReviewApp(App):
     # --- rendering ---------------------------------------------------------
 
     def category_prompt(self, n: int, category: str, width: int, share: float) -> Text:
-        selected = self.category in (None, category)
-        text = Text.assemble(
-            (' ● ', 'bold green') if selected else (' ○ ', 'dim'),
-            (f'{n} ', 'bold'),
-            (category, 'bold' if selected else ''),
-        )
+        text = Text(f' {n} {category}', style='bold' if self.category in (None, category) else 'dim')
         text.pad_right(width - text.cell_len)
         bar = max(1, round(width * share)) if share > 0 else 0
         text.stylize(BAR_STYLE, 0, bar)
@@ -499,7 +497,7 @@ class MoleReviewApp(App):
 
     def fit_sidebar(self, summary: Text) -> int:
         """Size the sidebar to its longest text, return the width of a category row."""
-        rows = [f' ● {n} {c} ' for n, c in enumerate(self.clean_list.categories, 1)]
+        rows = [f' {n} {c} ' for n, c in enumerate(self.clean_list.categories, 1)]
         width = max(
             [cell_len(row) for row in rows]
             + [cell_len(CATEGORY_HINT) + 2, cell_len(SHOW_ALL_LABEL) + 2]
@@ -640,18 +638,22 @@ class MoleReviewApp(App):
         item = self.current_item()
         text = Text()
         if item:
-            if self.category is None:
-                text.append(f'[{item.category}] ', style='cyan')
-            text.append(display_path(item.path))
+            # line 1: category and size, line 2: full path, line 3: notes
+            text.append(item.category, style='bold cyan')
+            text.append(f'  {item.size_text}', style='yellow')
+            if item.count > 1:
+                text.append(f' · {item.count} items', style='dim')
+            text.append('\n')
+            text.append(display_path(item.path), style='bold')
+            text.append('\n')
             hits = matching_patterns(item.path, self.patterns) if item.path in self.wl_paths else []
             if hits:
-                text.append('  whitelisted by: ', style='dim')
+                text.append('whitelisted by ', style='dim')
                 text.append(', '.join(display_path(h) for h in hits), style='yellow')
-            if item.count > 1:
-                text.append(f'  {item.count} items', style='dim')
             parent = item.counted_under or listed_ancestor(item.path, {i.path for i in self.items})
             if parent:
-                text.append('  counted under: ', style='dim')
+                text.append('  ·  ' if hits else '', style='dim')
+                text.append('counted under ', style='dim')
                 text.append(display_path(parent), style='cyan')
         self.query_one('#detail', Static).update(text)
 
