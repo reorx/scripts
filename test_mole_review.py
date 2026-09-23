@@ -496,29 +496,40 @@ class TestAppDetailPanel(AppTestCase):
             self.assertNotIn(styles.border_top[0], ('', 'none'))
             self.assertNotIn(styles.border_bottom[0], ('', 'none'))
 
-    async def test_first_line_is_category_second_is_full_path(self):
+    async def test_first_line_is_full_path_second_is_labeled_values(self):
         app = self.make_app()
         async with app.run_test(size=(160, 40)) as pilot:
             lines = self.lines(app)
-            self.assertTrue(lines[0].startswith('Developer tools'), lines)
-            self.assertEqual(lines[1], mr.display_path(self.p('npm/_cacache/content-v2')))
-            await pilot.press('1')  # category stays on line 1 when a single category is shown
+            self.assertEqual(lines[0], mr.display_path(self.p('npm/_cacache/content-v2')))
+            self.assertIn('Category: Developer tools', lines[1])
+            self.assertIn('Size: 11.82GB', lines[1])
+            self.assertEqual(len(lines), 2)
+            await pilot.press('1')
             await pilot.pause()
             lines = self.lines(app)
-            self.assertTrue(lines[0].startswith('User essentials'), lines)
-            self.assertEqual(lines[1], mr.display_path(self.p('Caches/Google')))
+            self.assertEqual(lines[0], mr.display_path(self.p('Caches/Google')))
+            self.assertIn('Category: User essentials', lines[1])
 
-    async def test_notes_line_says_what_the_row_is_counted_under(self):
+    async def test_counted_under_is_a_labeled_value(self):
         app = self.make_app()
         async with app.run_test(size=(160, 40)) as pilot:
             child = self.p('Caches/Google/Chrome/Default')
             app.query_one(mr.ItemTable).move_cursor(row=[i.path for i in app.shown].index(child))
             await pilot.pause()
             lines = self.lines(app)
-            self.assertEqual(lines[1], mr.display_path(child))
-            self.assertIn('counted under', lines[2])
-            self.assertIn(mr.display_path(self.p('Caches/Google')), lines[2])
+            self.assertEqual(lines[0], mr.display_path(child))
+            self.assertIn(f'Counted under: {mr.display_path(self.p("Caches/Google"))}', lines[1])
 
+    async def test_whitelisted_by_is_a_labeled_value(self):
+        mr.add_to_whitelist(self.wl_path, [self.p('npm')])
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            await pilot.press('w')
+            await pilot.pause()
+            target = self.p('npm/_cacache/content-v2')
+            app.query_one(mr.ItemTable).move_cursor(row=[i.path for i in app.shown].index(target))
+            await pilot.pause()
+            self.assertIn(f'Whitelisted by: {mr.display_path(self.p("npm"))}', self.lines(app)[1])
 
 class TestAppWhitelist(AppTestCase):
     async def test_whitelisted_rows_hidden_then_shown_dimmed(self):

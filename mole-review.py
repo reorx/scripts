@@ -383,7 +383,7 @@ class MoleReviewApp(App):
     #category-bar { height: 1; padding: 0 1; background: $boost; }
     #table { height: 1fr; }
     #detail {
-        height: auto; min-height: 5; max-height: 7; padding: 0 1;
+        height: auto; min-height: 4; max-height: 6; padding: 0 1;
         border-top: solid $primary 60%; border-bottom: solid $primary 60%;
     }
     #status { height: 1; padding: 0 1; background: $boost; }
@@ -638,23 +638,21 @@ class MoleReviewApp(App):
         item = self.current_item()
         text = Text()
         if item:
-            # line 1: category and size, line 2: full path, line 3: notes
-            text.append(item.category, style='bold cyan')
-            text.append(f'  {item.size_text}', style='yellow')
-            if item.count > 1:
-                text.append(f' · {item.count} items', style='dim')
-            text.append('\n')
+            # line 1: full path, line 2: labeled values of this row
             text.append(display_path(item.path), style='bold')
-            text.append('\n')
+            fields = [('Category', item.category, 'cyan'), ('Size', item.size_text, 'yellow')]
+            if item.count > 1:
+                fields.append(('Items', str(item.count), ''))
             hits = matching_patterns(item.path, self.patterns) if item.path in self.wl_paths else []
             if hits:
-                text.append('whitelisted by ', style='dim')
-                text.append(', '.join(display_path(h) for h in hits), style='yellow')
+                fields.append(('Whitelisted by', ', '.join(display_path(h) for h in hits), 'yellow'))
             parent = item.counted_under or listed_ancestor(item.path, {i.path for i in self.items})
             if parent:
-                text.append('  ·  ' if hits else '', style='dim')
-                text.append('counted under ', style='dim')
-                text.append(display_path(parent), style='cyan')
+                fields.append(('Counted under', display_path(parent), 'cyan'))
+            text.append('\n')
+            for n, (label, value, style) in enumerate(fields):
+                text.append(('   ' if n else '') + f'{label}: ', style='dim')
+                text.append(value, style=style)
         self.query_one('#detail', Static).update(text)
 
     # --- events ------------------------------------------------------------
