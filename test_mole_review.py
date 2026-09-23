@@ -16,6 +16,7 @@ import os
 import re
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from rich.style import Style
@@ -487,7 +488,7 @@ class TestAppCategories(AppTestCase):
 
 class TestAppDetailPanel(AppTestCase):
     def lines(self, app):
-        return str(app.query_one('#detail').content).splitlines()
+        return [str(app.query_one(f'#detail-{part}').content) for part in ('path', 'kv')]
 
     async def test_detail_is_a_bordered_panel(self):
         app = self.make_app()
@@ -503,7 +504,6 @@ class TestAppDetailPanel(AppTestCase):
             self.assertEqual(lines[0], mr.display_path(self.p('npm/_cacache/content-v2')))
             self.assertIn('Category: Developer tools', lines[1])
             self.assertIn('Size: 11.82GB', lines[1])
-            self.assertEqual(len(lines), 2)
             await pilot.press('1')
             await pilot.pause()
             lines = self.lines(app)
@@ -530,6 +530,46 @@ class TestAppDetailPanel(AppTestCase):
             app.query_one(mr.ItemTable).move_cursor(row=[i.path for i in app.shown].index(target))
             await pilot.pause()
             self.assertIn(f'Whitelisted by: {mr.display_path(self.p("npm"))}', self.lines(app)[1])
+
+class TestAppCopyPath(AppTestCase):
+    async def test_button_sits_at_the_right_end_of_the_key_value_row(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            button, kv = app.query_one('#copy-path'), app.query_one('#detail-kv')
+            self.assertEqual(str(button.label), 'Copy Path')
+            self.assertEqual(button.region.y, kv.region.y)
+            self.assertGreater(button.region.x, kv.region.x)
+            self.assertEqual(button.region.right, app.query_one('#detail').content_region.right)
+
+    async def test_clicking_copies_the_full_path_and_keeps_focus_on_files(self):
+        copied = []
+        with mock.patch.object(mr, 'copy_text', side_effect=lambda text: copied.append(text) or True):
+            app = self.make_app()
+            async with app.run_test(size=(160, 40)) as pilot:
+                await pilot.press('down')
+                await pilot.click('#copy-path')
+                await pilot.pause()
+                self.assertEqual(copied, [app.shown[1].path])
+                self.assertTrue(copied[0].startswith('/'))
+                self.assertIs(app.focused, app.query_one(mr.ItemTable))
+
+    async def test_c_key_copies_too(self):
+        copied = []
+        with mock.patch.object(mr, 'copy_text', side_effect=lambda text: copied.append(text) or True):
+            app = self.make_app()
+            async with app.run_test(size=(160, 40)) as pilot:
+                await pilot.press('c')
+                await pilot.pause()
+                self.assertEqual(copied, [app.shown[0].path])
+
+    async def test_falls_back_to_terminal_clipboard_without_pbcopy(self):
+        with mock.patch.object(mr, 'copy_text', return_value=False):
+            app = self.make_app()
+            async with app.run_test(size=(160, 40)) as pilot:
+                with mock.patch.object(app, 'copy_to_clipboard') as osc52:
+                    await pilot.press('c')
+                    await pilot.pause()
+                    osc52.assert_called_once_with(app.shown[0].path)
 
 class TestAppWhitelist(AppTestCase):
     async def test_whitelisted_rows_hidden_then_shown_dimmed(self):

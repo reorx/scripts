@@ -57,7 +57,8 @@ keys:
   enter   (in sidebar) show category    tab    switch sidebar / table
   /       filter by path                esc    clear filter
   o       reveal in Finder              e      edit whitelist in $EDITOR
-  r       reload list and whitelist     q      quit
+  c       copy full path                r      reload list and whitelist
+  q       quit
 """
 
 UNITS = {'B': 1, 'KB': 1000, 'MB': 1000**2, 'GB': 1000**3, 'TB': 1000**4}
@@ -299,6 +300,17 @@ def delete_path(path: str) -> None:
         os.remove(path)
 
 
+# --- clipboard ---------------------------------------------------------------
+
+
+def copy_text(text: str) -> bool:
+    """Put text on the macOS clipboard, False when pbcopy is not available."""
+    if not shutil.which('pbcopy'):
+        return False
+    subprocess.run(['pbcopy'], input=text, text=True, check=True)
+    return True
+
+
 # --- TUI ---------------------------------------------------------------------
 
 
@@ -363,7 +375,7 @@ class ConfirmDelete(ModalScreen[bool]):
 APP_ACTIONS = {
     'toggle_mark', 'mark_all', 'delete', 'toggle_whitelist', 'toggle_show_whitelisted',
     'cycle_sort', 'select_category', 'all_categories', 'focus_search',
-    'clear_search', 'reveal', 'edit_whitelist', 'reload',
+    'clear_search', 'reveal', 'copy_path', 'edit_whitelist', 'reload',
 }  # fmt: skip
 BUSY_ACTIONS = {'delete', 'toggle_whitelist', 'edit_whitelist', 'reload'}
 
@@ -383,9 +395,13 @@ class MoleReviewApp(App):
     #category-bar { height: 1; padding: 0 1; background: $boost; }
     #table { height: 1fr; }
     #detail {
-        height: auto; min-height: 4; max-height: 6; padding: 0 1;
+        height: auto; padding: 0 1;
         border-top: solid $primary 60%; border-bottom: solid $primary 60%;
     }
+    #detail-path { height: auto; min-height: 1; max-height: 2; }
+    #detail-row { height: auto; }
+    #detail-kv { width: 1fr; height: auto; min-height: 1; max-height: 2; }
+    #copy-path { margin-left: 2; }
     #status { height: 1; padding: 0 1; background: $boost; }
     ConfirmDelete { align: center middle; }
     #dialog { width: 100; max-width: 95%; height: auto; max-height: 85%; border: thick $error; background: $surface; padding: 1 2; }
@@ -404,6 +420,7 @@ class MoleReviewApp(App):
         # priority: handled in the app's queue so the keys right after it already reach the filter
         Binding('slash', 'focus_search', 'Filter', priority=True),
         Binding('o', 'reveal', 'Finder'),
+        Binding('c', 'copy_path', 'Copy path', show=False),
         Binding('e', 'edit_whitelist', 'Edit WL'),
         Binding('r', 'reload', 'Reload'),
         Binding('q', 'quit', 'Quit'),
@@ -440,7 +457,11 @@ class MoleReviewApp(App):
                 yield Static(id='category-bar')
                 yield SearchInput(placeholder='/ filter by path', id='search', compact=True)
                 yield ItemTable(id='table', cursor_type='row', zebra_stripes=True)
-                yield Static(id='detail')
+                with Vertical(id='detail'):
+                    yield Static(id='detail-path')
+                    with Horizontal(id='detail-row'):
+                        yield Static(id='detail-kv')
+                        yield Button('Copy Path', id='copy-path', compact=True)
                 yield Static(id='status')
         yield Footer()
 
@@ -449,6 +470,8 @@ class MoleReviewApp(App):
         table.add_column(' ', key='mark', width=1)
         table.add_column(Text('Size', justify='right'), key='size', width=9)
         table.add_column('Path', key='path')
+        # clicking it must not pull focus away from the file list
+        self.query_one('#copy-path', Button).can_focus = False
         self.load_data()
         table.focus()
 
@@ -636,10 +659,9 @@ class MoleReviewApp(App):
 
     def update_detail(self) -> None:
         item = self.current_item()
-        text = Text()
+        path, kv = Text(), Text()
         if item:
-            # line 1: full path, line 2: labeled values of this row
-            text.append(display_path(item.path), style='bold')
+            path.append(display_path(item.path), style='bold')
             fields = [('Category', item.category, 'cyan'), ('Size', item.size_text, 'yellow')]
             if item.count > 1:
                 fields.append(('Items', str(item.count), ''))
@@ -649,11 +671,12 @@ class MoleReviewApp(App):
             parent = item.counted_under or listed_ancestor(item.path, {i.path for i in self.items})
             if parent:
                 fields.append(('Counted under', display_path(parent), 'cyan'))
-            text.append('\n')
             for n, (label, value, style) in enumerate(fields):
-                text.append(('   ' if n else '') + f'{label}: ', style='dim')
-                text.append(value, style=style)
-        self.query_one('#detail', Static).update(text)
+                kv.append(('   ' if n else '') + f'{label}: ', style='dim')
+                kv.append(value, style=style)
+        self.query_one('#detail-path', Static).update(path)
+        self.query_one('#detail-kv', Static).update(kv)
+        self.query_one('#copy-path', Button).disabled = item is None
 
     # --- events ------------------------------------------------------------
 
@@ -664,6 +687,10 @@ class MoleReviewApp(App):
     @on(Button.Pressed, '#show-all')
     def on_show_all_pressed(self) -> None:
         self.show_category(None)
+
+    @on(Button.Pressed, '#copy-path')
+    def on_copy_path_pressed(self) -> None:
+        self.action_copy_path()
 
     def on_input_changed(self, event: Input.Changed) -> None:
         self.refresh_table()
@@ -761,6 +788,19 @@ class MoleReviewApp(App):
         item = self.current_item()
         if item:
             subprocess.run(['open', '-R', item.path], check=False)
+
+    def action_copy_path(self) -> None:
+        item = self.current_item()
+        if item is None:
+            return
+        try:
+            copied = copy_text(item.path)
+        except (OSError, subprocess.CalledProcessError) as e:
+            self.notify(f'Copy failed: {e}', severity='error')
+            return
+        if not copied:
+            self.copy_to_clipboard(item.path)  # OSC 52, needs terminal support
+        self.notify(f'Copied {item.path}')
 
     def action_edit_whitelist(self) -> None:
         if not self.whitelist_path.exists():
