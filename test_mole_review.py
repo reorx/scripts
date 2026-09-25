@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 #
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.12"
 # dependencies = ["textual>=8.0"]
 # ///
 """
@@ -14,6 +14,7 @@ import asyncio
 import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -99,13 +100,15 @@ class TestParseCleanList(unittest.TestCase):
         self.assertIn('/r/npm/weird # name', paths)
 
     def test_new_mole_annotations(self):
-        text = '\n'.join([
-            '=== Developer tools ===',
-            '/r/a  # 1.0MB, 12 items',
-            '/r/a/b  # 51.2MB, counted under /r/a',
-            '/r/c  # size unknown',
-            '/r/d  # size unknown, 3 items, counted under /r/a',
-        ])
+        text = '\n'.join(
+            [
+                '=== Developer tools ===',
+                '/r/a  # 1.0MB, 12 items',
+                '/r/a/b  # 51.2MB, counted under /r/a',
+                '/r/c  # size unknown',
+                '/r/d  # size unknown, 3 items, counted under /r/a',
+            ]
+        )
         a, b, c, d = mr.parse_clean_list(text).items
         self.assertEqual((a.path, a.size, a.count, a.counted_under), ('/r/a', 1_000_000, 12, None))
         self.assertEqual((b.path, b.size, b.count, b.counted_under), ('/r/a/b', 51_200_000, 1, '/r/a'))
@@ -229,6 +232,106 @@ class TestView(unittest.TestCase):
         self.assertEqual([i.path for i in self.view(query='FORK')], ['/r/Logs/Fork.log'])
 
 
+HOME = mr.HOME
+
+
+def home(rel):
+    return os.path.join(HOME, rel)
+
+
+def locked_tree(root):
+    """dir/ with a file rmtree can remove and a subdir it cannot (no write bit), returns the subdir."""
+    locked = root / 'dir' / 'locked'
+    locked.mkdir(parents=True)
+    (locked / 'f').write_text('x')
+    (root / 'dir' / 'free').write_text('x')
+    locked.chmod(0o500)
+    return locked
+
+
+class TestCheckDeletable(unittest.TestCase):
+    """The list is trusted only so far: paths that must never go are refused even when listed."""
+
+    def refuses(self, *paths):
+        for p in paths:
+            with self.assertRaises(ValueError, msg=p):
+                mr.check_deletable(p)
+
+    def allows(self, *paths):
+        for p in paths:
+            mr.check_deletable(p)
+
+    def test_malformed_paths(self):
+        self.refuses('', 'relative/path', '/a/../b', '/a/./b', '/tmp/a\nb', '/tmp/a\x1bb')
+
+    def test_system_roots_are_refused_but_their_entries_stay_deletable(self):
+        self.refuses(
+            '/', '/Users', '/Users/Shared', '/Library', '/Library/Application Support', '/Applications',
+            '/Volumes', '/private', '/private/var', '/private/var/folders', '/tmp', '/var/folders',
+            '/opt', '/opt/homebrew', '/usr/local',
+        )  # fmt: skip
+        self.allows(
+            '/Library/Caches/com.apple.foo', '/private/var/folders/xx/yy/T/foo', '/tmp/foo',
+            '/opt/homebrew/Cellar/foo', '/Volumes/Backup/foo', '/Library/Developer/CoreSimulator/Caches',
+        )  # fmt: skip
+
+    def test_system_trees_are_refused_entirely(self):
+        self.refuses(
+            '/usr', '/usr/bin/python3', '/System/Library/Caches/foo', '/bin/ls', '/private/etc/hosts',
+            '/private/var/db/foo', '/Library/Apple/foo', '/Library/Keychains/x', '/Applications/Safari.app/Contents',
+        )  # fmt: skip
+        # Homebrew (Intel) and user-installed software live here
+        self.allows('/usr/local/Cellar/foo', '/usr/local/bin/foo')
+
+    def test_every_home_directory_is_refused(self):
+        self.refuses('/Users/alice', '/Users/alice/', HOME, HOME + '/')
+        self.allows('/Users/alice/Library/Caches/foo')
+
+    def test_user_data_roots_are_refused_but_caches_inside_stay_deletable(self):
+        self.refuses(
+            home('Library'), home('Library/Application Support'), home('Library/Caches'), home('Library/Containers'),
+            home('Library/Group Containers'), home('Library/Preferences'), home('Library/Messages'), home('Library/Mail'),
+            home('Documents'), home('Desktop'), home('Downloads'), home('.Trash'), home('.config'),
+        )  # fmt: skip
+        self.allows(
+            home('Library/Caches/com.foo'), home('Library/Application Support/Code/Cache'),
+            home('Library/Messages/Caches/Previews'), home('Documents/proj/__pycache__'),
+            home('.Trash/old.app'), home('.lesshst'), home('.npm/_cacache'),
+        )  # fmt: skip
+
+    def test_secrets_and_cloud_synced_trees_are_refused_entirely(self):
+        self.refuses(
+            home('.ssh'), home('.ssh/id_ed25519'), home('.gnupg/x'), home('Library/Keychains/login.keychain-db'),
+            home('Library/Mobile Documents/com~apple~CloudDocs/notes'), home('Library/CloudStorage/Dropbox/x'),
+        )  # fmt: skip
+
+    def test_app_container_roots_are_refused_but_their_caches_stay_deletable(self):
+        self.refuses(
+            home('Library/Containers/com.foo'), home('Library/Containers/com.foo/Data'),
+            home('Library/Group Containers/group.foo'),
+        )  # fmt: skip
+        self.allows(
+            home('Library/Containers/com.foo/Data/Library/Caches'), home('Library/Group Containers/group.foo/Logs')
+        )
+
+    def test_aliases_of_protected_paths_are_caught_by_inode(self):
+        # APFS is case-insensitive and /Users is a firmlink: same directories under other spellings
+        self.refuses(
+            '/USERS', '/users/shared', '/USERS/' + os.path.basename(HOME), HOME.upper() + '/Library',
+            '/LIBRARY/Apple/foo', '/System/Volumes/Data' + HOME,
+        )  # fmt: skip
+
+    def test_symlinks_are_resolved_before_judging(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'to-ssh').symlink_to(home('.ssh'))
+            (root / 'to-docs').symlink_to(home('Documents'))
+            (root / 'to-caches').symlink_to(home('Library/Caches'))
+            # an ancestor link into a protected tree, and a leaf link to a protected root (like mole, refused)
+            self.refuses(str(root / 'to-ssh' / 'id_rsa'), str(root / 'to-docs'))
+            self.allows(str(root / 'to-caches' / 'com.foo'))
+
+
 class TestDeletePath(unittest.TestCase):
     def test_deletes_dirs_files_and_symlinks_without_following(self):
         with tempfile.TemporaryDirectory() as d:
@@ -240,7 +343,7 @@ class TestDeletePath(unittest.TestCase):
             (root / 'target' / 'keep').write_text('x')
             (root / 'link').symlink_to(root / 'target')
             for name in ('dir', 'file', 'link'):
-                mr.delete_path(str(root / name))
+                self.assertEqual(mr.delete_path(str(root / name)), [])
             self.assertFalse((root / 'dir').exists())
             self.assertFalse((root / 'file').exists())
             self.assertFalse((root / 'link').is_symlink())
@@ -250,6 +353,40 @@ class TestDeletePath(unittest.TestCase):
         for bad in ('/', '/Users', os.path.expanduser('~'), 'relative/path', '/a/../b'):
             with self.assertRaises(ValueError, msg=bad):
                 mr.delete_path(bad)
+
+    def test_keeps_going_past_undeletable_entries_and_reports_them(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            locked = locked_tree(root)
+            try:
+                errors = mr.delete_path(str(root / 'dir'))
+            finally:
+                locked.chmod(0o700)
+            self.assertFalse((root / 'dir' / 'free').exists())
+            self.assertTrue((locked / 'f').exists())
+            self.assertTrue(errors and all(str(locked) in e for e in errors), errors)
+
+
+class TestDeleteItem(unittest.TestCase):
+    def item(self, path):
+        return mr.Item(str(path), 1, '1B', 'c')
+
+    def test_outcome_per_entry(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / 'ok').write_text('x')
+            self.assertEqual(mr.delete_item(self.item(root / 'ok')).status, 'deleted')
+            self.assertEqual(mr.delete_item(self.item(root / 'missing')).status, 'gone')
+            refused = mr.delete_item(self.item('/Library'))
+            self.assertEqual(refused.status, 'failed')
+            self.assertIn('refusing', refused.error)
+            locked = locked_tree(root)
+            try:
+                partial = mr.delete_item(self.item(root / 'dir'))
+            finally:
+                locked.chmod(0o700)
+            self.assertEqual(partial.status, 'partial')
+            self.assertIn(str(locked), partial.error)
 
 
 FAKE_MO = """\
@@ -346,6 +483,13 @@ class TestRescan(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         self.assertFalse(self.calls.exists())
 
+    def test_refuses_to_run_as_root(self):
+        self.list_path.write_text('=== A ===\n/tmp  # 1KB\n')
+        with mock.patch.object(mr.os, 'geteuid', return_value=0), self.assertRaises(SystemExit) as cm:
+            self.run_main(['--rescan'])
+        self.assertIn('root', str(cm.exception.code))
+        self.assertFalse(self.calls.exists())
+
 
 class AppTestCase(unittest.IsolatedAsyncioTestCase):
     """Drives the real TUI with textual's pilot against a temp file tree."""
@@ -376,6 +520,14 @@ class AppTestCase(unittest.IsolatedAsyncioTestCase):
     async def settle(self, app, pilot):
         await app.workers.wait_for_complete()
         await pilot.pause()
+
+    async def confirm(self, pilot):
+        """Press y once the dialog accepts it: keys typed ahead of the dialog are ignored."""
+        await asyncio.sleep(mr.ConfirmDelete.ARM_DELAY)
+        await pilot.press('y')
+
+    def log_rows(self, app):
+        return [tuple(line.split('\t')[1:4:2]) for line in app.log_path.read_text().splitlines()]
 
 
 class TestAppBrowse(AppTestCase):
@@ -468,9 +620,7 @@ class TestAppCategories(AppTestCase):
         app = self.make_app()
         async with app.run_test(size=(160, 40)) as pilot:
             width = app.query_one(mr.CategoryList).content_size.width
-            sizes = {
-                c: mr.total_size([i for i in app.shown if i.category == c]) for c in app.clean_list.categories
-            }
+            sizes = {c: mr.total_size([i for i in app.shown if i.category == c]) for c in app.clean_list.categories}
             grand = sum(sizes.values())
             bars = {c: self.bar_cells(self.prompt_of(app, c)) for c in sizes}
             for c, size in sizes.items():
@@ -628,6 +778,7 @@ class TestAppDetailPanel(AppTestCase):
             await pilot.pause()
             self.assertIn(f'Whitelisted by: {mr.display_path(self.p("npm"))}', self.lines(app)[1])
 
+
 class TestAppCopyPath(AppTestCase):
     async def test_button_sits_at_the_right_end_of_the_key_value_row(self):
         app = self.make_app()
@@ -667,6 +818,7 @@ class TestAppCopyPath(AppTestCase):
                     await pilot.press('c')
                     await pilot.pause()
                     osc52.assert_called_once_with(app.shown[0].path)
+
 
 class TestAppWhitelist(AppTestCase):
     async def test_whitelisted_rows_hidden_then_shown_dimmed(self):
@@ -729,7 +881,7 @@ class TestAppDelete(AppTestCase):
             self.assertEqual(app.marked, {first, second})
             await pilot.press('d')
             await pilot.pause()
-            await pilot.press('y')
+            await self.confirm(pilot)
             await self.settle(app, pilot)
             self.assertFalse(os.path.exists(first))
             self.assertFalse(os.path.exists(second))
@@ -737,6 +889,84 @@ class TestAppDelete(AppTestCase):
             # second row is Caches/Google, its nested Chrome/Default child goes with it
             self.assertEqual(second, self.p('Caches/Google'))
             self.assertEqual(len(app.shown), 4)
+
+    async def test_y_typed_ahead_of_the_dialog_does_not_confirm(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            first = app.shown[0].path
+            await pilot.press('space', 'd', 'y')
+            await pilot.pause()
+            self.assertIsInstance(app.screen, mr.ConfirmDelete)
+            self.assertTrue(os.path.exists(first))
+            await self.confirm(pilot)
+            await self.settle(app, pilot)
+            self.assertFalse(os.path.exists(first))
+
+    async def test_log_records_each_entry_before_and_after_deleting_it(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            first = app.shown[0].path
+            await pilot.press('space', 'd')
+            await pilot.pause()
+            await self.confirm(pilot)
+            await self.settle(app, pilot)
+        self.assertEqual(self.log_rows(app), [('deleting', first), ('deleted', first)])
+        stamps = [line.split('\t')[0] for line in app.log_path.read_text().splitlines()]
+        self.assertTrue(all(re.fullmatch(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d', s) for s in stamps), stamps)
+
+    async def test_entry_that_vanished_is_logged_as_gone_and_dropped(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            first = app.shown[0].path
+            await pilot.press('space', 'd')
+            await pilot.pause()
+            shutil.rmtree(first)
+            await self.confirm(pilot)
+            await self.settle(app, pilot)
+            self.assertNotIn(first, [i.path for i in app.shown])
+        self.assertEqual(self.log_rows(app), [('deleting', first), ('gone', first)])
+
+    async def test_partially_deleted_entry_stays_listed_and_marked(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            first = app.shown[0].path
+            locked = locked_tree(Path(first))
+            try:
+                await pilot.press('space', 'd')
+                await pilot.pause()
+                await self.confirm(pilot)
+                await self.settle(app, pilot)
+            finally:
+                locked.chmod(0o700)
+            self.assertFalse(os.path.exists(os.path.join(first, 'data')))
+            self.assertTrue(os.path.exists(first))
+            self.assertIn(first, [i.path for i in app.shown])
+            self.assertEqual(app.marked, {first})
+        self.assertEqual(self.log_rows(app), [('deleting', first), ('partial', first)])
+
+    async def test_operation_not_permitted_hints_at_full_disk_access(self):
+        app = self.make_app()
+        denied = PermissionError(1, 'Operation not permitted')
+        with mock.patch.object(mr, 'delete_path', side_effect=denied):
+            async with app.run_test(size=(160, 40), notifications=True) as pilot:
+                await pilot.press('space', 'd')
+                await pilot.pause()
+                await self.confirm(pilot)
+                await self.settle(app, pilot)
+                messages = '\n'.join(n.message for n in app._notifications)
+        self.assertIn('Full Disk Access', messages)
+
+    async def test_quit_is_ignored_while_deleting(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            app.deleting = True
+            await pilot.press('q')
+            await pilot.pause()
+            self.assertFalse(app._exit)
+            app.deleting = False
+            await pilot.press('q')
+            await pilot.pause()
+            self.assertTrue(app._exit)
 
     async def test_cancel_keeps_everything(self):
         app = self.make_app()
@@ -757,7 +987,7 @@ class TestAppDelete(AppTestCase):
             app.marked = {parent}
             await pilot.press('d')
             await pilot.pause()
-            await pilot.press('y')
+            await self.confirm(pilot)
             await self.settle(app, pilot)
             paths = [i.path for i in app.shown]
             self.assertNotIn(parent, paths)

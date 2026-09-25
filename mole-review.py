@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 #
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.12"
 # dependencies = ["textual>=8.0"]
 # ///
 """
@@ -17,9 +17,14 @@ copied over when you want mole itself to skip them too.
 
 With --rescan it first runs `mo clean --dry-run` on the terminal, exactly as
 if typed in the shell, then opens the fresh list.
+
+Deletion is permanent. The list is not trusted blindly: system and user data
+roots are refused even when listed, symlinks are resolved before judging, and
+every step is appended to ~/.config/mole-review/deleted.log as it happens.
 """
 
 import argparse
+import errno
 import fnmatch
 import os
 import re
@@ -30,7 +35,9 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
+from functools import cache
 from pathlib import Path
+from time import monotonic
 
 from rich.cells import cell_len
 from rich.text import Text
@@ -286,24 +293,135 @@ def display_path(path: str) -> str:
 # --- deletion ----------------------------------------------------------------
 
 
+# The clean list is data, not authority. mole's own deletion policy (lib/core/file_ops.sh,
+# _mole_is_critical_deletion_path) is mirrored here, plus the user's data roots.
+# Deleting these exact paths is refused, entries inside them stay deletable.
+PROTECTED_ROOTS = [
+    '/', '/Applications', '/Library', '/Library/Application Support', '/Volumes', '/Network', '/cores',
+    '/etc', '/home', '/net', '/tmp', '/var', '/private', '/private/tmp', '/private/var', '/private/var/tmp',
+    '/private/var/folders', '/Users', '/Users/Shared', '/opt', '/opt/homebrew', '/usr/local',
+    '~', '~/Library', '~/Library/Application Support', '~/Library/Application Scripts', '~/Library/Caches',
+    '~/Library/Containers', '~/Library/Group Containers', '~/Library/Developer', '~/Library/Logs',
+    '~/Library/Mail', '~/Library/Messages', '~/Library/Preferences', '~/Library/Safari',
+    '~/Library/Saved Application State', '~/.Trash', '~/.cache', '~/.config', '~/.local',
+    '~/Desktop', '~/Documents', '~/Downloads', '~/Movies', '~/Music', '~/Pictures', '~/Public',
+]  # fmt: skip
+# Nothing inside these is deletable either.
+PROTECTED_TREES = [
+    '/bin', '/dev', '/sbin', '/usr', '/System', '/private/etc', '/private/var/audit', '/private/var/db',
+    '/private/var/root', '/Library/Apple', '/Library/Extensions', '/Library/Keychains',
+    '/Applications/Finder.app', '/Applications/Safari.app',
+    '~/Library/Keychains', '~/Library/Mobile Documents', '~/Library/CloudStorage', '~/.ssh', '~/.gnupg',
+]  # fmt: skip
+# Homebrew (Intel) and user-installed software: deletable although /usr is a protected tree
+TREE_EXCEPTIONS = ['/usr/local']
+PROTECTED_ROOTS = [os.path.expanduser(p) for p in PROTECTED_ROOTS]
+PROTECTED_TREES = [os.path.expanduser(p) for p in PROTECTED_TREES]
+# a home directory, or an app container root whose Container.plist and Data/ layout the sandbox relies on
+PROTECTED_SHAPES = [
+    re.compile(r'/Users/[^/]+'),
+    re.compile(re.escape(HOME) + r'/Library/(Group )?Containers/[^/]+(/Data)?'),
+]
+
+
+def inside(path: str, root: str) -> bool:
+    return path == root or path.startswith(root.rstrip('/') + '/')
+
+
+def file_id(path: str) -> tuple[int, int] | None:
+    if not os.path.exists(path):
+        return None
+    st = os.stat(path)
+    return st.st_dev, st.st_ino
+
+
+@cache
+def protected_inodes() -> dict[tuple[int, int], tuple[str, bool]]:
+    """Identity of every protected path that exists, so aliases of it are caught too:
+    APFS is case-insensitive (/USERS/SHARED), /Users is a firmlink of /System/Volumes/Data/Users."""
+    ids = {}
+    for is_tree, paths in ((False, PROTECTED_ROOTS), (True, PROTECTED_TREES)):
+        for p in paths:
+            if fid := file_id(p):
+                ids[fid] = (p, is_tree)
+    return ids
+
+
+def protected_reason(path: str) -> str | None:
+    """Why this (already normalized) path must not be deleted, None when it may be."""
+    excepted = any(inside(path, e) and path != e for e in TREE_EXCEPTIONS)
+    if path in PROTECTED_ROOTS:
+        return 'a protected directory'
+    if not excepted and any(inside(path, t) for t in PROTECTED_TREES):
+        return 'inside a protected tree'
+    if any(s.fullmatch(path) for s in PROTECTED_SHAPES):
+        return 'a home or app container root'
+    if file_id(os.path.dirname(path)) == file_id('/Users'):
+        return 'a home directory'
+    probe = path
+    while True:
+        hit = protected_inodes().get(file_id(probe))
+        if hit and (probe == path or hit[1]) and not (excepted and hit[0] == '/usr'):
+            return f'{"inside " if probe != path else ""}{hit[0]} under another spelling'
+        if probe == '/':
+            return None
+        probe = os.path.dirname(probe)
+
+
 def check_deletable(path: str) -> None:
     parts = path.split('/')
-    if (
-        not path.startswith('/')
-        or '..' in parts
-        or '.' in parts
-        or len([p for p in parts if p]) < 3
-        or normalize_path(path) == HOME
-    ):
-        raise ValueError(f'refusing to delete unsafe path: {path}')
+    if not path.startswith('/') or '..' in parts or '.' in parts or any(ord(c) < 32 or c == '\x7f' for c in path):
+        raise ValueError(f'refusing to delete unsafe path: {path!r}')
+    # judge the path as written and where it really leads: an ancestor that is a symlink would
+    # otherwise let a harmless-looking cache path walk rmtree into Documents or a system tree
+    for candidate in dict.fromkeys((normalize_path(path), os.path.realpath(path))):
+        if reason := protected_reason(candidate):
+            raise ValueError(f'refusing to delete {reason}: {candidate}')
 
 
-def delete_path(path: str) -> None:
+def delete_path(path: str) -> list[str]:
+    """Delete path, return the entries inside it that could not be removed (rmtree keeps going)."""
     check_deletable(path)
-    if os.path.isdir(path) and not os.path.islink(path):
-        shutil.rmtree(path)
-    else:
+    if not os.path.isdir(path) or os.path.islink(path):
         os.remove(path)
+        return []
+    errors: list[str] = []
+
+    def record(fn, p, exc):
+        # a directory left non-empty by an earlier error is a consequence, not a second cause
+        if errors and getattr(exc, 'errno', None) == errno.ENOTEMPTY:
+            return
+        errors.append(f'{p}: {getattr(exc, "strerror", None) or exc}')
+
+    shutil.rmtree(path, onexc=record)
+    return errors
+
+
+@dataclass(frozen=True)
+class DeleteResult:
+    item: Item
+    status: str  # deleted | partial | failed | gone
+    error: str = ''
+
+
+def delete_item(item: Item) -> DeleteResult:
+    try:
+        errors = delete_path(item.path)
+    except FileNotFoundError:
+        return DeleteResult(item, 'gone')
+    except (OSError, ValueError) as e:
+        return DeleteResult(item, 'failed', str(e))
+    if errors and os.path.lexists(item.path):
+        return DeleteResult(item, 'partial', f'{len(errors)} entries could not be removed, first: {errors[0]}')
+    return DeleteResult(item, 'deleted')
+
+
+def append_delete_log(log_path: Path, status: str, item: Item, error: str = '') -> None:
+    """One line per step, flushed at once, so a crash mid-batch still leaves a record."""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().isoformat(timespec='seconds')
+    with log_path.open('a') as f:
+        f.write(f'{stamp}\t{status}\t{item.size_text}\t{item.path}' + (f'\t{error}' if error else '') + '\n')
 
 
 # --- clipboard ---------------------------------------------------------------
@@ -337,10 +455,13 @@ class ConfirmDelete(ModalScreen[bool]):
         Binding('y', 'confirm', 'Delete'),
         Binding('n,escape', 'cancel', 'Cancel'),
     ]
+    # a `y` typed ahead of the dialog (e.g. "dy" in one burst) lands on it before it is even drawn
+    ARM_DELAY = 0.25
 
     def __init__(self, items: list[Item]):
         super().__init__()
         self.items = sorted(items, key=lambda i: -i.size)
+        self.armed_at = monotonic() + self.ARM_DELAY
 
     def compose(self) -> ComposeResult:
         listing = Text()
@@ -371,7 +492,8 @@ class ConfirmDelete(ModalScreen[bool]):
         self.dismiss(event.button.id == 'yes')
 
     def action_confirm(self) -> None:
-        self.dismiss(True)
+        if monotonic() >= self.armed_at:
+            self.dismiss(True)
 
     def action_cancel(self) -> None:
         self.dismiss(False)
@@ -383,7 +505,8 @@ APP_ACTIONS = {
     'cycle_sort', 'select_category', 'all_categories', 'focus_search',
     'clear_search', 'reveal', 'copy_path', 'edit_whitelist', 'reload',
 }  # fmt: skip
-BUSY_ACTIONS = {'delete', 'toggle_whitelist', 'edit_whitelist', 'reload'}
+# quitting mid-batch would leave the delete thread without an app to report to
+BUSY_ACTIONS = {'delete', 'toggle_whitelist', 'edit_whitelist', 'reload', 'quit'}
 
 
 class MoleReviewApp(App):
@@ -836,24 +959,20 @@ class MoleReviewApp(App):
 
     @work(thread=True, exclusive=True, group='delete')
     def run_delete(self, targets: list[Item]) -> None:
-        removed: list[Item] = []
-        failed: list[tuple[Item, str]] = []
-        for n, item in enumerate(targets, 1):
-            self.call_from_thread(self.update_status, f'Deleting {n}/{len(targets)}: {display_path(item.path)}')
-            try:
-                delete_path(item.path)
-            except FileNotFoundError:
-                pass
-            except (OSError, ValueError) as e:
-                failed.append((item, str(e)))
-                continue
-            removed.append(item)
-        self.call_from_thread(self.finish_delete, removed, failed)
+        results: list[DeleteResult] = []
+        try:
+            for n, item in enumerate(targets, 1):
+                self.call_from_thread(self.update_status, f'Deleting {n}/{len(targets)}: {display_path(item.path)}')
+                append_delete_log(self.log_path, 'deleting', item)
+                result = delete_item(item)
+                append_delete_log(self.log_path, result.status, item, result.error)
+                results.append(result)
+        finally:
+            self.call_from_thread(self.finish_delete, results)
 
-    def finish_delete(self, removed: list[Item], failed: list[tuple[Item, str]]) -> None:
+    def finish_delete(self, results: list[DeleteResult]) -> None:
         self.deleting = False
-        self.write_delete_log(removed, failed)
-        roots = {i.path for i in removed}
+        roots = {r.item.path for r in results if r.status in ('deleted', 'gone')}
 
         def is_gone(path: str) -> bool:
             return path in roots or listed_ancestor(path, roots) is not None
@@ -862,19 +981,16 @@ class MoleReviewApp(App):
         self.marked = {p for p in self.marked if not is_gone(p)}
         self.rebuild_categories()
         self.refresh_table()
-        self.notify(f'Deleted {len(removed)} entries, freed about {format_size(total_size(removed))}')
-        if failed:
-            lines = '\n'.join(f'{display_path(i.path)}: {err}' for i, err in failed[:5])
-            self.notify(f'{len(failed)} failed (still marked):\n{lines}', severity='error', timeout=15)
-
-    def write_delete_log(self, removed: list[Item], failed: list[tuple[Item, str]]) -> None:
-        self.log_path.parent.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.now().isoformat(timespec='seconds')
-        with self.log_path.open('a') as f:
-            for i in removed:
-                f.write(f'{stamp}\tdeleted\t{i.size_text}\t{i.path}\n')
-            for i, err in failed:
-                f.write(f'{stamp}\tfailed\t{i.size_text}\t{i.path}\t{err}\n')
+        deleted = [r.item for r in results if r.status == 'deleted']
+        self.notify(f'Deleted {len(deleted)} entries, freed about {format_size(total_size(deleted))}')
+        problems = [r for r in results if r.status in ('failed', 'partial')]
+        if problems:
+            lines = [f'{r.status}: {display_path(r.item.path)}: {r.error}' for r in problems[:5]]
+            if any('Operation not permitted' in r.error for r in problems):
+                lines.append('Operation not permitted usually means the terminal lacks Full Disk Access')
+            self.notify(
+                f'{len(problems)} not fully deleted (still marked):\n' + '\n'.join(lines), severity='error', timeout=15
+            )
 
 
 def rescan() -> int:
@@ -906,6 +1022,9 @@ def main() -> None:
         '--rescan', action='store_true', help=f'run `{shlex.join(RESCAN_CMD)}` first to regenerate the list'
     )
     args = parser.parse_args()
+    if os.geteuid() == 0:
+        # HOME would be /var/root, so every home-level guard would protect the wrong directory
+        sys.exit('mole-review must not run as root, run it as the user whose files are being reviewed')
     if args.rescan:
         if args.list != DEFAULT_LIST:
             parser.error(f'--rescan regenerates {DEFAULT_LIST}, it cannot be combined with another list path')
