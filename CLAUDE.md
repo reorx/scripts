@@ -1,28 +1,24 @@
 # Scripts Repository
 
-This repository is a collection of scripts I use for working tricks, productivity, and everyday life. Each script is independent and self-contained - they don't rely on each other.
+Personal scripts for work tricks, productivity, and everyday life, plus agent skills under `skills/`.
 
-## Development Guidelines
+## Rules
 
-### Script Independence
-- Each script works separately and independently
-- Don't relate scripts to each other unless explicitly requested
-- Work on each file individually
+- One task = one self-contained file. Scripts don't import or call each other unless explicitly requested; when editing, touch only the script at hand.
+- New scripts keep their extension (`.sh`, `.py`) and are made executable with `chmod +x`.
+- Tests sit beside the script as `test_<name>.py` / `test-<name>.sh`, each a standalone runnable file.
 
-### Python Scripts
-- Use only built-in libraries when possible
-- Avoid third-party dependencies unless absolutely necessary
-- Create single monolithic scripts that do all the work
-- For scripts with metadata, run using uv or make executable with uv shebang
-  - Do not directly run Python scripts with metadata
-  - Use uv to run or set uv as shebang interpreter
+## Python
 
-### Bash Scripts
-- Refer to @~/.claude/bash_cheatsheet.md for coding tricks and style guidelines
-- Follow best practices for shell scripting
+- Standard library first; add third-party dependencies only when absolutely necessary.
+- Declare dependencies with PEP 723 inline metadata and the shebang `#!/usr/bin/env -S uv run --script`. Run such scripts through `uv run <script>` or the shebang, never plain `python`.
 
-### Script Creation
-- Create only one mono script per task
-- Make scripts executable with `chmod +x`
-- Preserve file extensions (`.sh`, `.py`, etc.)
-- Keep everything self-contained in a single file
+## Bash
+
+- Start with `set -euo pipefail`.
+
+## Skills and linking
+
+- A skill is `skills/<name>/SKILL.md` with optional `scripts/` and `references/`.
+- `./link-skill skills/<name>` symlinks a skill into the agent skill dirs (`~/.claude`, `~/.agents`, `~/.codex`, OpenClaw).
+- `./link-script <path>` symlinks a script into `~/.local/bin`; `-l` lists links, `-d <name>` removes one.
