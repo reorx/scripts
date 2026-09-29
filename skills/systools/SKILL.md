@@ -1,6 +1,6 @@
 ---
 name: systools
-description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing processes on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots — CPU temp, load, memory, swap, disk, network (\"how's my mac\", \"is it overheating\"); live memory I/O pressure — pageouts, swap churn, compressor activity (\"why is my mac slow\", \"is it swapping\"); releasing leaked dev test resources — booted iOS simulators and agent-browser headless Chrome (\"clean up simulators\", \"close all agent-browser\", \"清理模拟器\", teardown after browser/iOS testing); WindowServer CPU/GPU diagnostics (\"WindowServer is hot\", \"UI feels laggy\"); managing the daily wake/sleep schedule via pmset (\"schedule my mac to sleep at 1am\", \"change the auto sleep time\", \"自动休眠计划\"); auditing launchd + cron scheduled jobs and whether they are actually loaded (\"what runs periodically\", \"why isn't my launch agent running\", \"定时任务\", \"launchd 有哪些\"); listing/managing macOS Background Task Management items shown in System Settings; and repairing PostgreSQL instances that will not start under brew services (\"postgresql shows error in brew services\", \"postgres won't start\", \"lock file postmaster.pid already exists\", \"数据库起不来\"). macOS-only except port management."
+description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing processes on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots — CPU temp, load, memory, swap, disk, network (\"how's my mac\", \"is it overheating\"); live memory I/O pressure — pageouts, swap churn, compressor activity (\"why is my mac slow\", \"is it swapping\"); releasing leaked dev test resources — booted iOS simulators and agent-browser headless Chrome (\"clean up simulators\", \"close all agent-browser\", \"清理模拟器\", teardown after browser/iOS testing) — and pruning the shared Rust/cargo target dir by last use (\"cargo target is huge\", \"clean rust build cache\", \"清理 cargo 缓存\"); WindowServer CPU/GPU diagnostics (\"WindowServer is hot\", \"UI feels laggy\"); managing the daily wake/sleep schedule via pmset (\"schedule my mac to sleep at 1am\", \"change the auto sleep time\", \"自动休眠计划\"); auditing launchd + cron scheduled jobs and whether they are actually loaded (\"what runs periodically\", \"why isn't my launch agent running\", \"定时任务\", \"launchd 有哪些\"); listing/managing macOS Background Task Management items shown in System Settings; and repairing PostgreSQL instances that will not start under brew services (\"postgresql shows error in brew services\", \"postgres won't start\", \"lock file postmaster.pid already exists\", \"数据库起不来\"). macOS-only except port management."
 ---
 
 # systools
@@ -135,16 +135,18 @@ This script samples virtual-memory counters at regular intervals and reports rea
 
 ## macOS Dev Resource Cleanup
 
-### Release leaked iOS simulators and agent-browser sessions
+### Release leaked iOS simulators, agent-browser sessions, and stale cargo artifacts
 
 **Script:** `scripts/mac-dev-cleanup`
 
-**Prerequisites:** macOS only. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Wraps `ps`, `xcrun simctl`, `agent-browser close`, `osascript`, `memory_pressure`.
+**Prerequisites:** macOS only. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Wraps `ps`, `xcrun simctl`, `agent-browser close`, `osascript`, `memory_pressure`, and for the cargo step `cargo` + [`cargo-sweep`](https://github.com/holmgr/cargo-sweep) (`cargo install cargo-sweep`; the step is skipped if either is missing).
 
 The two biggest recurring causes of a degraded `mac-health` reading, and neither cleans up after itself:
 
 - **Booted iOS simulators** — each booted device keeps a full `launchd_sim` tree alive: SpringBoard plus dozens of iOS widget extensions at 200–330 MB each. One booted device measured **~196 processes**.
 - **Leaked `agent-browser` sessions** — the CLI spawns a detached daemon (PPID 1) plus a ~10-process headless Chrome tree that survives the session that created it. Observed running for **days**, with renderers pinned at ~100% CPU each, ~5 of 10 cores gone.
+
+Plus one that eats disk instead: **the shared cargo target dir** (`build.target-dir` in `~/.cargo/config.toml`, here `~/Library/Caches/cargo-target`) that every Rust project builds into. It only grows — each dependency version, feature set and toolchain leaves its own artifacts — and reached 24 GB before this step existed.
 
 **How to use:**
 
@@ -152,17 +154,21 @@ The two biggest recurring causes of a degraded `mac-health` reading, and neither
 # See what would be cleaned, change nothing (exit 1 = there is work to do)
 mac-dev-cleanup --dry-run
 
-# Clean both
+# Clean everything
 mac-dev-cleanup
 
-# Only one side
+# Only one part
 mac-dev-cleanup --only sim
 mac-dev-cleanup --only browser
+mac-dev-cleanup --only cargo
 
 # Safe to run mid-session: spare agent-browser sessions younger than 2h
 mac-dev-cleanup --min-age 2
 
-# Behaviour checks (29 assertions, no side effects)
+# One-off deeper cargo cleanup: drop what no build used for a week, cap at 15 GiB
+mac-dev-cleanup --only cargo --cargo-days 7 --cargo-max-size 15GiB
+
+# Behaviour checks (50 assertions, no side effects)
 mac-dev-cleanup --selftest
 ```
 
@@ -172,7 +178,8 @@ mac-dev-cleanup --selftest
 |------|--------|
 | agent-browser | Groups Chrome processes into sessions by `--user-data-dir=…/agent-browser-chrome-<uuid>`, links each to its spawning daemon via the root process's PPID, then `agent-browser close --all`, then SIGTERM→SIGKILL any survivor |
 | simulators | `xcrun simctl shutdown all`, then quit Simulator.app via AppleScript, falling back to signals when it refuses |
-| report | Free-memory % and swap before/after |
+| cargo target | Finds the shared target via `cargo metadata` on a throwaway stub project, takes cargo's build locks, then `cargo sweep --time 21` (artifacts no build touched in 21 days) and `cargo sweep --maxsize 20GiB` (least recently used first) |
+| report | Free-memory % and swap before/after (process steps); target size before/after (cargo step) |
 
 **Exit code:** 0 on success. Under `--dry-run`, 1 means there is something to clean — composable as a check like `mac-health`.
 
@@ -185,6 +192,15 @@ mac-dev-cleanup --selftest
 - Simulator.app routinely ignores `quit app "Simulator"`; the signal fallback is the normal path, not an error.
 - Counting these processes by hand with `ps -A | grep -c <pattern>` self-matches the grep and the parent shell. Use a bracket pattern (`'[s]imruntime'`) or the script's own report.
 
+**Cargo step: why it doesn't cause rebuild churn, and its traps:**
+
+- "Last used" is the atime of the files in `.fingerprint/<unit>-<hash>/`: cargo reads the hash file there on every build, fresh or not, to decide whether to recompile. So anything a project still builds keeps a fresh atime and survives; only units that no project has touched in N days go. The price is that a project left alone for 3+ weeks rebuilds its dependencies once.
+- **`cargo sweep --installed` / `--toolchains` poison that signal** — they read every fingerprint `.json` (even with `--dry-run`), stamping the whole target "used today", after which `--time` finds nothing for weeks. The script only uses `--time` / `--maxsize` (stat-only), and before each sweep resets any fingerprint `.json` whose atime is newer than its mtime back to its mtime. Cargo itself reads the `.json` only right before rewriting it, so this loses nothing. Old-toolchain artifacts need no `--installed`: after a `rustup update` nobody uses them, and `--time` collects them.
+- cargo-sweep takes only a project path and resolves the target via `cargo metadata`; pointing it at the target dir itself fails. The stub project in a temp dir keeps the job independent of any real project.
+- If a build holds any of `.cargo-lock` / `.cargo-build-lock` / `.cargo-artifact-lock` (all flock(2)), the step skips the run. While sweeping it holds them itself, so a build that starts meanwhile prints `Blocking waiting for file lock on build directory` and waits (both verified against cargo 1.98).
+- **Size units:** cargo-sweep reads `GB` as 10⁹ and sums apparent file sizes, counting the hardlinks between `incremental/` and `deps/` twice, so its total runs ~5% above `du`. Pass `GiB`.
+- `~/.cargo/registry` needs none of this: cargo ≥1.88 garbage-collects it on its own.
+
 **Scheduled run:** a launchd agent runs the full cleanup **daily at 06:00** (30min after the 5:30AM `pmset repeat wakepoweron`; system sleep is disabled so the machine is reliably awake). Plist lives in the repo at `launchd/com.reorx.mac-dev-cleanup.plist`, symlinked to `~/Library/LaunchAgents/`. Log: `~/Library/Logs/mac-dev-cleanup.log` (each run is stamped — the script prints a timestamp header whenever stdout is not a TTY).
 
 ```bash
@@ -193,12 +209,13 @@ launchctl kickstart -p gui/$(id -u)/com.reorx.mac-dev-cleanup   # force a run no
 launchctl bootout gui/$(id -u)/com.reorx.mac-dev-cleanup        # unload
 ```
 
-It deliberately has **no `RunAtLoad`** — the job kills browsers and simulators, so it must only fire on schedule, never on login or reload.
+It deliberately has **no `RunAtLoad`** — the job kills browsers and simulators, so it must only fire on schedule, never on login or reload. For the same reason, don't `kickstart` it just to test the cargo step; run `mac-dev-cleanup --only cargo` instead. The plist's `PATH` includes `~/.cargo/bin` for that step; after editing the plist, `bootout` + `bootstrap` it, because launchd reads it only at load.
 
 **Typical scenarios:**
 - "Why is my mac hot / loud / slow?" → run `mac-health`; if load or temp is high, run `mac-dev-cleanup --dry-run` **before** investigating anything else — this has been the top cause
 - After finishing browser automation or iOS testing → run `mac-dev-cleanup` as the verification teardown step
 - Periodic hygiene while other sessions may be working → `mac-dev-cleanup --min-age 2`
+- "The cargo target / Rust cache is huge" → `mac-dev-cleanup --only cargo --dry-run`, then run it; lower `--cargo-days` or `--cargo-max-size` for a one-off deeper cut
 
 ## macOS WindowServer Diagnostics
 
@@ -373,7 +390,7 @@ sfltool dumpbtm > /tmp/btm.txt
 
 **Prerequisites:** macOS only. Pure stdlib Python ≥3.10 — no `uv`, no third-party deps. Wraps `launchctl list`, `crontab -l`, and `plutil` (fallback for root-owned plists).
 
-`launchctl list` and the plist directories each tell half the story: **a plist can sit on disk without ever being loaded**, and a loaded job can be resident rather than scheduled. This script joins both, classifies every job by cadence, and folds in crontab — where a leading `#` silently disables an entry.
+`launchctl list` and the plist directories each tell half the story: **a plist can sit on disk without ever being loaded**, and a loaded job can be resident rather than scheduled. This script joins both, classifies every job by cadence, and folds in crontab — where a leading `#` silently disables an entry. It also says **who owns each plist** (the `↳` line), since the jobs on this machine are installed four different ways and nothing else records which repo a plist came from.
 
 **How to use:**
 
@@ -381,9 +398,10 @@ sfltool dumpbtm > /tmp/btm.txt
 launchd-list.py                 # non-Apple jobs, grouped by cadence
 launchd-list.py --periodic      # only things that run on a schedule (+ cron)
 launchd-list.py --all           # include Apple's own (also scans /System/Library/Launch*)
-launchd-list.py --label grafana # filter by label or command substring
-launchd-list.py --json          # structured output
-launchd-list.py --selftest      # 39 behaviour checks, no side effects
+launchd-list.py --label grafana # filter by label, command or origin substring
+launchd-list.py --label macos-monitoring  # everything installed from one repo
+launchd-list.py --json          # structured output (`source` = plist dir, `origin` = owner)
+launchd-list.py --selftest      # 62 behaviour checks, no side effects
 ```
 
 **Categories:**
@@ -398,12 +416,26 @@ launchd-list.py --selftest      # 39 behaviour checks, no side effects
 
 **State column:** `[on ]` loaded, `[off]` plist present but **not** loaded, `[ ? ]` unknown. A running job also shows its `pid`; a job whose last run failed shows `exit N`.
 
+**Origin (`↳` line), first rule that matches wins:**
+
+| Origin | Meaning |
+|--------|---------|
+| `link → <path>` | The plist is a symlink; edit the target. `(broken)` = it points at nothing |
+| `copy of <repo path>` | A plist with the same filename exists in a repo's `launchd/` dir (`~/Code/*/launchd`, `~/Code/*/skills/*/launchd`, `~/Documents/*/launchd` — one glob level, no deep walk into iCloud). `(differs)` = the installed copy has drifted; re-run that repo's installer |
+| `brew services: <formula>` | `homebrew.mxcl.*` / `sh.brew.*`, managed by `brew services` |
+| `app: <Name>.app` | The program lives inside that app bundle (outermost bundle wins) |
+| `local file, program in ~/Code/<repo>` | A plain file, most likely written by the tool's own `install` command; the repo comes from the program path, its symlink target, or `WorkingDirectory` |
+| `local file` | Nothing above matched — hand-placed or third-party |
+
+Crontab rows need no origin line; Apple's `/System` jobs (under `--all`) get none either.
+
 **How to interpret results:**
 
 - **`[off]` is the finding worth chasing.** It means the plist exists — so it looks installed, and `ls ~/Library/LaunchAgents` suggests it is — but launchd has no record of it, so it never fires. The trailing summary lists these explicitly.
 - `[ ? ]` is normal for `/Library/LaunchDaemons`: those live in the system domain, which a non-root `launchctl list` cannot see. Re-run under `sudo` to resolve them.
 - A schedule beats `KeepAlive` in the classification: a job declaring both is reported as `PERIODIC`, because the schedule is what makes it fire.
 - Crontab entries commented out with `#` are still listed, marked `[off]` — they are easy to forget and invisible to `launchctl` entirely.
+- **A `copy of … (differs)` origin is the other finding worth chasing**: the repo was edited but never reinstalled, so the running job still uses the old plist. The trailing summary lists these, and any broken symlinks, explicitly.
 
 **Typical scenarios:**
 - "What runs periodically on this Mac?" → `launchd-list.py --periodic`
@@ -411,6 +443,7 @@ launchd-list.py --selftest      # 39 behaviour checks, no side effects
 - "Is my scheduled cleanup/backup actually armed?" → `launchd-list.py --label cleanup` and check the state marker and schedule
 - "Which of my jobs are failing?" → run it and read the "non-zero last exit" summary line
 - Auditing a new machine, or diffing before/after an install → `launchd-list.py --json` snapshots
+- "Where does this job's plist come from / which file do I edit?" → `launchd-list.py --label <name>` and read the `↳` line
 
 ## PostgreSQL Service Recovery
 

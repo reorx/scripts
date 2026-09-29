@@ -14,9 +14,10 @@
     <dict>
         <!-- The `#!/usr/bin/env -S uv run --script` shebang needs uv (~/.local/bin),
              and the script itself shells out to agent-browser (/opt/homebrew/bin),
-             xcrun + osascript + memory_pressure (/usr/bin) and sysctl (/usr/sbin). -->
+             cargo + cargo-sweep (~/.cargo/bin), xcrun + osascript + memory_pressure
+             (/usr/bin) and sysctl (/usr/sbin). -->
         <key>PATH</key>
-        <string>/Users/reorx/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <string>/Users/reorx/.local/bin:/Users/reorx/.cargo/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     </dict>
 
     <!-- 06:00 daily = 30min after the 5:30AM `pmset repeat wakepoweron`.

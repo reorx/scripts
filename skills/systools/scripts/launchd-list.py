@@ -6,7 +6,9 @@ Answers "which of my scripts run periodically, and are they really armed?".
 System Settings and `launchctl list` each tell half the story: a plist can sit
 on disk without being loaded, and a loaded job can be resident rather than
 scheduled. This flattens both into one table, classified by cadence, and folds
-in crontab (where a leading `#` silently disables an entry).
+in crontab (where a leading `#` silently disables an entry). Each plist also gets
+an origin line: symlink target, repo copy (flagging drift), brew, app bundle, or
+local file — nothing else on the machine records which repo a plist came from.
 
 Sources: ~/Library/LaunchAgents, /Library/LaunchAgents, /Library/LaunchDaemons,
 `launchctl list`, and `crontab -l`.
@@ -26,11 +28,14 @@ Usage examples:
 # ///
 
 import argparse
+import glob
 import json
+import os
 import plistlib
 import re
 import subprocess
 import sys
+import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -55,6 +60,19 @@ PERIODIC, TRIGGERED, RESIDENT, ONDEMAND, UNREADABLE = (
 )
 CATEGORY_ORDER = [PERIODIC, TRIGGERED, RESIDENT, ONDEMAND, UNREADABLE]
 
+# Where repo-managed plists live. A plist with the same filename in one of these was
+# installed from that repo (e.g. copied by macos-monitoring's install-launchd.sh).
+# One glob level only: ~/Documents sits in iCloud, so no deep walks there.
+REPO_PLIST_GLOBS = [
+    '~/Code/*/launchd/*.plist',
+    '~/Code/*/skills/*/launchd/*.plist',
+    '~/Documents/*/launchd/*.plist',
+]
+CODE_ROOT = Path.home() / 'Code'
+BREW_LABEL_PREFIXES = ('homebrew.mxcl.', 'sh.brew.')
+APP_BUNDLE_RE = re.compile(r'/([^/]+\.app)(?:/|$)')
+DIFFERS, BROKEN = ' (differs)', ' (broken)'
+
 # @reboot-style shorthands plus a plain 5-field schedule.
 CRON_SPECIAL_RE = re.compile(r'^@(reboot|yearly|annually|monthly|weekly|daily|midnight|hourly)\s+(\S.*)$')
 CRON_FIELD = r'[0-9*/,\-]+'
@@ -72,6 +90,7 @@ class Job:
     pid: int | None = None
     last_exit: int | None = None
     enabled: bool = True  # cron entries commented out are disabled
+    origin: str = ''  # who owns the plist: symlink target, repo copy, brew, app, or local file
 
 
 # ── Pure parsing ────────────────────────────────────────────
@@ -136,6 +155,62 @@ def describe_program(d: dict) -> str:
     if args:
         return ' '.join(str(a) for a in args)
     return str(d.get('Program', ''))
+
+
+def shorten(path: str, home: str = str(Path.home())) -> str:
+    """Abbreviate the home directory to ~."""
+    if path == home or path.startswith(home + '/'):
+        return '~' + path[len(home) :]
+    return path
+
+
+def code_repo_hint(paths: list[str], code_root: Path) -> Path | None:
+    """Return the <code_root>/<repo> that the first matching path lives in."""
+    for p in paths:
+        path = Path(p)
+        if path != code_root and path.is_relative_to(code_root):
+            return code_root / path.relative_to(code_root).parts[0]
+    return None
+
+
+def index_repo_plists(patterns: list[str]) -> dict[str, Path]:
+    """Map plist filename → its copy in a repo; the first match in sorted order wins."""
+    index: dict[str, Path] = {}
+    for pattern in patterns:
+        for match in sorted(glob.glob(os.path.expanduser(pattern))):
+            index.setdefault(os.path.basename(match), Path(match))
+    return index
+
+
+def describe_origin(path: Path, d: dict | None, repo_index: dict[str, Path], code_root: Path = CODE_ROOT) -> str:
+    """Say who owns a plist: a symlink target, a repo copy, brew, an app bundle, or nobody."""
+    if path.is_symlink():
+        target = path.parent / os.readlink(path)
+        return f'link → {shorten(str(target))}' + ('' if target.exists() else BROKEN)
+
+    d = d or {}
+    label = d.get('Label', path.stem)
+    for prefix in BREW_LABEL_PREFIXES:
+        if label.startswith(prefix):
+            return f'brew services: {label.removeprefix(prefix)}'
+
+    repo_copy = repo_index.get(path.name)
+    if repo_copy:
+        drift = '' if repo_copy.read_bytes() == path.read_bytes() else DIFFERS
+        return f'copy of {shorten(str(repo_copy))}{drift}'
+
+    # launchd execs Program when set; ProgramArguments[0] is then only argv[0].
+    program = str(d.get('Program') or (d.get('ProgramArguments') or [''])[0])
+    app = APP_BUNDLE_RE.search(program)
+    if app:
+        return f'app: {app.group(1)}'
+
+    # Self-installing tools (cc-renewer, warpway, …) write their own plist; the repo
+    # they come from shows up in the program path, its symlink target, or the cwd.
+    candidates = [program, os.path.realpath(program)] if program else []
+    candidates.append(d.get('WorkingDirectory', ''))
+    repo = code_repo_hint([c for c in candidates if c], code_root)
+    return f'local file, program in {shorten(str(repo))}' if repo else 'local file'
 
 
 def parse_launchctl_list(output: str) -> dict[str, tuple[int | None, int | None]]:
@@ -210,6 +285,84 @@ def check(name: str, got, want) -> None:
         print(f'  ❌ {name}\n       got:  {got!r}\n       want: {want!r}')
 
 
+def selftest_origin(root: Path) -> None:
+    """index_repo_plists / describe_origin against a throwaway tree under `root`."""
+    code = root / 'Code'
+    repo_launchd = code / 'monitoring' / 'launchd'
+    skill_launchd = code / 'scripts' / 'skills' / 'tool' / 'launchd'
+    agents = root / 'LaunchAgents'
+    for directory in (repo_launchd, skill_launchd, agents, root / 'bin', code / 'clash' / 'bin'):
+        directory.mkdir(parents=True)
+    (repo_launchd / 'com.local.same.plist').write_bytes(b'same')
+    (repo_launchd / 'com.local.drift.plist').write_bytes(b'repo version')
+    (skill_launchd / 'com.reorx.linked.plist').write_bytes(b'linked')
+    (agents / 'com.local.same.plist').write_bytes(b'same')
+    (agents / 'com.local.drift.plist').write_bytes(b'hand edited')
+    (agents / 'com.reorx.linked.plist').symlink_to(skill_launchd / 'com.reorx.linked.plist')
+    (agents / 'com.gone.plist').symlink_to(root / 'nowhere.plist')
+    (agents / 'local.plist').write_bytes(b'x')
+    (code / 'clash' / 'bin' / 'tool').write_bytes(b'')
+    (root / 'bin' / 'tool').symlink_to(code / 'clash' / 'bin' / 'tool')
+
+    print('\nindex_repo_plists')
+    index = index_repo_plists([f'{code}/*/launchd/*.plist', f'{code}/*/skills/*/launchd/*.plist'])
+    check(
+        'finds repo launchd dirs',
+        sorted(index),
+        ['com.local.drift.plist', 'com.local.same.plist', 'com.reorx.linked.plist'],
+    )
+    check('maps name to repo path', index['com.local.same.plist'], repo_launchd / 'com.local.same.plist')
+    check('missing dirs are fine', index_repo_plists([f'{root}/nope/*/launchd/*.plist']), {})
+
+    def origin(name: str, d: dict | None = None) -> str:
+        return describe_origin(agents / name, d, index, code)
+
+    print('\ndescribe_origin')
+    check(
+        'symlink → its target, even with a repo copy',
+        origin('com.reorx.linked.plist'),
+        f'link → {skill_launchd / "com.reorx.linked.plist"}',
+    )
+    check('dangling symlink flagged', origin('com.gone.plist'), f'link → {root / "nowhere.plist"} (broken)')
+    check('identical repo copy', origin('com.local.same.plist'), f'copy of {repo_launchd / "com.local.same.plist"}')
+    check(
+        'drifted repo copy flagged',
+        origin('com.local.drift.plist'),
+        f'copy of {repo_launchd / "com.local.drift.plist"} (differs)',
+    )
+    check('homebrew.mxcl → brew', origin('local.plist', {'Label': 'homebrew.mxcl.redis'}), 'brew services: redis')
+    check('sh.brew → brew', origin('local.plist', {'Label': 'sh.brew.mysql@9.7'}), 'brew services: mysql@9.7')
+    check(
+        'outermost app bundle owns it',
+        origin('local.plist', {'ProgramArguments': ['/Applications/OneDrive.app/Contents/U.app/Contents/MacOS/u']}),
+        'app: OneDrive.app',
+    )
+    check(
+        'program in a ~/Code repo',
+        origin('local.plist', {'ProgramArguments': [f'{code}/warpway/warpway', 'serve']}),
+        f'local file, program in {code / "warpway"}',
+    )
+    check(
+        'WorkingDirectory in a ~/Code repo',
+        origin(
+            'local.plist', {'ProgramArguments': ['/usr/local/bin/uv', 'run'], 'WorkingDirectory': f'{code}/condenser'}
+        ),
+        f'local file, program in {code / "condenser"}',
+    )
+    check(
+        'symlinked program resolved into its repo',
+        origin('local.plist', {'ProgramArguments': [str(root / 'bin' / 'tool'), 'run']}),
+        f'local file, program in {code / "clash"}',
+    )
+    check(
+        'Program wins over ProgramArguments',
+        origin('local.plist', {'Program': f'{code}/x/bin', 'ProgramArguments': ['/bin/sh']}),
+        f'local file, program in {code / "x"}',
+    )
+    check('plain local file', origin('local.plist', {'ProgramArguments': ['/opt/homebrew/bin/x']}), 'local file')
+    check('unparseable plist still gets an origin', origin('local.plist'), 'local file')
+
+
 def selftest() -> int:
     print('describe_interval')
     check('hours', describe_interval(3600), 'every 1h')
@@ -279,6 +432,27 @@ def selftest() -> int:
     check('env assignment ignored', [c for c in cron if c.program.startswith('SHELL')], [])
     check('all cron rows are periodic', {c.category for c in cron}, {PERIODIC})
 
+    print('\nshorten')
+    check('home abbreviated', shorten('/Users/x/Code/a', home='/Users/x'), '~/Code/a')
+    check('home itself', shorten('/Users/x', home='/Users/x'), '~')
+    check('sibling prefix untouched', shorten('/Users/xy/a', home='/Users/x'), '/Users/xy/a')
+    check('outside home untouched', shorten('/opt/homebrew/bin/x', home='/Users/x'), '/opt/homebrew/bin/x')
+
+    print('\ncode_repo_hint')
+    code = Path('/Users/x/Code')
+    check('program inside a repo', code_repo_hint(['/Users/x/Code/warpway/warpway'], code), code / 'warpway')
+    check('outside ~/Code → none', code_repo_hint(['/Users/x/go/bin/pinchtab'], code), None)
+    check(
+        'later candidate used',
+        code_repo_hint(['/Users/x/.local/bin/uv', '/Users/x/Code/condenser/probe'], code),
+        code / 'condenser',
+    )
+    check('~/Code itself is not a repo', code_repo_hint(['/Users/x/Code'], code), None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # resolve(): /var/folders is a symlink to /private/var, and realpath() sees through it.
+        selftest_origin(Path(tmp).resolve())
+
     print()
     if _FAILED:
         print(f'❌ {_FAILED} check(s) failed')
@@ -314,21 +488,25 @@ def crontab_jobs() -> list[Job]:
 
 def collect_jobs(include_apple: bool) -> list[Job]:
     loaded = launchctl_loaded()
+    repo_index = index_repo_plists(REPO_PLIST_GLOBS)
     jobs: list[Job] = []
 
     for directory, tag in PLIST_DIRS + (SYSTEM_PLIST_DIRS if include_apple else []):
         if not directory.is_dir():
             continue
+        # Apple's own directories need no attribution.
+        is_system = (directory, tag) in SYSTEM_PLIST_DIRS
         for path in sorted(directory.iterdir()):
             if path.suffix != '.plist':
                 continue
             d = load_plist(path)
             if d is None:
-                jobs.append(Job(path.stem, UNREADABLE, '', '', tag))
+                jobs.append(Job(path.stem, UNREADABLE, '', '', tag, origin=describe_origin(path, None, repo_index)))
                 continue
             label = d.get('Label', path.stem)
             if not include_apple and label.startswith('com.apple.'):
                 continue
+            origin = '' if is_system else describe_origin(path, d, repo_index)
             category, schedule = classify(d)
             pid, last_exit = loaded.get(label, (None, None))
             if label in loaded:
@@ -337,7 +515,9 @@ def collect_jobs(include_apple: bool) -> list[Job]:
                 is_loaded = None  # system domain, invisible without sudo
             else:
                 is_loaded = False
-            jobs.append(Job(label, category, schedule, describe_program(d), tag, is_loaded, pid, last_exit))
+            jobs.append(
+                Job(label, category, schedule, describe_program(d), tag, is_loaded, pid, last_exit, origin=origin)
+            )
 
     jobs.extend(crontab_jobs())
     return jobs
@@ -373,11 +553,22 @@ def render(jobs: list[Job]) -> None:
             print(f'  {state_marker(job)} {job.source:4} {job.label:<44} {job.schedule}{note}')
             if job.program:
                 print(f'        {job.program[:150]}')
+            if job.origin:
+                print(f'        ↳ {job.origin}')
 
     stale = [j for j in jobs if j.source != 'cron' and j.loaded is False]
     disabled_cron = [j for j in jobs if j.source == 'cron' and not j.enabled]
     failing = [j for j in jobs if j.last_exit]
+    drifted = [j for j in jobs if j.origin.endswith(DIFFERS)]
+    broken = [j for j in jobs if j.origin.endswith(BROKEN)]
     print()
+    if drifted:
+        print(
+            f"{len(drifted)} installed plist(s) differ from their repo copy (re-run that repo's installer): "
+            f'{", ".join(j.label for j in drifted)}'
+        )
+    if broken:
+        print(f'{len(broken)} plist symlink(s) point at nothing: {", ".join(j.label for j in broken)}')
     if stale:
         print(f'{len(stale)} plist(s) present but NOT loaded: {", ".join(j.label for j in stale)}')
     if disabled_cron:
@@ -397,7 +588,9 @@ def main() -> int:
     parser.add_argument(
         '--all', action='store_true', help="Include Apple's own jobs (also scans /System/Library/Launch*)"
     )
-    parser.add_argument('--label', metavar='SUBSTR', help='Filter by label substring (case-insensitive)')
+    parser.add_argument(
+        '--label', metavar='SUBSTR', help='Filter by substring of label, command or origin (case-insensitive)'
+    )
     parser.add_argument('--json', action='store_true', help='Structured output')
     parser.add_argument('--selftest', action='store_true', help='Run behaviour checks and exit')
     args = parser.parse_args()
@@ -414,7 +607,7 @@ def main() -> int:
         jobs = [j for j in jobs if j.category == PERIODIC]
     if args.label:
         needle = args.label.lower()
-        jobs = [j for j in jobs if needle in j.label.lower() or needle in j.program.lower()]
+        jobs = [j for j in jobs if needle in f'{j.label} {j.program} {j.origin}'.lower()]
 
     if args.json:
         print(json.dumps([asdict(j) for j in jobs], indent=2))

@@ -18,3 +18,19 @@
 - 记录：2026-09-23
 - `BAR_STYLE = 'on #5a4a1e'` 是 Rich 样式，拿不到 textual 主题变量；默认深色主题下清晰，从命令面板切到浅色主题时深色文字压在深色条上会发暗。
 - 处理方向：在 `watch_theme` 里按 `self.current_theme.dark` 切换两套条色。
+
+## mac-dev-cleanup：cargo 一步撞上构建就整天跳过，不补跑
+
+- 记录：2026-09-29
+- 06:00 那一刻若有 cargo 构建持有 target 锁，这一步只打一行「skipped this run」就结束，要等第二天。实现时就这么简化了：共享 target 一天不清理问题不大，加重试反而可能和长时间的 release 构建一直撞。
+- 若日志里经常出现 skipped，再改成隔几分钟重试几次。
+
+## mac-dev-cleanup：cargo 一步只清共享 target，不管项目自带的 target/
+
+- 记录：2026-09-29
+- 只清 `~/.cargo/config.toml` 里 `build.target-dir` 指向的那个目录。项目用 `.cargo/config.toml` 改回本地 `target/` 的不在范围内。要覆盖它们，可以用 cargo-sweep 的 `-r` 扫 `~/Code`，但那会逐个跑 `cargo metadata`，更慢，也更容易误伤。
+
+## com.reorx.mac-dev-cleanup.plist 注释里有 `--`，严格 XML 解析器读不了
+
+- 记录：2026-09-29（早就存在，这次才发现）
+- 注释里引用的 shebang `uv run --script` 含 `--`，XML 规范不允许注释里出现它。launchd 和 plutil 能容忍，所以任务一直正常；Python 的 `plistlib`（expat）会直接报错，launchd-list 靠 plutil 兜底才读得出来。想彻底消除，就把注释里的 `--script` 改写掉。

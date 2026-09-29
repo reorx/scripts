@@ -2,26 +2,31 @@
 # /// script
 # requires-python = ">=3.11"
 # ///
-"""Release macOS dev test resources: booted iOS simulators and agent-browser Chrome trees.
+"""Release macOS dev resources: booted iOS simulators, agent-browser Chrome trees, and
+stale Rust build artifacts in the shared cargo target dir.
 
-Neither cleans up after itself. A booted simulator keeps a full launchd_sim tree of
+None of them cleans up after itself. A booted simulator keeps a full launchd_sim tree of
 iOS daemons and widget extensions alive (hundreds of processes, GBs of RAM); a leaked
 agent-browser session keeps a ~10-process headless Chrome tree spinning at ~100% CPU
-per renderer, indefinitely.
+per renderer, indefinitely; and a target dir shared by every Rust project only grows.
 
 Exit code: 0 on success. With --dry-run, 1 means there is something to clean (so it
 composes as a check, like mac-health).
 """
 
 import argparse
+import fcntl
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # Chrome's --user-data-dir is what ties a process to an agent-browser session, and is
 # the only reliable discriminator from the user's own Chrome.
@@ -333,6 +338,164 @@ def cleanup_simulators(dry_run: bool) -> int:
     return (runtime_procs - left) + (len(app_pids) - app_left)
 
 
+# ── cargo target cleanup ────────────────────────────────────
+# What cargo-sweep reports per target dir, e.g. `[INFO] Cleaned 4.51 GiB from "…"`.
+SWEEP_RESULT_RE = re.compile(r"(?:Cleaned|Would clean:) (nothing|[\d.]+ (?:B|KiB|MiB|GiB|TiB)) from")
+BYTE_UNITS = {"B": 1, "KiB": 1024, "MiB": 1024**2, "GiB": 1024**3, "TiB": 1024**4}
+
+# cargo-sweep only accepts a project path and finds the target dir via `cargo metadata`.
+# An empty project with no local override resolves to the global build.target-dir, so
+# the sweep never depends on any real project still existing.
+STUB_MANIFEST = '[package]\nname = "mac-dev-cleanup-stub"\nversion = "0.0.0"\nedition = "2021"\n'
+
+
+def parse_sweep_bytes(output: str) -> int | None:
+    """Bytes cargo-sweep says it cleaned (or would clean). None when it printed no result."""
+    sizes = SWEEP_RESULT_RE.findall(output)
+    if not sizes:
+        return None
+    total = 0
+    for size in sizes:
+        if size != "nothing":
+            number, unit = size.split()
+            total += int(float(number) * BYTE_UNITS[unit])
+    return total
+
+
+def pick_shared_target(metadata_json: str, stub: Path) -> Path | None:
+    """The target dir `cargo metadata` reports for the stub, or None if it is the stub's own."""
+    target = Path(json.loads(metadata_json)["target_directory"])
+    # Resolve both sides: macOS temp dirs live under /var, which cargo may report as /private/var.
+    if target.resolve().is_relative_to(stub.resolve()):
+        return None
+    return target
+
+
+def human_bytes(size: float) -> str:
+    if size < 1024:
+        return f"{size:.0f} B"
+    for unit in ("KiB", "MiB", "GiB"):
+        size /= 1024
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+    return f"{size / 1024:.1f} TiB"
+
+
+def reset_polluted_atimes(target: Path, dry_run: bool) -> int:
+    """Set fingerprint JSONs read since cargo last wrote them back to atime = mtime.
+
+    cargo-sweep ranks artifacts by the newest atime in each .fingerprint/<unit>/ dir, and
+    cargo's freshness check reads only the hash file there, so that atime is a true
+    "last used by a build". The JSON is read by cargo only right before rewriting it, but
+    `cargo sweep --installed` (even with --dry-run) reads every one, which makes the whole
+    target look used today and silently disables the time-based sweep for weeks.
+    """
+    count = 0
+    for path in target.glob("*/.fingerprint/*/*.json"):
+        stat = path.stat()
+        if stat.st_atime_ns > stat.st_mtime_ns:
+            count += 1
+            if not dry_run:
+                os.utime(path, ns=(stat.st_mtime_ns, stat.st_mtime_ns))
+    return count
+
+
+def lock_target(target: Path) -> list[int] | None:
+    """Take every cargo build lock in the target without blocking. None if cargo holds one.
+
+    Holding them for the sweep makes a build that starts meanwhile wait, instead of
+    reading artifacts as they are deleted. Cargo takes these with flock(2), as does
+    fcntl.flock. The profile dirs (debug/, release/) hold the host locks, which cargo
+    takes even for --target builds.
+    """
+    fds = []
+    for path in sorted(target.glob("*/.cargo*lock")):
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            for taken in fds:
+                os.close(taken)
+            return None
+        fds.append(fd)
+    return fds
+
+
+def dir_size(path: Path) -> int:
+    """Disk usage in bytes. `du` counts hardlinks once, and incremental objects are hardlinked."""
+    return int(run(["du", "-sk", str(path)], timeout=300).stdout.split()[0]) * 1024
+
+
+def sweep_target(cargo: str, stub: Path, target: Path, keep_days: int, max_size: str, dry_run: bool) -> int:
+    """Run the time sweep, then the size cap. Returns bytes cleaned (or that would be)."""
+    before = dir_size(target)
+    print(f"  {target}  {human_bytes(before)}")
+
+    polluted = reset_polluted_atimes(target, dry_run)
+    if polluted and dry_run:
+        print(f"  [dry-run] would reset atime on {polluted} fingerprint json(s) read outside cargo; estimates below run low")
+    elif polluted:
+        print(f"  reset atime on {polluted} fingerprint json(s) read outside cargo")
+
+    total = 0
+    passes = [(f"unused > {keep_days}d", ["--time", str(keep_days)]), (f"cap {max_size}", ["--maxsize", max_size])]
+    for label, criterion in passes:
+        cmd = [cargo, "sweep", *criterion, *(["--dry-run"] if dry_run else []), str(stub)]
+        result = run(cmd, timeout=600)
+        cleaned = parse_sweep_bytes(result.stdout + result.stderr)
+        if cleaned is None:
+            tail = (result.stderr or result.stdout).strip().splitlines()[-1:] or ["no output"]
+            print(f"  {DANGER_MARKER} {label}: cargo sweep failed: {tail[0][:200]}")
+            continue
+        total += cleaned
+        print(f"  {label:<16} {'would clean' if dry_run else 'cleaned'} {human_bytes(cleaned)}")
+
+    if not dry_run:
+        print(f"✅ done, {human_bytes(before)} → {human_bytes(dir_size(target))}")
+    return total
+
+
+def cleanup_cargo(keep_days: int, max_size: str, dry_run: bool) -> int:
+    """Sweep the shared cargo target dir. Returns bytes cleaned (or that would be)."""
+    print("── cargo target ───────────────────────────────────")
+    cargo = shutil.which("cargo")
+    if not cargo:
+        print("cargo not found, skipped")
+        return 0
+    if not shutil.which("cargo-sweep"):
+        print(f"{DANGER_MARKER} cargo-sweep not installed (`cargo install cargo-sweep`), skipped")
+        return 0
+
+    with tempfile.TemporaryDirectory(prefix="mac-dev-cleanup-") as tmp:
+        stub = Path(tmp)
+        (stub / "Cargo.toml").write_text(STUB_MANIFEST)
+        (stub / "src").mkdir()
+        (stub / "src/lib.rs").touch()
+
+        meta = run([cargo, "metadata", "--no-deps", "--format-version", "1", "--manifest-path", str(stub / "Cargo.toml")])
+        if meta.returncode != 0:
+            print(f"{DANGER_MARKER} cargo metadata failed: {meta.stderr.strip()[:200]}")
+            return 0
+        target = pick_shared_target(meta.stdout, stub)
+        if target is None:
+            print("no shared build.target-dir configured, nothing to sweep")
+            return 0
+        if not target.is_dir():
+            print(f"{target} does not exist yet, nothing to sweep")
+            return 0
+
+        fds = lock_target(target)
+        if fds is None:
+            print(f"a cargo build is using {target}, skipped this run")
+            return 0
+        try:
+            return sweep_target(cargo, stub, target, keep_days, max_size, dry_run)
+        finally:
+            for fd in fds:
+                os.close(fd)
+
+
 # ── Self tests (behaviour spec) ─────────────────────────────
 PS_FIXTURE = """\
   PID  PPID     ELAPSED  %CPU COMMAND
@@ -424,6 +587,84 @@ def selftest() -> int:
     check("human_age hours", human_age(83530), "23h12m")
     check("human_age minutes", human_age(530), "8m50s")
 
+    print("\ncargo: parse_sweep_bytes")
+    check("cleaned GiB", parse_sweep_bytes('[INFO] Cleaned 4.51 GiB from "/c/cargo-target"\n'), int(4.51 * 1024**3))
+    check("would clean KiB", parse_sweep_bytes('[INFO] Would clean: 21.69 KiB from "/c"'), int(21.69 * 1024))
+    check("plain bytes", parse_sweep_bytes('[INFO] Cleaned 512.00 B from "/c"'), 512)
+    check("nothing → 0", parse_sweep_bytes('[INFO] Cleaned nothing from "/c"'), 0)
+    # cargo-sweep logs its failures and still exits 0, so "no result line" is the failure signal.
+    check("error output → None", parse_sweep_bytes('Error: Failed to gather metadata for "/c"'), None)
+
+    print("\ncargo: pick_shared_target")
+    stub = Path("/var/folders/zz/T/mac-dev-cleanup-stub")
+    check(
+        "configured target-dir is picked",
+        pick_shared_target('{"target_directory": "/Users/me/Library/Caches/cargo-target"}', stub),
+        Path("/Users/me/Library/Caches/cargo-target"),
+    )
+    check(
+        "stub-local target → None (no target-dir configured)",
+        pick_shared_target('{"target_directory": "/var/folders/zz/T/mac-dev-cleanup-stub/target"}', stub),
+        None,
+    )
+    check(
+        "/private/var alias of the stub → still None",
+        pick_shared_target('{"target_directory": "/private/var/folders/zz/T/mac-dev-cleanup-stub/target"}', stub),
+        None,
+    )
+
+    print("\ncargo: human_bytes")
+    check("GiB", human_bytes(19.5 * 1024**3), "19.5 GiB")
+    check("MiB", human_bytes(21 * 1024**2), "21.0 MiB")
+    check("bytes", human_bytes(512), "512 B")
+
+    print("\ncargo: reset_polluted_atimes")
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp)
+        polluted = target / "debug/.fingerprint/foo-1234abcd/lib-foo.json"
+        clean = target / "release/.fingerprint/bar-5678abcd/lib-bar.json"
+        hash_file = polluted.with_name("lib-foo")
+        for path in (polluted, clean, hash_file):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}")
+        mtime = 1_700_000_000_000_000_000
+        os.utime(polluted, ns=(mtime + 86_400 * 10**9, mtime))  # read a day after cargo wrote it
+        os.utime(clean, ns=(mtime, mtime))
+        os.utime(hash_file, ns=(mtime + 3600 * 10**9, mtime))  # cargo's own freshness read
+        check("dry-run counts only the polluted json", reset_polluted_atimes(target, dry_run=True), 1)
+        check("dry-run changes nothing", polluted.stat().st_atime_ns, mtime + 86_400 * 10**9)
+        check("reset counts the polluted json", reset_polluted_atimes(target, dry_run=False), 1)
+        check("json atime is back to its mtime", polluted.stat().st_atime_ns, mtime)
+        check("json mtime preserved", polluted.stat().st_mtime_ns, mtime)
+        check("SAFETY: hash file atime (the real LRU signal) untouched", hash_file.stat().st_atime_ns, mtime + 3600 * 10**9)
+        check("second pass finds nothing", reset_polluted_atimes(target, dry_run=False), 0)
+
+    print("\ncargo: lock_target")
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp)
+        locks = [target / "debug/.cargo-lock", target / "debug/.cargo-build-lock", target / "release/.cargo-lock"]
+        for path in locks:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.touch()
+        fds = lock_target(target)
+        check("idle target → takes every lock", len(fds or []), 3)
+        for fd in fds or []:
+            os.close(fd)
+        # A running cargo holds one of them (possibly shared, e.g. the artifact lock).
+        busy = os.open(locks[2], os.O_RDONLY)
+        fcntl.flock(busy, fcntl.LOCK_SH)
+        check("a lock held by cargo → None", lock_target(target), None)
+        probe = os.open(locks[0], os.O_RDONLY)
+        try:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            released = True
+        except BlockingIOError:
+            released = False
+        check("backing off releases the locks it already took", released, True)
+        os.close(probe)
+        os.close(busy)
+        check("no lock files → nothing to take", lock_target(target / "missing"), [])
+
     print()
     if _FAILED:
         print(f"❌ {_FAILED} check(s) failed")
@@ -435,14 +676,14 @@ def selftest() -> int:
 # ── Main ────────────────────────────────────────────────────
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Release iOS simulator and agent-browser test resources",
+        description="Release iOS simulator, agent-browser and cargo target resources",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-n", "--dry-run", action="store_true", help="Report what would be cleaned, change nothing")
     parser.add_argument(
         "--only",
-        choices=["sim", "browser"],
-        help="Clean only simulators, or only agent-browser (default: both)",
+        choices=["sim", "browser", "cargo"],
+        help="Clean only simulators, only agent-browser, or only the cargo target (default: all)",
     )
     parser.add_argument(
         "--min-age",
@@ -451,6 +692,22 @@ def main() -> int:
         metavar="HOURS",
         help="Only reap agent-browser sessions older than HOURS (default: 0 = all). "
         "Use e.g. --min-age 2 to run this while a session is actively driving a browser.",
+    )
+    parser.add_argument(
+        "--cargo-days",
+        type=int,
+        default=21,
+        metavar="DAYS",
+        help="Remove cargo artifacts no build has used for DAYS (default: 21)",
+    )
+    # cargo-sweep reads "GB" as 10^9 and sums apparent file sizes, counting the hardlinks
+    # between incremental/ and deps/ twice, so its total runs ~5% above `du`. Use GiB.
+    parser.add_argument(
+        "--cargo-max-size",
+        default="20GiB",
+        metavar="SIZE",
+        help="Then remove least recently used artifacts until the target fits SIZE, as cargo-sweep "
+        "measures it: apparent size, a bit above du (default: 20GiB; note GB means 10^9)",
     )
     parser.add_argument("--selftest", action="store_true", help="Run behaviour checks and exit")
     args = parser.parse_args()
@@ -466,24 +723,32 @@ def main() -> int:
     if not sys.stdout.isatty():
         print(f"═══ mac-dev-cleanup {time.strftime('%Y-%m-%d %H:%M:%S')} ═══")
 
-    free_before, swap_before = mem_stats()
+    targets = [args.only] if args.only else ["browser", "sim", "cargo"]
+    # Only processes affect memory; the cargo sweep frees disk.
+    track_memory = "browser" in targets or "sim" in targets
+    if track_memory:
+        free_before, swap_before = mem_stats()
 
     found = 0
-    if args.only != "sim":
+    if "browser" in targets:
         found += cleanup_agent_browser(args.min_age, args.dry_run)
         print()
-    if args.only != "browser":
+    if "sim" in targets:
         found += cleanup_simulators(args.dry_run)
         print()
+    if "cargo" in targets:
+        found += cleanup_cargo(args.cargo_days, args.cargo_max_size, args.dry_run)
+        print()
 
-    free_after, swap_after = mem_stats()
-    parts = []
-    if free_before is not None and free_after is not None:
-        parts.append(f"free memory {free_before:.0f}% → {free_after:.0f}%")
-    if swap_before is not None and swap_after is not None:
-        parts.append(f"swap {swap_before:.2f}G → {swap_after:.2f}G")
-    if parts and not args.dry_run:
-        print("  ".join(parts))
+    if track_memory and not args.dry_run:
+        free_after, swap_after = mem_stats()
+        parts = []
+        if free_before is not None and free_after is not None:
+            parts.append(f"free memory {free_before:.0f}% → {free_after:.0f}%")
+        if swap_before is not None and swap_after is not None:
+            parts.append(f"swap {swap_before:.2f}G → {swap_after:.2f}G")
+        if parts:
+            print("  ".join(parts))
 
     # Under --dry-run, a non-zero exit means "there is something to clean".
     return 1 if args.dry_run and found else 0
