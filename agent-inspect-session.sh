@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Read-only inspection: no agent/API invocation and no changes to agent settings.
+# Inspection is read-only; --cache-statusline stores Claude callback metrics.
 # Claude formula: https://code.claude.com/docs/en/statusline#context-window-fields
 # Codex window: https://developers.openai.com/codex/config-reference
 
@@ -9,6 +9,7 @@ usage() {
     cat <<'HELP'
 Usage: agent-inspect-session.sh [--json] [--agent codex|claude]
                                 [--context-window TOKENS]
+       agent-inspect-session.sh --cache-statusline < statusline.json
 
 Print agent, session_id and context_percent (used, not remaining).
 Requires Bash and jq. Reads local JSONL transcripts; makes no network requests.
@@ -21,7 +22,20 @@ Session detection:
 Data directories: CODEX_HOME (default ~/.codex) and CLAUDE_CONFIG_DIR
 (default ~/.claude). Only the matching session transcript is inspected.
 
-Codex uses the latest last_token_usage.total_tokens / model_context_window.
+Codex matches its native status line: subtract the fixed 12000-token baseline
+from usage and window, round remaining percent, then subtract it from 100.
+JSON raw_context_percent preserves the unadjusted token/window ratio.
+Source: github.com/openai/codex/blob/main/codex-rs/tui/src/token_usage.rs
+
+Claude prefers official statusline data cached by --cache-statusline. This
+mode reads stdin JSON, caches only session/context metrics atomically under
+CLAUDE_CONFIG_DIR/agent-inspect-session/<session_id>.json, and forwards the
+original JSON to stdout. Chain it before an existing statusline command:
+  /absolute/path/agent-inspect-session.sh --cache-statusline | existing-command
+It uses the callback session_id, not inherited agent environment variables.
+JSON includes updated_at and cache_age_seconds; cached readings may lag the
+live session. No cache means transcript fallback as described below.
+
 Claude uses the latest input_tokens + cache_creation_input_tokens +
 cache_read_input_tokens, excluding output tokens, as its status line does.
 Claude window priority: --context-window, recorded session window, explicit
@@ -32,7 +46,7 @@ or for an unrecognized model. JSON includes context_source for this reason.
 
 Percent is rounded to the nearest integer, clamped to 0..100. It reflects
 the last recorded response, not pending tool results or the live /context
-estimate. Codex UI accounting may subtract reserved tokens and differ.
+estimate. Raw JSON percent is not clamped; native percent is clamped to 0..100.
 Missing usage/window is unknown (JSON null), never a fabricated zero.
 Missing session ID, ambiguous agents and invalid arguments exit nonzero.
 HELP
@@ -50,14 +64,25 @@ find_transcript() {
     done < <(find "$root" -type f -name "$pattern" -print0)
 }
 
+print_result() {
+    if "$json"; then
+        printf '%s\n' "$result"
+    else
+        jq -r '"agent: \(.agent)\nsession_id: \(.session_id)\ncontext_percent: \(if .context_percent == null then "unknown" elif .context_source == "model-default" then "~\(.context_percent)%" else "\(.context_percent)%" end)"' <<< "$result"
+    fi
+}
+
 main() {
     local agent='' session_id='' window='' json=false transcript='' result
+    local cache_mode=false payload cache_file temporary cached
+    local cache_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/agent-inspect-session"
     local codex_id=${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-}}
     local claude_id=${CLAUDE_CODE_SESSION_ID:-}
     while (( $# )); do
         case "$1" in
             --help|-h) usage; return 0 ;;
             --json) json=true; shift ;;
+            --cache-statusline) cache_mode=true; shift ;;
             --agent|--context-window)
                 if (( $# < 2 )); then
                     printf 'Missing value for %s\n' "$1" >&2; return 2
@@ -69,6 +94,33 @@ main() {
     done
     if [[ -n "$window" && ! "$window" =~ ^[1-9][0-9]*$ ]]; then
         echo '--context-window must be a positive integer.' >&2; return 2
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo 'jq is required (macOS: brew install jq).' >&2; return 1
+    fi
+    if "$cache_mode"; then
+        if [[ -n "$agent" || -n "$window" || "$json" == true ]]; then
+            echo '--cache-statusline cannot be combined with query options.' >&2; return 2
+        fi
+        payload=$(cat)
+        # Forward even invalid callback data so an existing renderer still sees it.
+        printf '%s' "$payload"
+        cached=$(jq -ce '
+            select(.session_id | type == "string" and test("^[a-zA-Z0-9_-]+$")) |
+            select(.context_window | type == "object") |
+            select(.context_window.used_percentage == null or
+                (.context_window.used_percentage | type == "number" and . >= 0 and . <= 100)) |
+            {agent:"claude",session_id,context_window,updated_at:(now | floor)}
+        ' <<< "$payload") || { echo 'Invalid Claude statusline data.' >&2; return 1; }
+        session_id=$(jq -r '.session_id' <<< "$cached")
+        mkdir -p "$cache_dir"
+        temporary=$(mktemp "$cache_dir/.${session_id}.XXXXXX")
+        if ! printf '%s\n' "$cached" > "$temporary" ||
+           ! mv -f "$temporary" "$cache_dir/$session_id.json"; then
+            rm -f "$temporary"
+            echo 'Could not write Claude statusline cache.' >&2; return 1
+        fi
+        return 0
     fi
     if [[ -z "$agent" ]]; then
         if [[ -n "$codex_id" && -n "$claude_id" ]]; then
@@ -88,8 +140,32 @@ main() {
     if [[ ! "$session_id" =~ ^[a-zA-Z0-9_-]+$ ]]; then
         echo 'Session ID is missing or contains unsupported characters.' >&2; return 2
     fi
-    if ! command -v jq >/dev/null 2>&1; then
-        echo 'jq is required (macOS: brew install jq).' >&2; return 1
+    cache_file="$cache_dir/$session_id.json"
+    if [[ "$agent" == claude && -f "$cache_file" ]]; then
+        if result=$(jq -ce --arg id "$session_id" --arg override "$window" '
+            select(.agent == "claude" and .session_id == $id) |
+            select(.updated_at | type == "number") |
+            select(.context_window | type == "object") |
+            select(.context_window.used_percentage == null or
+                (.context_window.used_percentage | type == "number" and . >= 0 and . <= 100)) |
+            .context_window as $c |
+            (if $c.current_usage == null then null else ($c.current_usage |
+                .input_tokens + (.cache_creation_input_tokens // 0) +
+                (.cache_read_input_tokens // 0)) end) as $tokens |
+            (if $override == "" then $c.context_window_size else ($override | tonumber) end) as $window |
+            (if ($tokens | type == "number") and ($window | type == "number" and . > 0)
+                then ($tokens / $window * 100 | round) else null end) as $raw |
+            {agent,session_id,updated_at,
+             cache_age_seconds:([0,(now - .updated_at | floor)] | max),
+             context_tokens:$tokens,context_window:$window,raw_context_percent:$raw,
+             context_source:(if $override == "" then "statusline" else "override" end),
+             context_percent:(if $override == "" then $c.used_percentage
+                 elif $raw == null then null else ([0,([100,$raw] | min)] | max) end)}
+        ' "$cache_file" 2>/dev/null); then
+            print_result
+            return 0
+        fi
+        echo 'Invalid statusline cache; falling back to transcript.' >&2
     fi
     if [[ "$agent" == codex ]]; then
         find_transcript "${CODEX_HOME:-$HOME/.codex}/sessions" "*-${session_id}.jsonl"
@@ -145,19 +221,23 @@ main() {
         end |
         {agent: $agent, session_id: $id,
          context_percent: (if (.usage | nonnegative) and (.window | positive)
-             then ([0, ([100, (.usage / .window * 100 | round)] | min)] | max)
+             then if $agent == "codex" then
+                 if .window <= 12000 then 100 else
+                     (.window - 12000) as $effective |
+                     ([0, (.usage - 12000)] | max) as $used |
+                     100 - (([0, ($effective - $used)] | max) / $effective * 100 | round)
+                 end
+             else ([0, ([100, (.usage / .window * 100 | round)] | min)] | max) end
              else null end),
+         raw_context_percent: (if (.usage | nonnegative) and (.window | positive)
+             then (.usage / .window * 100 | round) else null end),
          context_tokens: .usage, context_window: .window,
          context_source: .source}
     ' "${transcript:-/dev/null}")
     if [[ $(jq -r '.context_percent' <<< "$result") == null ]]; then
         echo 'Context unavailable: transcript, usage or window size missing; see --help.' >&2
     fi
-    if "$json"; then
-        printf '%s\n' "$result"
-    else
-        jq -r '"agent: \(.agent)\nsession_id: \(.session_id)\ncontext_percent: \(if .context_percent == null then "unknown" elif .context_source == "model-default" then "~\(.context_percent)%" else "\(.context_percent)%" end)"' <<< "$result"
-    fi
+    print_result
 }
 
 main "$@"

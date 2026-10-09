@@ -29,10 +29,17 @@ cat > "$CODEX_LOG" <<'JSON'
 {"unfinished":
 JSON
 export CODEX_SESSION_ID=codex-session
-expect 'Codex latest usage and incomplete trailing line' '.agent == "codex" and .session_id == "codex-session" and .context_percent == 25' "$(bash "$SCRIPT" --json)"
+expect 'Codex latest usage and incomplete trailing line' '.agent == "codex" and .session_id == "codex-session" and .context_percent == 20 and .raw_context_percent == 25' "$(bash "$SCRIPT" --json)"
 unset CODEX_SESSION_ID
 export CODEX_THREAD_ID=codex-session
-expect 'Codex thread ID fallback' '.context_percent == 25' "$(bash "$SCRIPT" --json)"
+expect 'Codex thread ID fallback' '.context_percent == 20' "$(bash "$SCRIPT" --json)"
+cp "$CODEX_LOG" "$WORK/original.jsonl"
+for sample in '53066 258400 17 21' '1000 200000 0 1' '2140 12000 100 18' '12500 112000 0 11' '300000 200000 100 150'; do
+    read -r tokens capacity expected raw <<< "$sample"
+    jq -nc --argjson tokens "$tokens" --argjson capacity "$capacity" '{type:"event_msg",payload:{type:"token_count",info:{last_token_usage:{total_tokens:$tokens},model_context_window:$capacity}}}' > "$CODEX_LOG"
+    expect "Codex native rounding and boundaries: $sample" ".context_percent == $expected and .raw_context_percent == $raw" "$(bash "$SCRIPT" --json)"
+done
+cp "$WORK/original.jsonl" "$CODEX_LOG"
 unset CODEX_THREAD_ID
 
 cat > "$CLAUDE_LOG" <<'JSON'
@@ -84,11 +91,25 @@ cat > "$CLAUDE_LOG" <<'JSON'
 {"type":"assistant","message":{"model":"<synthetic>","usage":{"input_tokens":10000}}}
 JSON
 expect 'Real zero usage survives sidechain and synthetic messages' '.context_percent == 0' "$(bash "$SCRIPT" --json)"
+# A statusline callback has authoritative session identity even inside Codex.
+export CODEX_SESSION_ID=codex-session
+payload='{"session_id":"claude-session","context_window":{"used_percentage":17,"context_window_size":1000000,"current_usage":{"input_tokens":10000,"cache_creation_input_tokens":20000,"cache_read_input_tokens":140000}},"extra":"preserve"}'
+forwarded=$(printf '%s' "$payload" | bash "$SCRIPT" --cache-statusline)
+[[ "$forwarded" == "$payload" ]]
+expect 'Official percentage overrides transcript inference' '.context_percent == 17 and .context_window == 1000000 and .context_source == "statusline" and .context_tokens == 170000 and .cache_age_seconds >= 0 and .updated_at != null' "$(bash "$SCRIPT" --agent claude --json)"
+expect 'Explicit window recalculates from cached tokens' '.context_percent == 85 and .context_source == "override"' "$(bash "$SCRIPT" --agent claude --json --context-window 200000)"
+printf '%s' '{"session_id":"claude-session","context_window":{"used_percentage":null,"context_window_size":1000000,"current_usage":null}}' | bash "$SCRIPT" --cache-statusline >/dev/null
+expect 'Null statusline usage does not resurrect pre-compaction usage' '.context_percent == null and .context_source == "statusline"' "$(bash "$SCRIPT" --agent claude --json 2>/dev/null)"
+if printf '%s' '{"session_id":"../escape","context_window":{"used_percentage":17}}' | bash "$SCRIPT" --cache-statusline >/dev/null 2>&1; then
+    echo 'FAIL: unsafe cache session ID accepted' >&2; exit 1
+fi
+printf 'invalid json' > "$CLAUDE_CONFIG_DIR/agent-inspect-session/claude-session.json"
+expect 'Corrupt cache falls back to transcript' '.context_source == "model-default" and .context_percent == 0' "$(bash "$SCRIPT" --agent claude --json 2>/dev/null)"
 unset CLAUDE_CODE_SESSION_ID
 export CODEX_SESSION_ID=codex-session
 if bash "$SCRIPT" --context-window 0 >/dev/null 2>&1; then
     echo 'FAIL: zero window must fail' >&2; exit 1
 fi
 output=$(bash "$SCRIPT")
-[[ "$output" == *'agent: codex'* && "$output" == *'session_id: codex-session'* && "$output" == *'context_percent: 25%'* ]]
+[[ "$output" == *'agent: codex'* && "$output" == *'session_id: codex-session'* && "$output" == *'context_percent: 20%'* ]]
 echo "$passed JSON cases and CLI error/text checks passed."
