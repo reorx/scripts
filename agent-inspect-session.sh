@@ -11,8 +11,13 @@ Usage: agent-inspect-session.sh [--json] [--agent codex|claude]
                                 [--context-window TOKENS]
        agent-inspect-session.sh --cache-statusline < statusline.json
 
-Print agent, session_id and context_percent (used, not remaining).
+Print agent, session_id, model, thinking_effort and context_percent (used).
 Requires Bash and jq. Reads local JSONL transcripts; makes no network requests.
+
+Codex model and thinking_effort come from the latest turn_context record.
+Claude model comes from statusline model.id or the latest real response.
+Claude transcripts/statusline do not reliably record effort; report unknown.
+Missing model/effort is unknown (JSON null); global defaults are not inferred.
 
 Session detection:
   Codex:  CODEX_SESSION_ID, then CODEX_THREAD_ID
@@ -28,7 +33,7 @@ JSON raw_context_percent preserves the unadjusted token/window ratio.
 Source: github.com/openai/codex/blob/main/codex-rs/tui/src/token_usage.rs
 
 Claude prefers official statusline data cached by --cache-statusline. This
-mode reads stdin JSON, caches only session/context metrics atomically under
+mode reads stdin JSON, caches only session/model/context metrics atomically under
 CLAUDE_CONFIG_DIR/agent-inspect-session/<session_id>.json, and forwards the
 original JSON to stdout. Chain it before an existing statusline command:
   /absolute/path/agent-inspect-session.sh --cache-statusline | existing-command
@@ -68,7 +73,7 @@ print_result() {
     if "$json"; then
         printf '%s\n' "$result"
     else
-        jq -r '"agent: \(.agent)\nsession_id: \(.session_id)\ncontext_percent: \(if .context_percent == null then "unknown" elif .context_source == "model-default" then "~\(.context_percent)%" else "\(.context_percent)%" end)"' <<< "$result"
+        jq -r '"agent: \(.agent)\nsession_id: \(.session_id)\nmodel: \(.model // "unknown")\nthinking_effort: \(.thinking_effort // "unknown")\ncontext_percent: \(if .context_percent == null then "unknown" elif .context_source == "model-default" then "~\(.context_percent)%" else "\(.context_percent)%" end)"' <<< "$result"
     fi
 }
 
@@ -110,7 +115,7 @@ main() {
             select(.context_window | type == "object") |
             select(.context_window.used_percentage == null or
                 (.context_window.used_percentage | type == "number" and . >= 0 and . <= 100)) |
-            {agent:"claude",session_id,context_window,updated_at:(now | floor)}
+            {agent:"claude",session_id,model:(.model.id // null),context_window,updated_at:(now | floor)}
         ' <<< "$payload") || { echo 'Invalid Claude statusline data.' >&2; return 1; }
         session_id=$(jq -r '.session_id' <<< "$cached")
         mkdir -p "$cache_dir"
@@ -155,7 +160,7 @@ main() {
             (if $override == "" then $c.context_window_size else ($override | tonumber) end) as $window |
             (if ($tokens | type == "number") and ($window | type == "number" and . > 0)
                 then ($tokens / $window * 100 | round) else null end) as $raw |
-            {agent,session_id,updated_at,
+            {agent,session_id,model,thinking_effort:null,updated_at,
              cache_age_seconds:([0,(now - .updated_at | floor)] | max),
              context_tokens:$tokens,context_window:$window,raw_context_percent:$raw,
              context_source:(if $override == "" then "statusline" else "override" end),
@@ -181,7 +186,9 @@ main() {
         reduce inputs as $line ({};
             ($line | fromjson? // {}) as $e |
             if $agent == "codex" then
-                if $e.type == "compacted" then .usage = null
+                if $e.type == "turn_context" then
+                    .model = $e.payload.model | .thinking_effort = $e.payload.effort
+                elif $e.type == "compacted" then .usage = null
                 elif $e.type == "event_msg" and $e.payload.type == "token_count"
                      and $e.payload.info != null then
                     .usage = $e.payload.info.last_token_usage.total_tokens |
@@ -219,7 +226,7 @@ main() {
                 .window = 200000 | .source = "model-default"
             else .window = null | .source = "unknown" end
         end |
-        {agent: $agent, session_id: $id,
+        {agent: $agent, session_id: $id, model: .model, thinking_effort: .thinking_effort,
          context_percent: (if (.usage | nonnegative) and (.window | positive)
              then if $agent == "codex" then
                  if .window <= 12000 then 100 else

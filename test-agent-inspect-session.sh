@@ -40,6 +40,25 @@ for sample in '53066 258400 17 21' '1000 200000 0 1' '2140 12000 100 18' '12500 
     expect "Codex native rounding and boundaries: $sample" ".context_percent == $expected and .raw_context_percent == $raw" "$(bash "$SCRIPT" --json)"
 done
 cp "$WORK/original.jsonl" "$CODEX_LOG"
+# Given a model/effort switch, report the latest turn even before token usage.
+cat >> "$CODEX_LOG" <<'JSON'
+{"type":"turn_context","payload":{"model":"model-old","effort":"low"}}
+{"type":"turn_context","payload":{"model":"model-current","effort":"high","collaboration_mode":{"settings":{"reasoning_effort":"low"}}}}
+JSON
+expect 'Codex latest turn model and effort' '.model == "model-current" and .thinking_effort == "high" and .context_percent == 20' "$(bash "$SCRIPT" --json)"
+output=$(bash "$SCRIPT")
+[[ "$output" == *'model: model-current'* && "$output" == *'thinking_effort: high'* ]]
+cat >> "$CODEX_LOG" <<'JSON'
+{"type":"turn_context","payload":{"model":"model-next"}}
+JSON
+expect 'Missing effort must not retain previous turn effort' '.model == "model-next" and .thinking_effort == null' "$(bash "$SCRIPT" --json)"
+cat >> "$CODEX_LOG" <<'JSON'
+{"type":"turn_context","payload":{"model":"model-next","effort":"none"}}
+{"type":"compacted"}
+JSON
+expect 'Compaction preserves model and explicit none effort' '.model == "model-next" and .thinking_effort == "none" and .context_percent == null' "$(bash "$SCRIPT" --json 2>/dev/null)"
+cp "$WORK/original.jsonl" "$CODEX_LOG"
+expect 'Older transcripts expose unknown model and effort' 'has("model") and has("thinking_effort") and .model == null and .thinking_effort == null' "$(bash "$SCRIPT" --json)"
 unset CODEX_THREAD_ID
 
 cat > "$CLAUDE_LOG" <<'JSON'
@@ -47,6 +66,7 @@ cat > "$CLAUDE_LOG" <<'JSON'
 JSON
 export CLAUDE_CODE_SESSION_ID=claude-session
 expect 'Claude includes both caches, excludes output' '.agent == "claude" and .context_percent == 30 and .context_window == 200000 and .context_source == "model-default"' "$(bash "$SCRIPT" --json)"
+expect 'Claude transcript model without guessing effort' '.model == "claude-sonnet-4-20250514" and has("thinking_effort") and .thinking_effort == null' "$(bash "$SCRIPT" --json)"
 expect 'Explicit extended context window' '.context_percent == 6 and .context_window == 1000000' "$(bash "$SCRIPT" --json --context-window 1000000)"
 
 cat > "$CLAUDE_LOG" <<'JSON'
@@ -96,6 +116,10 @@ export CODEX_SESSION_ID=codex-session
 payload='{"session_id":"claude-session","context_window":{"used_percentage":17,"context_window_size":1000000,"current_usage":{"input_tokens":10000,"cache_creation_input_tokens":20000,"cache_read_input_tokens":140000}},"extra":"preserve"}'
 forwarded=$(printf '%s' "$payload" | bash "$SCRIPT" --cache-statusline)
 [[ "$forwarded" == "$payload" ]]
+expect 'Older statusline caches expose unknown metadata' 'has("model") and has("thinking_effort") and .model == null and .thinking_effort == null' "$(bash "$SCRIPT" --agent claude --json)"
+payload=$(jq -c '.model = {id:"claude-current",display_name:"Claude Current"}' <<< "$payload")
+printf '%s' "$payload" | bash "$SCRIPT" --cache-statusline >/dev/null
+expect 'Statusline preserves model ID' '.model == "claude-current" and .thinking_effort == null' "$(bash "$SCRIPT" --agent claude --json)"
 expect 'Official percentage overrides transcript inference' '.context_percent == 17 and .context_window == 1000000 and .context_source == "statusline" and .context_tokens == 170000 and .cache_age_seconds >= 0 and .updated_at != null' "$(bash "$SCRIPT" --agent claude --json)"
 expect 'Explicit window recalculates from cached tokens' '.context_percent == 85 and .context_source == "override"' "$(bash "$SCRIPT" --agent claude --json --context-window 200000)"
 printf '%s' '{"session_id":"claude-session","context_window":{"used_percentage":null,"context_window_size":1000000,"current_usage":null}}' | bash "$SCRIPT" --cache-statusline >/dev/null
