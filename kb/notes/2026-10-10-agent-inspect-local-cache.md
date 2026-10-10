@@ -28,6 +28,29 @@ fresh transcript reads, compaction, missing transcripts, ignoring old caches,
 no cache creation, and rejection of the removed writer option. Bash syntax and
 the local settings JSON were also checked.
 
+## Unknown-context fallback
+
+On-demand inspection now emits actionable guidance when percentage cannot be
+calculated. Recorded token usage takes precedence (including zero); 100000
+tokens triggers a recommendation to summarize work and consider a new session.
+Without token data, the same recommendation triggers at 400000 approximate
+UTF-8 bytes of message and tool text since the last compaction. These thresholds
+are heuristics, not model limits. Bytes are never converted into invented tokens.
+Known windows without token data still use the byte fallback.
+
+The byte estimate excludes metadata, images, Claude sidechains and Codex display
+events. Compaction resets it, using Codex replacement history when present.
+It does not reconstruct exact conversation branches, hidden prompts or pruned
+tool results. Both below-threshold readings and absent evidence explicitly avoid
+claiming that context pressure is low. JSON exposes `assessment_basis`,
+`context_bytes`, `context_high`, `warning_threshold` and `guidance`; text output
+also includes recorded token usage and the advice.
+
+Validation: 40 JSON cases and CLI checks passed, including UTF-8 bytes, tool
+content, compaction, exact threshold boundaries, zero tokens and missing data.
+A real Claude transcript with 342358 tokens and no identifiable window emitted
+the expected new-session guidance; a Codex session retained its percentage.
+
 ## Historical cache relocation
 
 The Claude statusline invokes `agent-inspect-session.sh --cache-statusline`.

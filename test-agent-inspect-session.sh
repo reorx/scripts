@@ -145,8 +145,58 @@ fi
 [[ ! -s "$WORK/removed-option.out" ]]
 [[ "$(cat "$WORK/removed-option.err")" == 'Unknown argument: --cache-statusline' ]]
 [[ ! -e "$XDG_CACHE_HOME/agent-inspect-session" && ! -e "$CLAUDE_CONFIG_DIR/agent-inspect-session" ]]
-unset CLAUDE_CODE_SESSION_ID
+# Unknown windows still expose token evidence and actionable guidance.
+cat > "$CLAUDE_LOG" <<'JSON'
+{"type":"assistant","message":{"model":"custom-model","usage":{"input_tokens":100000}}}
+JSON
+expect 'Unknown window warns at token threshold' '.context_percent == null and .context_tokens == 100000 and .assessment_basis == "tokens" and .context_high == true and (.guidance | contains("context is unknown") and contains("new session"))' "$(bash "$SCRIPT" --json)"
+output=$(bash "$SCRIPT")
+[[ "$output" == *'context_tokens: 100000'* && "$output" == *'context is unknown'* && "$output" == *'new session'* ]]
+expect 'Known window takes precedence over absolute token heuristic' '.context_percent == 10 and .assessment_basis == "percent" and .context_high == null' "$(bash "$SCRIPT" --json --context-window 1000000)"
+cat > "$CLAUDE_LOG" <<'JSON'
+{"type":"assistant","message":{"model":"custom-model","usage":{"input_tokens":99999}}}
+JSON
+expect 'Below token threshold is not proof of safety' '.context_high == false and (.guidance | contains("does not prove"))' "$(bash "$SCRIPT" --json)"
+# Count UTF-8 message text and tool payloads, not metadata or image data.
+cat > "$CLAUDE_LOG" <<'JSON'
+{"type":"user","message":{"content":"中文"},"metadata":"not context"}
+{"type":"assistant","message":{"model":"custom-model","content":[{"type":"text","text":"abc"},{"type":"tool_use","input":{"x":1}},{"type":"image","source":{"data":"ignore"}}]}}
+{"type":"user","message":{"content":[{"type":"tool_result","content":[{"type":"text","text":"ok"}]}]}}
+{"type":"assistant","isSidechain":true,"message":{"content":"ignore"}}
+{"type":"progress","data":{"text":"ignore"}}
+{"unfinished":
+JSON
+expect 'Bytes count message content only, including Unicode and tools' '.context_tokens == null and .context_bytes == 18 and .assessment_basis == "bytes" and .model == "custom-model" and .context_high == false' "$(bash "$SCRIPT" --json)"
+expect 'Window alone cannot produce a percentage without tokens' '.context_window == 200000 and .context_percent == null and .assessment_basis == "bytes" and .context_bytes == 18' "$(bash "$SCRIPT" --json --context-window 200000)"
+cat >> "$CLAUDE_LOG" <<'JSON'
+{"type":"system","subtype":"compact_boundary"}
+{"type":"user","message":{"content":"summary"}}
+JSON
+expect 'Compaction resets byte estimate to retained summary' '.context_bytes == 7 and .context_tokens == null' "$(bash "$SCRIPT" --json)"
+jq -nc '{type:"user",message:{content:("x" * 400000)}}' > "$CLAUDE_LOG"
+expect 'Byte threshold warns without inventing tokens' '.context_bytes == 400000 and .context_tokens == null and .context_high == true and (.guidance | contains("new session"))' "$(bash "$SCRIPT" --json)"
+output=$(bash "$SCRIPT")
+[[ "$output" == *'context_tokens: unknown'* && "$output" == *'context_bytes (approximate UTF-8): 400000'* && "$output" == *'new session'* ]]
+cat >> "$CLAUDE_LOG" <<'JSON'
+{"type":"assistant","message":{"model":"custom-model","usage":{"input_tokens":0}}}
+JSON
+expect 'Measured zero tokens outranks large byte estimate' '.assessment_basis == "tokens" and .context_tokens == 0 and .context_high == false' "$(bash "$SCRIPT" --json)"
+jq -nc '{type:"user",message:{content:("x" * 399999)}}' > "$CLAUDE_LOG"
+expect 'Below byte threshold does not trigger a high-context warning' '.context_bytes == 399999 and .context_high == false' "$(bash "$SCRIPT" --json)"
+: > "$CLAUDE_LOG"
+expect 'Empty transcript cannot imply zero context' '.assessment_basis == "unavailable" and .context_bytes == null and .context_high == null and (.guidance | contains("cannot assess"))' "$(bash "$SCRIPT" --json)"
+cp "$CODEX_LOG" "$WORK/codex-original.jsonl"
+cat > "$CODEX_LOG" <<'JSON'
+{"type":"response_item","payload":{"type":"message","content":[{"type":"input_text","text":"old history"}]}}
+{"type":"compacted","replacement_history":[{"type":"message","content":[{"type":"input_text","text":"summary"}]}]}
+{"type":"response_item","payload":{"type":"function_call","arguments":"{}"}}
+{"type":"response_item","payload":{"type":"function_call_output","output":"ok"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"duplicate display event"}}
+JSON
 export CODEX_SESSION_ID=codex-session
+expect 'Codex uses replacement history and excludes display duplicates' '.assessment_basis == "bytes" and .context_bytes == 11' "$(bash "$SCRIPT" --agent codex --json)"
+cp "$WORK/codex-original.jsonl" "$CODEX_LOG"
+unset CLAUDE_CODE_SESSION_ID
 if bash "$SCRIPT" --context-window 0 >/dev/null 2>&1; then
     echo 'FAIL: zero window must fail' >&2; exit 1
 fi
