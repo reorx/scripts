@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Inspection is read-only; --cache-statusline stores Claude callback metrics.
+# Read-only, on-demand inspection of local session transcripts.
 # Claude formula: https://code.claude.com/docs/en/statusline#context-window-fields
 # Codex window: https://developers.openai.com/codex/config-reference
 
@@ -9,14 +9,14 @@ usage() {
     cat <<'HELP'
 Usage: agent-inspect-session.sh [--json] [--agent codex|claude]
                                 [--context-window TOKENS]
-       agent-inspect-session.sh --cache-statusline < statusline.json
 
 Print agent, session_id, model, thinking_effort and context_percent (used).
-Requires Bash and jq. Reads local JSONL transcripts; makes no network requests.
+Requires Bash and jq. Reads local JSONL transcripts only when invoked;
+no statusline integration, persistent cache, background work or network requests.
 
 Codex model and thinking_effort come from the latest turn_context record.
-Claude model comes from statusline model.id or the latest real response.
-Claude transcripts/statusline do not reliably record effort; report unknown.
+Claude model comes from the latest real response in the transcript.
+Claude transcripts do not reliably record effort; report unknown.
 Missing model/effort is unknown (JSON null); global defaults are not inferred.
 
 Session detection:
@@ -31,16 +31,6 @@ Codex matches its native status line: subtract the fixed 12000-token baseline
 from usage and window, round remaining percent, then subtract it from 100.
 JSON raw_context_percent preserves the unadjusted token/window ratio.
 Source: github.com/openai/codex/blob/main/codex-rs/tui/src/token_usage.rs
-
-Claude prefers official statusline data cached by --cache-statusline. This
-mode reads stdin JSON, caches only session/model/context metrics atomically under
-${XDG_CACHE_HOME:-~/Library/Caches}/agent-inspect-session/<session_id>.json,
-outside CLAUDE_CONFIG_DIR (which may be synced by iCloud), and forwards the
-original JSON to stdout. Chain it before an existing statusline command:
-  /absolute/path/agent-inspect-session.sh --cache-statusline | existing-command
-It uses the callback session_id, not inherited agent environment variables.
-JSON includes updated_at and cache_age_seconds; cached readings may lag the
-live session. No cache means transcript fallback as described below.
 
 Claude uses the latest input_tokens + cache_creation_input_tokens +
 cache_read_input_tokens, excluding output tokens, as its status line does.
@@ -80,17 +70,12 @@ print_result() {
 
 main() {
     local agent='' session_id='' window='' json=false transcript='' result
-    local cache_mode=false payload cache_file temporary cached
-    # Statusline callbacks refresh even when token usage is unchanged. Keep their
-    # heartbeat timestamps local; ~/.claude may be a symlink into iCloud Drive.
-    local cache_dir="${XDG_CACHE_HOME:-$HOME/Library/Caches}/agent-inspect-session"
     local codex_id=${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-}}
     local claude_id=${CLAUDE_CODE_SESSION_ID:-}
     while (( $# )); do
         case "$1" in
             --help|-h) usage; return 0 ;;
             --json) json=true; shift ;;
-            --cache-statusline) cache_mode=true; shift ;;
             --agent|--context-window)
                 if (( $# < 2 )); then
                     printf 'Missing value for %s\n' "$1" >&2; return 2
@@ -105,30 +90,6 @@ main() {
     fi
     if ! command -v jq >/dev/null 2>&1; then
         echo 'jq is required (macOS: brew install jq).' >&2; return 1
-    fi
-    if "$cache_mode"; then
-        if [[ -n "$agent" || -n "$window" || "$json" == true ]]; then
-            echo '--cache-statusline cannot be combined with query options.' >&2; return 2
-        fi
-        payload=$(cat)
-        # Forward even invalid callback data so an existing renderer still sees it.
-        printf '%s' "$payload"
-        cached=$(jq -ce '
-            select(.session_id | type == "string" and test("^[a-zA-Z0-9_-]+$")) |
-            select(.context_window | type == "object") |
-            select(.context_window.used_percentage == null or
-                (.context_window.used_percentage | type == "number" and . >= 0 and . <= 100)) |
-            {agent:"claude",session_id,model:(.model.id // null),context_window,updated_at:(now | floor)}
-        ' <<< "$payload") || { echo 'Invalid Claude statusline data.' >&2; return 1; }
-        session_id=$(jq -r '.session_id' <<< "$cached")
-        mkdir -p "$cache_dir"
-        temporary=$(mktemp "$cache_dir/.${session_id}.XXXXXX")
-        if ! printf '%s\n' "$cached" > "$temporary" ||
-           ! mv -f "$temporary" "$cache_dir/$session_id.json"; then
-            rm -f "$temporary"
-            echo 'Could not write Claude statusline cache.' >&2; return 1
-        fi
-        return 0
     fi
     if [[ -z "$agent" ]]; then
         if [[ -n "$codex_id" && -n "$claude_id" ]]; then
@@ -147,33 +108,6 @@ main() {
     esac
     if [[ ! "$session_id" =~ ^[a-zA-Z0-9_-]+$ ]]; then
         echo 'Session ID is missing or contains unsupported characters.' >&2; return 2
-    fi
-    cache_file="$cache_dir/$session_id.json"
-    if [[ "$agent" == claude && -f "$cache_file" ]]; then
-        if result=$(jq -ce --arg id "$session_id" --arg override "$window" '
-            select(.agent == "claude" and .session_id == $id) |
-            select(.updated_at | type == "number") |
-            select(.context_window | type == "object") |
-            select(.context_window.used_percentage == null or
-                (.context_window.used_percentage | type == "number" and . >= 0 and . <= 100)) |
-            .context_window as $c |
-            (if $c.current_usage == null then null else ($c.current_usage |
-                .input_tokens + (.cache_creation_input_tokens // 0) +
-                (.cache_read_input_tokens // 0)) end) as $tokens |
-            (if $override == "" then $c.context_window_size else ($override | tonumber) end) as $window |
-            (if ($tokens | type == "number") and ($window | type == "number" and . > 0)
-                then ($tokens / $window * 100 | round) else null end) as $raw |
-            {agent,session_id,model,thinking_effort:null,updated_at,
-             cache_age_seconds:([0,(now - .updated_at | floor)] | max),
-             context_tokens:$tokens,context_window:$window,raw_context_percent:$raw,
-             context_source:(if $override == "" then "statusline" else "override" end),
-             context_percent:(if $override == "" then $c.used_percentage
-                 elif $raw == null then null else ([0,([100,$raw] | min)] | max) end)}
-        ' "$cache_file" 2>/dev/null); then
-            print_result
-            return 0
-        fi
-        echo 'Invalid statusline cache; falling back to transcript.' >&2
     fi
     if [[ "$agent" == codex ]]; then
         find_transcript "${CODEX_HOME:-$HOME/.codex}/sessions" "*-${session_id}.jsonl"

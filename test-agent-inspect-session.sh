@@ -115,33 +115,36 @@ cat > "$CLAUDE_LOG" <<'JSON'
 {"type":"assistant","message":{"model":"<synthetic>","usage":{"input_tokens":10000}}}
 JSON
 expect 'Real zero usage survives sidechain and synthetic messages' '.context_percent == 0' "$(bash "$SCRIPT" --json)"
-# A statusline callback has authoritative session identity even inside Codex.
-export CODEX_SESSION_ID=codex-session
-payload='{"session_id":"claude-session","context_window":{"used_percentage":17,"context_window_size":1000000,"current_usage":{"input_tokens":10000,"cache_creation_input_tokens":20000,"cache_read_input_tokens":140000}},"extra":"preserve"}'
-forwarded=$(printf '%s' "$payload" | bash "$SCRIPT" --cache-statusline)
-[[ "$forwarded" == "$payload" ]]
-if [[ ! -f "$XDG_CACHE_HOME/agent-inspect-session/claude-session.json" ||
-      -e "$CLAUDE_CONFIG_DIR/agent-inspect-session" ]]; then
-    echo 'FAIL: statusline cache must stay outside the synced Claude config directory' >&2
-    exit 1
+# Queries must not create cache directories, including under cloud-synced config.
+[[ ! -e "$XDG_CACHE_HOME" && ! -e "$CLAUDE_CONFIG_DIR/agent-inspect-session" ]]
+# Given conflicting old caches, only the transcript determines the result.
+mkdir -p "$XDG_CACHE_HOME/agent-inspect-session" "$CLAUDE_CONFIG_DIR/agent-inspect-session"
+cat > "$WORK/old-cache.json" <<'JSON'
+{"agent":"claude","session_id":"claude-session","model":"cached-model","updated_at":1,"context_window":{"used_percentage":17,"context_window_size":1000000,"current_usage":{"input_tokens":170000}}}
+JSON
+cp "$WORK/old-cache.json" "$XDG_CACHE_HOME/agent-inspect-session/claude-session.json"
+cp "$WORK/old-cache.json" "$CLAUDE_CONFIG_DIR/agent-inspect-session/claude-session.json"
+expect 'Old caches cannot override transcript data' '.model == "claude-opus-4-20250514" and .context_percent == 0 and .context_source == "model-default" and (has("updated_at") | not) and (has("cache_age_seconds") | not)' "$(bash "$SCRIPT" --json)"
+cat >> "$CLAUDE_LOG" <<'JSON'
+{"type":"assistant","message":{"model":"claude-opus-4-20250514","usage":{"input_tokens":40000}}}
+JSON
+expect 'Next query immediately reads appended transcript usage' '.context_tokens == 40000 and .context_percent == 20' "$(bash "$SCRIPT" --json)"
+expect 'Override uses transcript tokens despite old caches' '.context_percent == 4 and .context_source == "override"' "$(bash "$SCRIPT" --json --context-window 1000000)"
+cat >> "$CLAUDE_LOG" <<'JSON'
+{"type":"system","subtype":"compact_boundary"}
+JSON
+expect 'Old cache cannot resurrect usage after compaction' '.context_percent == null' "$(bash "$SCRIPT" --json 2>/dev/null)"
+rm "$CLAUDE_LOG"
+expect 'Old cache cannot replace a missing transcript' '.model == null and .context_percent == null' "$(bash "$SCRIPT" --json 2>/dev/null)"
+cmp "$WORK/old-cache.json" "$XDG_CACHE_HOME/agent-inspect-session/claude-session.json"
+cmp "$WORK/old-cache.json" "$CLAUDE_CONFIG_DIR/agent-inspect-session/claude-session.json"
+rm -r "$XDG_CACHE_HOME/agent-inspect-session" "$CLAUDE_CONFIG_DIR/agent-inspect-session"
+if bash "$SCRIPT" --cache-statusline < "$WORK/old-cache.json" > "$WORK/removed-option.out" 2> "$WORK/removed-option.err"; then
+    echo 'FAIL: removed cache writer option must fail' >&2; exit 1
 fi
-mkdir -p "$CLAUDE_CONFIG_DIR/agent-inspect-session"
-printf 'legacy cloud cache must remain untouched\n' > "$WORK/legacy-cache"
-cp "$WORK/legacy-cache" "$CLAUDE_CONFIG_DIR/agent-inspect-session/claude-session.json"
-expect 'Older statusline caches expose unknown metadata' 'has("model") and has("thinking_effort") and .model == null and .thinking_effort == null' "$(bash "$SCRIPT" --agent claude --json)"
-payload=$(jq -c '.model = {id:"claude-current",display_name:"Claude Current"}' <<< "$payload")
-printf '%s' "$payload" | bash "$SCRIPT" --cache-statusline >/dev/null
-cmp "$WORK/legacy-cache" "$CLAUDE_CONFIG_DIR/agent-inspect-session/claude-session.json"
-expect 'Statusline preserves model ID' '.model == "claude-current" and .thinking_effort == null' "$(bash "$SCRIPT" --agent claude --json)"
-expect 'Official percentage overrides transcript inference' '.context_percent == 17 and .context_window == 1000000 and .context_source == "statusline" and .context_tokens == 170000 and .cache_age_seconds >= 0 and .updated_at != null' "$(bash "$SCRIPT" --agent claude --json)"
-expect 'Explicit window recalculates from cached tokens' '.context_percent == 85 and .context_source == "override"' "$(bash "$SCRIPT" --agent claude --json --context-window 200000)"
-printf '%s' '{"session_id":"claude-session","context_window":{"used_percentage":null,"context_window_size":1000000,"current_usage":null}}' | bash "$SCRIPT" --cache-statusline >/dev/null
-expect 'Null statusline usage does not resurrect pre-compaction usage' '.context_percent == null and .context_source == "statusline"' "$(bash "$SCRIPT" --agent claude --json 2>/dev/null)"
-if printf '%s' '{"session_id":"../escape","context_window":{"used_percentage":17}}' | bash "$SCRIPT" --cache-statusline >/dev/null 2>&1; then
-    echo 'FAIL: unsafe cache session ID accepted' >&2; exit 1
-fi
-printf 'invalid json' > "$XDG_CACHE_HOME/agent-inspect-session/claude-session.json"
-expect 'Corrupt cache falls back to transcript' '.context_source == "model-default" and .context_percent == 0' "$(bash "$SCRIPT" --agent claude --json 2>/dev/null)"
+[[ ! -s "$WORK/removed-option.out" ]]
+[[ "$(cat "$WORK/removed-option.err")" == 'Unknown argument: --cache-statusline' ]]
+[[ ! -e "$XDG_CACHE_HOME/agent-inspect-session" && ! -e "$CLAUDE_CONFIG_DIR/agent-inspect-session" ]]
 unset CLAUDE_CODE_SESSION_ID
 export CODEX_SESSION_ID=codex-session
 if bash "$SCRIPT" --context-window 0 >/dev/null 2>&1; then

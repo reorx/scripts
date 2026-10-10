@@ -7,6 +7,29 @@ tags:
 
 # Keep statusline metrics outside iCloud
 
+## Superseded: on-demand transcript inspection
+
+Later on 2026-10-10, caching was removed at the user's request: occasional
+inspection should not require continuous background writes. The inspector now
+reads only local transcripts on invocation. It ignores old caches and no longer
+accepts `--cache-statusline`; cache timestamps are absent from JSON output.
+Window inference and `--context-window` remain available. Missing window data
+still yields unknown rather than an invented percentage.
+
+On this Mac, the cache pipeline was removed from `~/.claude/settings.json`, and
+the local cache directory and legacy compatibility symlink were deleted. The
+statusline's five-second refresh remains for its existing running-turn timer;
+it no longer invokes the inspector. Other installations with the old pipeline
+must likewise remove the `agent-inspect-session.sh --cache-statusline |` prefix.
+
+Validation: the new stale-cache regression failed against the previous script.
+After removing caching, all 29 JSON cases and CLI checks passed, including
+fresh transcript reads, compaction, missing transcripts, ignoring old caches,
+no cache creation, and rejection of the removed writer option. Bash syntax and
+the local settings JSON were also checked.
+
+## Historical cache relocation
+
 The Claude statusline invokes `agent-inspect-session.sh --cache-statusline`.
 Every callback writes an atomic snapshot including a fresh `updated_at`, even
 when token usage is unchanged. On this Mac, `~/.claude` points into iCloud Drive,
