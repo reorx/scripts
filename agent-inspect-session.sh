@@ -34,7 +34,8 @@ Source: github.com/openai/codex/blob/main/codex-rs/tui/src/token_usage.rs
 
 Claude prefers official statusline data cached by --cache-statusline. This
 mode reads stdin JSON, caches only session/model/context metrics atomically under
-CLAUDE_CONFIG_DIR/agent-inspect-session/<session_id>.json, and forwards the
+${XDG_CACHE_HOME:-~/Library/Caches}/agent-inspect-session/<session_id>.json,
+outside CLAUDE_CONFIG_DIR (which may be synced by iCloud), and forwards the
 original JSON to stdout. Chain it before an existing statusline command:
   /absolute/path/agent-inspect-session.sh --cache-statusline | existing-command
 It uses the callback session_id, not inherited agent environment variables.
@@ -80,7 +81,9 @@ print_result() {
 main() {
     local agent='' session_id='' window='' json=false transcript='' result
     local cache_mode=false payload cache_file temporary cached
-    local cache_dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/agent-inspect-session"
+    # Statusline callbacks refresh even when token usage is unchanged. Keep their
+    # heartbeat timestamps local; ~/.claude may be a symlink into iCloud Drive.
+    local cache_dir="${XDG_CACHE_HOME:-$HOME/Library/Caches}/agent-inspect-session"
     local codex_id=${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-}}
     local claude_id=${CLAUDE_CODE_SESSION_ID:-}
     while (( $# )); do

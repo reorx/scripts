@@ -5,7 +5,11 @@ SCRIPT="$(cd "$(dirname "$0")" && pwd)/agent-inspect-session.sh"
 WORK=$(mktemp -d)
 trap 'rm -rf "$WORK"' EXIT
 export CODEX_HOME="$WORK/codex" CLAUDE_CONFIG_DIR="$WORK/claude"
+export XDG_CACHE_HOME="$WORK/local-cache"
 unset CODEX_SESSION_ID CODEX_THREAD_ID CLAUDE_CODE_SESSION_ID
+# Reproduce a Claude config directory symlinked into cloud storage.
+mkdir -p "$WORK/cloud/claude"
+ln -s "$WORK/cloud/claude" "$CLAUDE_CONFIG_DIR"
 mkdir -p "$CODEX_HOME/sessions/2026/10/09" "$CLAUDE_CONFIG_DIR/projects/project"
 CODEX_LOG="$CODEX_HOME/sessions/2026/10/09/rollout-test-codex-session.jsonl"
 CLAUDE_LOG="$CLAUDE_CONFIG_DIR/projects/project/claude-session.jsonl"
@@ -116,9 +120,18 @@ export CODEX_SESSION_ID=codex-session
 payload='{"session_id":"claude-session","context_window":{"used_percentage":17,"context_window_size":1000000,"current_usage":{"input_tokens":10000,"cache_creation_input_tokens":20000,"cache_read_input_tokens":140000}},"extra":"preserve"}'
 forwarded=$(printf '%s' "$payload" | bash "$SCRIPT" --cache-statusline)
 [[ "$forwarded" == "$payload" ]]
+if [[ ! -f "$XDG_CACHE_HOME/agent-inspect-session/claude-session.json" ||
+      -e "$CLAUDE_CONFIG_DIR/agent-inspect-session" ]]; then
+    echo 'FAIL: statusline cache must stay outside the synced Claude config directory' >&2
+    exit 1
+fi
+mkdir -p "$CLAUDE_CONFIG_DIR/agent-inspect-session"
+printf 'legacy cloud cache must remain untouched\n' > "$WORK/legacy-cache"
+cp "$WORK/legacy-cache" "$CLAUDE_CONFIG_DIR/agent-inspect-session/claude-session.json"
 expect 'Older statusline caches expose unknown metadata' 'has("model") and has("thinking_effort") and .model == null and .thinking_effort == null' "$(bash "$SCRIPT" --agent claude --json)"
 payload=$(jq -c '.model = {id:"claude-current",display_name:"Claude Current"}' <<< "$payload")
 printf '%s' "$payload" | bash "$SCRIPT" --cache-statusline >/dev/null
+cmp "$WORK/legacy-cache" "$CLAUDE_CONFIG_DIR/agent-inspect-session/claude-session.json"
 expect 'Statusline preserves model ID' '.model == "claude-current" and .thinking_effort == null' "$(bash "$SCRIPT" --agent claude --json)"
 expect 'Official percentage overrides transcript inference' '.context_percent == 17 and .context_window == 1000000 and .context_source == "statusline" and .context_tokens == 170000 and .cache_age_seconds >= 0 and .updated_at != null' "$(bash "$SCRIPT" --agent claude --json)"
 expect 'Explicit window recalculates from cached tokens' '.context_percent == 85 and .context_source == "override"' "$(bash "$SCRIPT" --agent claude --json --context-window 200000)"
@@ -127,7 +140,7 @@ expect 'Null statusline usage does not resurrect pre-compaction usage' '.context
 if printf '%s' '{"session_id":"../escape","context_window":{"used_percentage":17}}' | bash "$SCRIPT" --cache-statusline >/dev/null 2>&1; then
     echo 'FAIL: unsafe cache session ID accepted' >&2; exit 1
 fi
-printf 'invalid json' > "$CLAUDE_CONFIG_DIR/agent-inspect-session/claude-session.json"
+printf 'invalid json' > "$XDG_CACHE_HOME/agent-inspect-session/claude-session.json"
 expect 'Corrupt cache falls back to transcript' '.context_source == "model-default" and .context_percent == 0' "$(bash "$SCRIPT" --agent claude --json 2>/dev/null)"
 unset CLAUDE_CODE_SESSION_ID
 export CODEX_SESSION_ID=codex-session
