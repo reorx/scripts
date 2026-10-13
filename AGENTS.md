@@ -22,3 +22,11 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 - A skill is `skills/<name>/SKILL.md` with optional `scripts/` and `references/`.
 - `./link-skill skills/<name>` symlinks a skill into the agent skill dirs (`~/.claude`, `~/.agents`, `~/.codex`, OpenClaw).
 - `./link-script <path>` symlinks a script into `~/.local/bin`; `-l` lists links, `-d <name>` removes one.
+
+## Application preferences
+
+- `app-defaults.py` inspects saved macOS preferences and scans ARM64 binaries for candidate keys. Keep candidates distinct from confirmed settings; mutations must back up first and verify by reading back. Run `uv run test_app_defaults.py` when changing it.
+
+## Documentation
+
+- `kb/docs/app-defaults.md` — Read when inspecting or changing macOS application preferences or modifying `app-defaults.py`.
