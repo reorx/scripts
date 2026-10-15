@@ -27,6 +27,11 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 
 - `app-defaults.py` inspects saved macOS preferences and scans ARM64 binaries for candidate keys. Keep candidates distinct from confirmed settings; mutations must back up first and verify by reading back. Run `uv run test_app_defaults.py` when changing it.
 
+## YouTube transcripts
+
+- `yt-transcript.py <url-or-id>` fetches one caption track through the `yt-dlp` binary and prints `[mm:ss]` lines (`--format plain|json`, `--lang`, `--list`). Default track: uploaded subtitles in the video's language, else that language's `-orig` ASR track — auto-dubbed videos carry one `-orig` per audio track, so match on `info.language`, not the suffix.
+- Keep downloads to exactly one `--sub-langs` code: requesting several (e.g. `en.*,zh.*`) gets HTTP 429 from YouTube. Run `uv run test_yt_transcript.py` when changing it.
+
 ## Documentation
 
 - `kb/docs/app-defaults.md` — Read when inspecting or changing macOS application preferences or modifying `app-defaults.py`.
