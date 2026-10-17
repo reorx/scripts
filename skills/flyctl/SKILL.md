@@ -1,6 +1,7 @@
 ---
 name: flyctl
-description: Use when deploying services to Fly.io, configuring fly.toml, managing Fly machines, volumes, domains, health checks, or troubleshooting Fly deployments. Trigger this skill whenever the user mentions Fly.io, flyctl, fly deploy, fly.toml, or wants to run containers on Fly — even if they just say "deploy this to Fly" or "put this on fly.io".
+description: Deploy and troubleshoot services on Fly.io using flyctl, including fly.toml, machines, volumes, domains, and health checks. Use only when the user explicitly invokes flyctl.
+disable-model-invocation: true
 ---
 
 # flyctl

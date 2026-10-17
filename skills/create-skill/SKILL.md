@@ -1,6 +1,7 @@
 ---
 name: create-skill
-description: This is the skill to create skills. Use when user want to create a new skill. 中文语境下，当用户需要创建一个新技能时，使用这个技能。
+description: Create an agent skill from the user's requirements. Use only when the user explicitly invokes create-skill.
+disable-model-invocation: true
 ---
 
 Create an agent skill based on what user describes. If no input, ask user to provide information about the skill to create.

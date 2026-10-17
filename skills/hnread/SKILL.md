@@ -4,7 +4,8 @@ description: >-
   Read and analyze Hacker News discussion threads. Fetches an HN thread URL, converts it to
   flat markdown using hn_flat.py, then extracts and presents the most valuable discussion
   insights — critical rebuttals, personal anecdotes, technical corrections, and notable debates.
-  Use when the user provides an HN URL and wants a curated summary of the discussion.
+  Use only when the user explicitly invokes hnread.
+disable-model-invocation: true
 ---
 
 # HNRead - Hacker News Discussion Analyzer
