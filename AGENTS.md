@@ -35,3 +35,4 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 ## Documentation
 
 - `kb/docs/app-defaults.md` — Read when inspecting or changing macOS application preferences or modifying `app-defaults.py`.
+- `kb/docs/codex-cc-format.md` — Codex global PostToolUse adapter for the existing Claude cc-format command; keep the embedded command identical and run `uv run test_codex_cc_format.py` after changes.
