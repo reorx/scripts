@@ -12,10 +12,12 @@ usage() {
         echo "  status    - show status of cc-format"
     else
         echo "Usage: $0 <filename>"
+        echo "       $0 --hook"
         echo "Formats files based on their extension:"
         echo "  .py       - formatted with ruff"
         echo "  .ts/.tsx/.js - formatted with the repo's own prettier or biome config if it has one,"
         echo "                 otherwise biome with cc-format's defaults"
+        echo "--hook reads a Claude Code or Codex PostToolUse event from stdin and formats the files it changed"
     fi
     exit 1
 }
@@ -52,6 +54,58 @@ control_mode() {
     esac
 }
 
+HOOK_FILE_PATTERN='\.(py|ts|tsx|js)$'
+
+# Paths a Codex patch added, updated or moved to, in order and deduplicated
+patch_paths() {
+    sed -nE 's/^[[:space:]]*\*\*\* (Add File|Update File|Move to): (.*[^[:space:]])[[:space:]]*$/\2/p' \
+        | awk '!seen[$0]++'
+}
+
+# Claude Code: one file per Edit/MultiEdit/Write, the formatter's output and exit status pass through
+hook_claude() {
+    local self="$1" event="$2" file_path
+    file_path="$(jq -r '.tool_input.file_path // empty' <<< "$event")"
+    [[ "$file_path" =~ $HOOK_FILE_PATTERN ]] || exit 0
+    exec "$self" "$file_path"
+}
+
+# Codex: one apply_patch can touch several files. The model is not told that a hook changed a file, so
+# report the reformatted files or its next patch misses. Report formatter errors the same way and exit 0:
+# a non-zero status would replace the patch's result and make an applied patch look failed.
+hook_codex() {
+    local self="$1" event="$2" path before output changed="" failures="" failed_paths=""
+    cd "$(jq -r '.cwd // "."' <<< "$event")" || exit 0
+    while IFS= read -r path; do
+        # A moved file's old path no longer exists, deleted files are not listed
+        [[ "$path" =~ $HOOK_FILE_PATTERN ]] && [ -f "$path" ] || continue
+        before="$(cksum < "$path")"
+        if ! output="$("$self" "$path" 2>&1 < /dev/null)"; then
+            failures+="
+- $path: $output"
+            failed_paths+=" $path"
+        elif [ "$(cksum < "$path")" != "$before" ]; then
+            changed+="
+- $path"
+        fi
+    done < <(jq -r '.tool_input.command // empty' <<< "$event" | patch_paths)
+    report_codex_hook "$changed" "$failures" "$failed_paths"
+    exit 0
+}
+
+# Print the Codex hook output for reformatted and failed files, nothing when there are neither
+report_codex_hook() {
+    local changed="$1" failures="$2" failed_paths="$3" context=""
+    [ -n "$changed" ] && context="cc-format reformatted these files after your patch, re-read them before patching them again:$changed"
+    [ -n "$failures" ] && context="${context:+$context
+
+}cc-format failed on these files, your patch itself was applied:$failures"
+    [ -z "$context" ] && return
+    jq -n --arg context "$context" --arg failed "$failed_paths" '
+        {hookSpecificOutput: {hookEventName: "PostToolUse", additionalContext: $context}}
+        + if $failed == "" then {} else {systemMessage: "cc-format failed on\($failed)"} end'
+}
+
 # Check arguments
 [ $# -eq 0 ] && usage
 
@@ -67,6 +121,16 @@ if [ -f "$IS_OFF_FILE" ]; then
         echo "cc-format is disabled, skipping formatting" >&2
     fi
     exit 0
+fi
+
+# Hook mode: format the files changed by a Claude Code or Codex PostToolUse event
+if [ "$1" == "--hook" ]; then
+    SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+    EVENT="$(cat)"
+    if [ "$(jq -r '.tool_name' <<< "$EVENT")" == apply_patch ]; then
+        hook_codex "$SELF" "$EVENT"
+    fi
+    hook_claude "$SELF" "$EVENT"
 fi
 
 # Get the file path from the first argument

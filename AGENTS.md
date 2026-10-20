@@ -36,4 +36,4 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 
 - `kb/docs/skill-invocation.md` — Read before changing skill invocation policies or synchronizing installed skills; explicit-only skills need both Claude Code and Codex settings.
 - `kb/docs/app-defaults.md` — Read when inspecting or changing macOS application preferences or modifying `app-defaults.py`.
-- `kb/docs/codex-cc-format.md` — Codex global PostToolUse adapter for the existing Claude cc-format command; keep the embedded command identical and run `uv run test_codex_cc_format.py` after changes.
+- `kb/docs/cc-format-hook.md` — Read before changing `cc-format --hook` or the Claude Code / Codex PostToolUse hooks that call it; Codex needs different reporting from Claude. Run `./test-cc-format.sh` after changes.
