@@ -1,10 +1,11 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = []
+# dependencies = ["prompt-toolkit>=3.0,<4"]
 # ///
 """Download a thunderx:// JSON task list using a dedicated foreground aria2.
 
+    ./thunder-download.py                     # paste a list, then press Enter
     ./thunder-download.py tmp/thunder.txt
     ./thunder-download.py tmp/thunder.txt -d /Volumes/Data/Downloads
 
@@ -21,6 +22,8 @@ import subprocess
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
+
+from prompt_toolkit import prompt
 
 
 def parse_tasks(text: str) -> list[str]:
@@ -47,7 +50,7 @@ def parse_tasks(text: str) -> list[str]:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('file', type=Path, help='迅雷一键下载列表文件')
+    parser.add_argument('file', nargs='?', type=Path, help='迅雷一键下载列表文件（省略时粘贴输入）')
     parser.add_argument(
         '-d',
         '--dir',
@@ -91,7 +94,22 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     process = None
     try:
-        urls = parse_tasks(args.file.read_text(encoding='utf-8-sig'))
+        if args.file is not None:
+            urls = parse_tasks(args.file.read_text(encoding='utf-8-sig'))
+        else:
+            # prompt_toolkit preserves bracketed multiline paste until Enter,
+            # including on macOS Python builds using libedit.
+            print('请粘贴迅雷下载内容（支持多行），粘贴完成后按回车确认；Ctrl+C 取消。', flush=True)
+            text = ''
+            while True:
+                text += prompt('> ' if not text else '… ') + '\n'
+                try:
+                    urls = parse_tasks(text)
+                except json.JSONDecodeError:
+                    # Also accept multiline input in terminals without
+                    # bracketed paste support; wait for a complete JSON value.
+                    continue
+                break
         executable = shutil.which('aria2c')
         if not executable:
             raise RuntimeError('找不到 aria2c，请先安装：brew install aria2')
@@ -111,6 +129,9 @@ def main(argv: list[str] | None = None) -> int:
             process.wait()
         print('\n下载已停止，重新运行相同命令可续传。', file=sys.stderr)
         return 130
+    except EOFError:
+        print('错误：输入为空或下载列表不完整，请重新粘贴完整内容。', file=sys.stderr)
+        return 1
     except (OSError, ValueError, RuntimeError) as exc:
         print(f'错误：{exc}', file=sys.stderr)
         return 1

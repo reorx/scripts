@@ -1,11 +1,12 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = []
+# dependencies = ["prompt-toolkit>=3.0,<4"]
 # ///
 """Behavior tests; real downloads use a temporary local HTTP server."""
 
 import importlib.util
+import io
 import json
 import shutil
 import subprocess
@@ -16,6 +17,7 @@ import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).with_name('thunder-download.py')
 spec = importlib.util.spec_from_file_location('thunder_download', SCRIPT)
@@ -28,6 +30,37 @@ def download_list(urls):
 
 
 class BehaviorTests(unittest.TestCase):
+    def test_file_argument_is_optional(self):
+        self.assertIsNone(app.parse_args([]).file)
+
+    def test_pasted_single_and_multiple_lines_start_without_eof(self):
+        url = 'https://example.org/a'
+        multiline = 'thunderx://' + json.dumps({'tasks': [{'url': url}]}, indent=2)
+        for lines in ([download_list([url])], [multiline], multiline.splitlines()):
+            with self.subTest(lines=lines), tempfile.TemporaryDirectory() as directory:
+                with (
+                    patch.object(app, 'prompt', side_effect=lines) as read,
+                    patch.object(app.shutil, 'which', return_value='/bin/aria2c'),
+                    patch.object(app.subprocess, 'Popen') as process,
+                    patch('sys.stdout', new_callable=io.StringIO),
+                ):
+                    process.return_value.returncode = 0
+                    self.assertEqual(app.main(['-d', directory]), 0)
+                    process.return_value.communicate.assert_called_once_with(url + '\n')
+                    self.assertEqual(read.call_count, len(lines))
+
+    def test_incomplete_or_empty_paste_at_eof_does_not_start_download(self):
+        for lines in ([EOFError], ['thunderx://{', EOFError]):
+            with (
+                self.subTest(lines=lines),
+                patch.object(app, 'prompt', side_effect=lines),
+                patch.object(app.subprocess, 'Popen') as process,
+                patch('sys.stderr', new_callable=io.StringIO),
+                patch('sys.stdout', new_callable=io.StringIO),
+            ):
+                self.assertEqual(app.main([]), 1)
+                process.assert_not_called()
+
     def test_extracts_urls_and_removes_duplicates_in_order(self):
         urls = ['https://example.org/a', 'https://example.org/b']
         self.assertEqual(app.parse_tasks(download_list(urls + urls)), urls)
