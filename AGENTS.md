@@ -32,6 +32,10 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 - `yt-transcript.py <url-or-id>` fetches one caption track through the `yt-dlp` binary and prints `[mm:ss]` lines (`--format plain|json`, `--lang`, `--list`). Default track: uploaded subtitles in the video's language, else that language's `-orig` ASR track — auto-dubbed videos carry one `-orig` per audio track, so match on `info.language`, not the suffix.
 - Keep downloads to exactly one `--sub-langs` code: requesting several (e.g. `en.*,zh.*`) gets HTTP 429 from YouTube. Run `uv run test_yt_transcript.py` when changing it.
 
+## Git history squashing
+
+- `skills/squash-docs/scripts/squash-docs.ts` folds linear runs of commits whose subject matches `--pattern` (default `docs:`) into one, reusing original trees and keeping merges; preview by default, `--apply` updates only the current branch behind a `refs/squash-docs-backup/` ref. It is the repo's only TypeScript script: Node >= 22.18, no dependencies, run `node test-squash-docs.ts` when changing it.
+
 ## Documentation
 
 - `kb/docs/skill-invocation.md` — Read before changing skill invocation policies or synchronizing installed skills; explicit-only skills need both Claude Code and Codex settings.

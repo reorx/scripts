@@ -18,6 +18,7 @@ tags:
 | `llm-models` | 允许自动调用 |
 | `macos-launchd-agents` | 允许自动调用 |
 | `obsidian` | 允许自动调用 |
+| `squash-docs` | 允许自动调用 |
 | `systools` | 允许自动调用 |
 
 同级 `devblocks` 仓库中，用户另外指定以下 skill 仅显式调用：`agentsmd-enhance`、`agentsmd-enhance-cn`、`browser-ext`、`herdr-coordinator`、`macos-app-bootstrap`、`tmuxp`。用户提到的 “tmuxup” 按现有 skill 名称 `tmuxp` 处理。该仓库使用 SKM 管理安装，调用方式约束也记录在其 `AGENTS.md`。
@@ -47,7 +48,7 @@ policy:
 
 本机的这些 skill 由 SKM 管理安装，新增配置文件后通过 SKM 刷新现有安装。SKM 对 Claude Code 使用软链接，对标准目录 `~/.agents/skills` 使用文件树，同一文件系统下使用硬链接。仓库另有 `./link-skill skills/<name>` 工具用于软链接安装；已有 SKM 登记的安装应继续由 SKM 管理。
 
-检查实际安装路径后再同步。本机核查时，Claude Code 的这 7 个 skill 目录是指向仓库的软链接；`~/.agents/skills` 则是独立目录，已有部分文件与仓库文件共用硬链接。编辑器可能替换文件、打断硬链接；新增 `agents/openai.yaml` 也不会因其他文件共用硬链接而自动出现。同步后需对比 `SKILL.md` 和 `agents/openai.yaml` 的内容，不能只检查仓库。
+检查实际安装路径后再同步。本机核查时，Claude Code 的这些 skill 目录是指向仓库的软链接；`~/.agents/skills` 则是独立目录，已有部分文件与仓库文件共用硬链接。编辑器可能替换文件、打断硬链接；新增 `agents/openai.yaml` 也不会因其他文件共用硬链接而自动出现。同步后需对比 `SKILL.md` 和 `agents/openai.yaml` 的内容，不能只检查仓库。
 
 配置更新后，在新会话中检查是否生效；Codex 未检测到更新时重启。已经读入当前会话的 skill 内容不会因修改磁盘配置而被撤回。
 
