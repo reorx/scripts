@@ -4,9 +4,8 @@ description: >-
   Squash runs of consecutive docs commits (or any commits whose subject matches a regex) on the
   current git branch into single commits, keeping every tree, merge, author/date and the full
   original messages. Previews by default; --apply rewrites only the current branch, atomically,
-  behind a backup ref. Use when the user wants to clean up, fold, or compress noisy docs / kb /
-  notes / chore / wip commits in git history — "squash docs commits", "too many docs commits",
-  "合并 docs 提交", "压缩文档提交", "整理提交历史".
+  behind a backup ref. Use only when the user explicitly invokes squash-docs.
+disable-model-invocation: true
 ---
 
 # squash-docs

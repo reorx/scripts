@@ -15,10 +15,10 @@ tags:
 | `create-skill` | 仅显式调用 |
 | `flyctl` | 仅显式调用 |
 | `hnread` | 仅显式调用 |
+| `squash-docs` | 仅显式调用 |
 | `llm-models` | 允许自动调用 |
 | `macos-launchd-agents` | 允许自动调用 |
 | `obsidian` | 允许自动调用 |
-| `squash-docs` | 允许自动调用 |
 | `systools` | 允许自动调用 |
 
 同级 `devblocks` 仓库中，用户另外指定以下 skill 仅显式调用：`agentsmd-enhance`、`agentsmd-enhance-cn`、`browser-ext`、`herdr-coordinator`、`macos-app-bootstrap`、`tmuxp`。用户提到的 “tmuxup” 按现有 skill 名称 `tmuxp` 处理。该仓库使用 SKM 管理安装，调用方式约束也记录在其 `AGENTS.md`。

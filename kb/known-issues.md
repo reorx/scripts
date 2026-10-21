@@ -34,3 +34,9 @@
 
 - 记录：2026-09-29（早就存在，这次才发现）
 - 注释里引用的 shebang `uv run --script` 含 `--`，XML 规范不允许注释里出现它。launchd 和 plutil 能容忍，所以任务一直正常；Python 的 `plistlib`（expat）会直接报错，launchd-list 靠 plutil 兜底才读得出来。想彻底消除，就把注释里的 `--script` 改写掉。
+
+## SKM：`~/.agents/skills/systools` 有仓库里没有的改动，`skm install` 整体中断
+
+- 记录：2026-10-21（安装 squash-docs 时发现）
+- 该副本在 2026-10-19 被直接修改：description 改成了监控告警方向，新增 “Monitoring changes and workload-aware alerts” 一节和 `references/process-alert-policies.md`，仓库的 `skills/systools` 里都没有。SKM 因此判定它不是托管副本，非交互运行时卡在覆盖确认上报错退出，排在后面的 skill 不刷新，锁文件也不写入。`squash-docs` 因此没有锁文件记录，`~/.agents` 里的副本是按 SKM 的方式手动补的硬链接。
+- 处理方向：先决定这些改动要不要并回仓库。并回后内容一致，SKM 会重新认作托管副本；不要的话用 `skm install --force` 覆盖。
