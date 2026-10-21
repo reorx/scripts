@@ -1,6 +1,6 @@
 ---
 name: systools
-description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing processes on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots — CPU temp, load, memory, swap, disk, network (\"how's my mac\", \"is it overheating\"); live memory I/O pressure — pageouts, swap churn, compressor activity (\"why is my mac slow\", \"is it swapping\"); releasing leaked dev test resources — booted iOS simulators and agent-browser headless Chrome (\"clean up simulators\", \"close all agent-browser\", \"清理模拟器\", teardown after browser/iOS testing) — and pruning the shared Rust/cargo target dir by last use (\"cargo target is huge\", \"clean rust build cache\", \"清理 cargo 缓存\"); WindowServer CPU/GPU diagnostics (\"WindowServer is hot\", \"UI feels laggy\"); managing the daily wake/sleep schedule via pmset (\"schedule my mac to sleep at 1am\", \"change the auto sleep time\", \"自动休眠计划\"); auditing launchd + cron scheduled jobs and whether they are actually loaded (\"what runs periodically\", \"why isn't my launch agent running\", \"定时任务\", \"launchd 有哪些\"); listing/managing macOS Background Task Management items shown in System Settings; and repairing PostgreSQL instances that will not start under brew services (\"postgresql shows error in brew services\", \"postgres won't start\", \"lock file postmaster.pid already exists\", \"数据库起不来\"). macOS-only except port management."
+description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing what's on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots and live memory pressure — CPU temp, load, memory, swap, pageouts (\"how's my mac\", \"why is my mac slow\"); releasing leaked test resources — booted iOS simulators, agent-browser Chrome, the shared cargo target dir (\"clean up simulators\", \"清理模拟器\", \"清理 cargo 缓存\"); WindowServer CPU/GPU (\"WindowServer is hot\", \"UI feels laggy\"); the daily pmset wake/sleep schedule (\"sleep my mac at 1am\", \"自动休眠计划\"); auditing launchd + cron jobs and Background Task Management items (\"定时任务\", \"why isn't my launch agent running\"); repairing PostgreSQL that won't start under brew services (\"lock file postmaster.pid already exists\", \"数据库起不来\"); and tuning the local monitoring stack's per-process CPU alerts (\"prl_vm_app alert is noisy\", \"调 CPU 告警阈值\"). macOS-only except port management."
 ---
 
 # systools
@@ -514,3 +514,20 @@ pg-doctor --selftest
 - An app suddenly cannot reach postgres on 5432 after a reboot → `pg-doctor`
 - The postgres log is exploding in size → `pg-doctor` reports the FATAL count and log size directly
 - Checking a non-brew or second cluster → `pg-doctor --datadir <path>`
+
+## Local Monitoring: Process CPU Alerts
+
+### Tune a noisy or missing per-process CPU alert
+
+**Reference:** `references/process-alert-policies.md`
+
+The user's self-hosted monitoring stack (Telegraf + proc-top → VictoriaMetrics → Grafana → Telegram, with Hermes AI triage) lives in `~/Documents/macos-monitoring`. Per-process CPU thresholds come from its `process-rules.yaml` through a generator. Before changing a rule, read the reference: it lists the project documents that hold the mechanics and current values, and the order of work.
+
+- Read process CPU in its units and context before calling it runaway: 100% is one core, so a VM or compiler can legitimately use several. Check the executable's identity and what the user is doing; don't turn one expected workload into a permanent exemption.
+- Change the policy only through the project's policy file and generator — no hardcoded exceptions, no AI-only suppression. Host-wide alerts, existing pauses and the AI triage budgets stay as they are.
+- A remembered threshold is not proof of what is deployed; read the current configuration and the live rules first.
+- Report local tests, historical replay, deployed configuration and real notification delivery as separate acceptance levels.
+
+**Typical scenarios:**
+- "The prl_vm_app CPU alert keeps firing while my VM is busy" → confirm the process and workload, then follow the reference
+- "Add a CPU threshold for <process>" → add an exact-name entry to `process-rules.yaml`, preview, replay, deploy after approval

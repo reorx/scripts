@@ -46,7 +46,7 @@ policy:
 
 ## 安装与生效
 
-本机的这些 skill 由 SKM 管理安装，新增配置文件后通过 SKM 刷新现有安装。SKM 对 Claude Code 使用软链接，对标准目录 `~/.agents/skills` 使用文件树，同一文件系统下使用硬链接。仓库另有 `./link-skill skills/<name>` 工具用于软链接安装；已有 SKM 登记的安装应继续由 SKM 管理。
+本机的这些 skill 由 SKM 管理安装，新增配置文件后通过 SKM 刷新现有安装。刷新时直接运行 `skm install`，不带路径参数：`~/.config/skm/skills.yaml` 把整个仓库登记为本地包，会自动发现 `skills/` 下的全部 skill，新增的 skill 也一起装上。不要直接修改 `~/.agents/skills` 下的副本：内容一旦与仓库不同，SKM 就不再认作托管副本，`skm install` 会停在覆盖确认上。SKM 对 Claude Code 使用软链接，对标准目录 `~/.agents/skills` 使用文件树，同一文件系统下使用硬链接。仓库另有 `./link-skill skills/<name>` 工具用于软链接安装；已有 SKM 登记的安装应继续由 SKM 管理。
 
 检查实际安装路径后再同步。本机核查时，Claude Code 的这些 skill 目录是指向仓库的软链接；`~/.agents/skills` 则是独立目录，已有部分文件与仓库文件共用硬链接。编辑器可能替换文件、打断硬链接；新增 `agents/openai.yaml` 也不会因其他文件共用硬链接而自动出现。同步后需对比 `SKILL.md` 和 `agents/openai.yaml` 的内容，不能只检查仓库。
 
