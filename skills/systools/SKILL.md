@@ -1,6 +1,6 @@
 ---
 name: systools
-description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing what's on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots and live memory pressure — CPU temp, load, memory, swap, pageouts (\"how's my mac\", \"why is my mac slow\"); releasing leaked test resources — booted iOS simulators, agent-browser Chrome, the shared cargo target dir (\"clean up simulators\", \"清理模拟器\", \"清理 cargo 缓存\"); WindowServer CPU/GPU (\"WindowServer is hot\", \"UI feels laggy\"); the daily pmset wake/sleep schedule (\"sleep my mac at 1am\", \"自动休眠计划\"); auditing launchd + cron jobs and Background Task Management items (\"定时任务\", \"why isn't my launch agent running\"); repairing PostgreSQL that won't start under brew services (\"lock file postmaster.pid already exists\", \"数据库起不来\"); and tuning the local monitoring stack's per-process CPU alerts (\"prl_vm_app alert is noisy\", \"调 CPU 告警阈值\"). macOS-only except port management."
+description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing what's on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots and live memory pressure — CPU temp, load, memory, swap, pageouts (\"how's my mac\", \"why is my mac slow\"); releasing leaked test resources — booted iOS simulators, agent-browser Chrome, the shared cargo target dir (\"clean up simulators\", \"清理模拟器\", \"清理 cargo 缓存\"); WindowServer CPU/GPU (\"WindowServer is hot\", \"UI feels laggy\"); keeping the Mac awake up to 24h (\"keep my mac awake\", \"防止休眠\"); the daily pmset wake/sleep schedule (\"sleep my mac at 1am\", \"自动休眠计划\"); auditing launchd + cron jobs and Background Task Management items (\"定时任务\", \"why isn't my launch agent running\"); repairing PostgreSQL that won't start under brew services (\"lock file postmaster.pid already exists\", \"数据库起不来\"); and tuning the local monitoring stack's per-process CPU alerts (\"prl_vm_app alert is noisy\", \"调 CPU 告警阈值\"). macOS-only except port management."
 ---
 
 # systools
@@ -271,6 +271,33 @@ sudo -E <skill-path>/scripts/window-server-doctor.py
 - "Which app is burning the GPU?" → `sudo -E window-server-doctor.py --quick` then look at section 5 isn't available under `--quick`; drop `--quick` instead
 - "Do I have too many windows open?" → run with `--slow-windows` to see per-app window counts
 - Non-disruptive fixes: Cmd+H the top GPU consumer, reduce transparency/motion in Accessibility, switch dynamic wallpaper to static, unplug unused external displays
+
+## macOS Keep-Awake
+
+### Keep the Mac from sleeping for a long job, display still sleeps, max 24h
+
+**Script:** `scripts/mac-keepawake` (linked to `~/.local/bin/mac-keepawake`)
+
+**Prerequisites:** macOS only. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Wraps `caffeinate`, `pmset -g`, `ps`, `system_profiler`. No sudo.
+
+```bash
+mac-keepawake on                 # 24h (default and maximum)
+mac-keepawake on 8h --screen-off # 8h, and turn the display off right away
+mac-keepawake off                # stop early
+mac-keepawake                    # status: time left, who holds what, last log entry
+uv run test_mac_keepawake.py     # 20 behaviour tests (e2e part skips while a real session runs)
+```
+
+**How it works:** `on` spawns a detached watcher (`setsid`, survives the terminal/SSH session) that runs `caffeinate -i -s -w <watcher> -t <duration+60s>` and checks the **wall clock** every 30s; at the deadline it terminates caffeinate and logs `OFF expired` — the same thing `off` does. No `-d`, so `displaysleep` still applies (this also keeps monitoring alert #15 "screen never slept for 6h" quiet). `pmset` is **never modified**, so there is nothing to restore: when the assertion goes away the normal timers apply again, and a crash, `kill` or reboot can't leave the Mac stuck awake.
+
+**Notes / gotchas:**
+
+- Sessions are found by scanning `ps` for `mac-keepawake _watch --since <epoch> --until <epoch>`; there is no state file. `off` signals only that watcher and its own caffeinate child — other caffeinates (Claude Code holds `caffeinate -i -t 300` while working) are listed as "not ours" and left alone. Covered by an e2e test with a real bystander caffeinate.
+- `on` while a session runs **replaces** it (new 24h window from now), never stacks. Durations need a unit (`8h`, `90m`, `1h30m`, `45s`); over 24h is rejected, not clamped.
+- The deadline is enforced by the watcher, not by caffeinate's `-t`, because `-t` isn't guaranteed to count time spent asleep (lid closed, Apple menu › Sleep); `-t` is only a backstop if the watcher hangs, `-w` kills caffeinate if the watcher dies.
+- The watcher is started with `realpath(sys.executable)`: `uv run --script` executes from a temp env under `~/.cache/uv/builds-v0/` that uv deletes as soon as `on` exits.
+- Still sleeps on: closing the lid **without** an external display (closed-display mode needs display + power), Apple menu › Sleep, critically low battery. `-s` only has effect on AC; `-i` covers battery.
+- Log: `~/Library/Logs/mac-keepawake.log` (`ON` / `OFF <reason>` lines; `MAC_KEEPAWAKE_LOG` overrides it, used by the tests).
 
 ## macOS Sleep/Wake Schedule
 

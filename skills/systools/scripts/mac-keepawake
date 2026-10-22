@@ -1,0 +1,477 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Keep the Mac from sleeping for up to 24h, while the display still sleeps as usual.
+
+`on` starts a detached watcher that holds a `caffeinate -i -s` assertion and drops it
+once the wall-clock deadline passes; `off` stops it early. Power settings (pmset) are
+never modified, so there is nothing to restore: once the assertion is gone the normal
+sleep timers simply apply again. An assertion dies with its process, so a crash, a
+`kill` or a reboot can never leave the Mac stuck in "never sleep".
+
+Sessions are found by scanning `ps` for the watcher's command line, which carries the
+start and deadline, so there is no state file to go stale. Events go to the log file.
+"""
+
+import argparse
+import contextlib
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+MAX_SECS = 24 * 3600
+CAFFEINATE = "/usr/bin/caffeinate"
+# -i blocks idle sleep on AC and battery, -s additionally blocks system sleep on AC.
+# No -d: the display keeps its own sleep timer.
+CAFFEINATE_FLAGS = ["-i", "-s"]
+SLEEP_KINDS = {"PreventUserIdleSystemSleep", "PreventSystemSleep"}
+# caffeinate's -t is not guaranteed to count time the Mac spent asleep anyway (lid
+# closed, Apple menu › Sleep), so the watcher checks the wall clock itself and -t is
+# only a backstop in case the watcher hangs.
+POLL_SECS = 30
+BACKSTOP_SECS = 60
+LOG_PATH = Path(os.environ.get("MAC_KEEPAWAKE_LOG", "~/Library/Logs/mac-keepawake.log")).expanduser()
+SELF = os.path.realpath(__file__)
+
+WATCHER_RE = re.compile(r"\bmac-keepawake _watch --since (\d+) --until (\d+)\b")
+DURATION_RE = re.compile(r"(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?")
+ASSERTION_RE = re.compile(r'^\s*pid (\d+)\(([^)]*)\): \[[^\]]*\] \S+ (\w+) named: "(.*)"')
+TIMER_RE = re.compile(r"\s+(sleep|displaysleep)\s+(\d+)")
+
+
+@dataclass
+class Session:
+    watcher_pid: int
+    since: int
+    until: int
+    caffeinate_pid: int | None
+
+
+@dataclass
+class Assertion:
+    pid: int
+    process: str
+    kind: str
+    name: str
+
+
+@dataclass
+class SystemInfo:
+    settings: dict[str, dict[str, int]]
+    source: str
+    external_displays: list[str]
+
+
+# ── parsing ─────────────────────────────────────────────────────────────────
+
+
+def parse_duration(text: str | None) -> int:
+    if text is None:
+        return MAX_SECS
+    m = DURATION_RE.fullmatch(text.strip())
+    if not text.strip() or not m:
+        raise ValueError(f"invalid duration {text!r}: use h/m/s units, like 8h, 90m or 1h30m")
+    hours, minutes, seconds = (int(g or 0) for g in m.groups())
+    secs = hours * 3600 + minutes * 60 + seconds
+    if secs <= 0:
+        raise ValueError("duration must be more than zero")
+    if secs > MAX_SECS:
+        raise ValueError(f"{text} is longer than the 24h maximum")
+    return secs
+
+
+def parse_procs(ps_text: str) -> dict[int, tuple[int, str]]:
+    procs = {}
+    for line in ps_text.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+            procs[int(parts[0])] = (int(parts[1]), parts[2])
+    return procs
+
+
+def find_sessions(ps_text: str) -> list[Session]:
+    procs = parse_procs(ps_text)
+    sessions = []
+    for pid, (_, command) in procs.items():
+        if m := WATCHER_RE.search(command):
+            child = next(
+                (p for p, (ppid, cmd) in procs.items() if ppid == pid and Path(cmd.split()[0]).name == "caffeinate"),
+                None,
+            )
+            sessions.append(Session(pid, int(m[1]), int(m[2]), child))
+    return sessions
+
+
+def parse_assertions(text: str) -> list[Assertion]:
+    return [Assertion(int(m[1]), m[2], m[3], m[4]) for line in text.splitlines() if (m := ASSERTION_RE.match(line))]
+
+
+def other_blockers(assertions: list[Assertion], exclude_pids: set[int]) -> list[Assertion]:
+    # powerd's "Prevent sleep while display is on" is part of normal sleep, not a blocker.
+    return [a for a in assertions if a.kind in SLEEP_KINDS and a.pid not in exclude_pids and a.process != "powerd"]
+
+
+def parse_power_settings(text: str) -> dict[str, dict[str, int]]:
+    settings, current = {}, None
+    for line in text.splitlines():
+        if line.endswith(":") and not line.startswith(" "):
+            current = settings.setdefault(line[:-1], {})
+        elif current is not None and (m := TIMER_RE.match(line)):
+            current[m[1]] = int(m[2])
+    return settings
+
+
+def parse_power_source(text: str) -> str:
+    m = re.search(r"Now drawing from '([^']+)'", text)
+    return m[1] if m else "unknown"
+
+
+def parse_external_displays(json_text: str) -> list[str]:
+    data = json.loads(json_text)
+    return [
+        d["_name"]
+        for gpu in data.get("SPDisplaysDataType", [])
+        for d in gpu.get("spdisplays_ndrvs", [])
+        if d.get("spdisplays_online") == "spdisplays_yes"
+        and d.get("spdisplays_connection_type") != "spdisplays_internal"
+    ]
+
+
+def describe_profile(profile: dict[str, int]) -> str:
+    display_mins, sleep_mins = profile.get("displaysleep", 0), profile.get("sleep", 0)
+    if display_mins:
+        display = f"display off after {display_mins} min idle"
+    else:
+        display = "display never turns off on its own (displaysleep 0)"
+    if not sleep_mins:
+        system = "the system never idle-sleeps (sleep 0)"
+    elif display_mins and sleep_mins <= display_mins:
+        # powerd holds the system awake while the display is on.
+        system = f"system sleeps right after (sleep timer {sleep_mins} min)"
+    else:
+        system = f"system sleep after {sleep_mins} min idle"
+    return f"{display}, {system}"
+
+
+# ── formatting ──────────────────────────────────────────────────────────────
+
+
+def fmt_span(secs: float) -> str:
+    secs = max(int(round(secs)), 0)
+    hours, rem = divmod(secs, 3600)
+    minutes, seconds = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    if minutes:
+        return f"{minutes}m"
+    return f"{seconds}s"
+
+
+def fmt_time(epoch: float) -> str:
+    return time.strftime("%a %m-%d %H:%M", time.localtime(epoch))
+
+
+def fmt_blocker(a: Assertion, procs: dict[int, tuple[int, str]]) -> str:
+    if a.process == "caffeinate" and a.pid in procs:
+        parent = procs.get(procs[a.pid][0])
+        if parent:
+            return f"caffeinate pid {a.pid} (started by {Path(parent[1].split()[0]).name})"
+    return f'{a.process} pid {a.pid} "{a.name[:40]}"'
+
+
+def print_profiles(info: SystemInfo, indent: str = "      ") -> None:
+    for name in sorted(info.settings, key=lambda n: n != info.source):
+        mark = "   ← now" if name == info.source else ""
+        print(f"{indent}{name}: {describe_profile(info.settings[name])}{mark}")
+
+
+def print_blockers(assertions: list[Assertion], procs: dict[int, tuple[int, str]], exclude_pids: set[int]) -> None:
+    seen = {}
+    for a in other_blockers(assertions, exclude_pids):
+        seen.setdefault(a.pid, a)
+    if seen:
+        listed = ", ".join(fmt_blocker(a, procs) for a in seen.values())
+        print(f"  - Also holding the Mac awake right now (not ours, left alone): {listed}")
+
+
+def lid_line(info: SystemInfo) -> str | None:
+    if "Battery Power" not in info.settings:
+        return None  # a desktop Mac has no lid
+    if info.external_displays:
+        names = ", ".join(info.external_displays)
+        return f"Lid: closing it is fine while {names} and power stay connected (closed-display mode)"
+    return "Lid: keep it open: with no external display connected, closing it sleeps the Mac regardless"
+
+
+def last_log_line() -> str | None:
+    if not LOG_PATH.exists():
+        return None
+    lines = [line for line in LOG_PATH.read_text().splitlines() if line.strip()]
+    return lines[-1] if lines else None
+
+
+# ── system access ───────────────────────────────────────────────────────────
+
+
+def run(cmd: list[str]) -> str:
+    return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
+
+
+def read_ps() -> str:
+    return run(["/bin/ps", "-Awwo", "pid=,ppid=,command="])
+
+
+def read_assertions() -> str:
+    return run(["/usr/bin/pmset", "-g", "assertions"])
+
+
+def read_system_info() -> SystemInfo:
+    return SystemInfo(
+        settings=parse_power_settings(run(["/usr/bin/pmset", "-g", "custom"])),
+        source=parse_power_source(run(["/usr/bin/pmset", "-g", "batt"])),
+        external_displays=parse_external_displays(run(["/usr/sbin/system_profiler", "SPDisplaysDataType", "-json"])),
+    )
+
+
+def log_event(message: str) -> None:
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_PATH.open("a") as f:
+        f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {message}\n")
+
+
+def signal_pid(pid: int, sig: int) -> None:
+    # The watcher takes its caffeinate down with it, so the second signal may find it gone.
+    with contextlib.suppress(ProcessLookupError):
+        os.kill(pid, sig)
+
+
+def signal_sessions(sessions: list[Session], kill=signal_pid) -> None:
+    for s in sessions:
+        for pid in (s.watcher_pid, s.caffeinate_pid):
+            if pid:
+                kill(pid, signal.SIGTERM)
+
+
+def wait_for(predicate, timeout: float = 3.0):
+    deadline = time.monotonic() + timeout
+    while not (result := predicate()) and time.monotonic() < deadline:
+        time.sleep(0.1)
+    return result
+
+
+def held_kinds(pid: int | None) -> list[str]:
+    if not pid:
+        return []
+    return [a.kind for a in parse_assertions(read_assertions()) if a.pid == pid and a.kind in SLEEP_KINDS]
+
+
+def stop_all(reason: str) -> list[Session]:
+    sessions = find_sessions(read_ps())
+    if not sessions:
+        return []
+    signal_sessions(sessions)
+    watchers = {s.watcher_pid for s in sessions}
+    caffeinates = {s.caffeinate_pid for s in sessions if s.caffeinate_pid}
+
+    def all_gone():
+        alive = {s.watcher_pid for s in find_sessions(read_ps())} & watchers
+        held = {a.pid for a in parse_assertions(read_assertions())} & caffeinates
+        return not alive and not held
+
+    if not wait_for(all_gone):
+        for pid in watchers | caffeinates:
+            signal_pid(pid, signal.SIGKILL)
+    for s in sessions:
+        log_event(f"OFF  {reason} after {fmt_span(time.time() - s.since)}")
+    return sessions
+
+
+def start_session(secs: int) -> Session:
+    since = int(time.time())
+    until = since + secs
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with LOG_PATH.open("a") as log:
+        # uv runs this script from a throwaway env it deletes on exit; the real interpreter outlives it.
+        watcher = subprocess.Popen(
+            [os.path.realpath(sys.executable), SELF, "_watch", "--since", str(since), "--until", str(until)],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=log, start_new_session=True,
+        )
+
+    def holding():
+        mine = [s for s in find_sessions(read_ps()) if s.watcher_pid == watcher.pid]
+        return mine[0] if mine and "PreventUserIdleSystemSleep" in held_kinds(mine[0].caffeinate_pid) else None
+
+    session = wait_for(holding)
+    if not session:
+        signal_pid(watcher.pid, signal.SIGTERM)
+        raise RuntimeError(f"caffeinate did not take hold within 3s, nothing is active; see {LOG_PATH}")
+    log_event(
+        f"ON   for {fmt_span(secs)} until {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(until))}"
+        f" (watcher {session.watcher_pid}, caffeinate {session.caffeinate_pid})"
+    )
+    return session
+
+
+# ── commands ────────────────────────────────────────────────────────────────
+
+
+def cmd_on(duration: str | None, screen_off: bool) -> None:
+    secs = parse_duration(duration)
+    replaced = stop_all("replaced by a new session")
+    session = start_session(secs)
+    kinds = held_kinds(session.caffeinate_pid)
+    info = read_system_info()
+    if screen_off:
+        run(["/usr/bin/pmset", "displaysleepnow"])
+
+    print(f"Keep-awake is ON for {fmt_span(secs)}, until {fmt_time(session.until)}.")
+    print()
+    print("What changed")
+    for r in replaced:
+        print(f"  ~ Replaced the previous session (it ran until {fmt_time(r.until)}, {fmt_span(r.until - time.time())} left)")
+    print(f"  + caffeinate pid {session.caffeinate_pid} holds {', '.join(kinds)}: the Mac will not sleep on idle")
+    print("  = Power settings untouched (pmset is not modified, so there is nothing to restore later)")
+    if screen_off:
+        print("  + Display turned off now (a key press or mouse move wakes it)")
+    print()
+    print("What happens next")
+    current = info.settings.get(info.source, {})
+    if current.get("displaysleep"):
+        print(f"  - The display still turns off after {current['displaysleep']} min idle (on {info.source})")
+    else:
+        print("  - The display has no sleep timer here (displaysleep 0); `pmset displaysleepnow` turns it off")
+    print(f"  - The Mac stays awake until {fmt_time(session.until)}, then keep-awake ends on its own,")
+    print("    exactly like `mac-keepawake off`, and normal sleep comes back:")
+    print_profiles(info)
+    if lid := lid_line(info):
+        print(f"  - {lid}")
+    if info.source == "Battery Power":
+        print("  - On battery: it stays awake but drains the battery; macOS still sleeps when it runs critically low")
+    print("  - Apple menu › Sleep still puts it to sleep immediately")
+    print()
+    print(f"Stop early: mac-keepawake off  ·  Check: mac-keepawake status  ·  Log: {LOG_PATH}")
+
+
+def cmd_off() -> None:
+    stopped = stop_all("turned off by user")
+    info = read_system_info()
+    procs = parse_procs(read_ps())
+    assertions = parse_assertions(read_assertions())
+    if not stopped:
+        print(f"Keep-awake was not on, nothing changed. Normal sleep applies (on {info.source}):")
+        print_profiles(info, indent="    ")
+        print_blockers(assertions, procs, exclude_pids=set())
+        return
+
+    now = time.time()
+    s = stopped[0]
+    print(f"Keep-awake is OFF. It had been on for {fmt_span(now - s.since)} ({fmt_span(s.until - now)} were left).")
+    print()
+    print("What changed")
+    for s in stopped:
+        print(f"  - Stopped caffeinate pid {s.caffeinate_pid}; its sleep assertions are released")
+    print()
+    print("What happens next")
+    print("  - Normal sleep is back:")
+    print_profiles(info)
+    print_blockers(assertions, procs, exclude_pids=set())
+
+
+def cmd_status() -> None:
+    ps_text = read_ps()
+    sessions = find_sessions(ps_text)
+    procs = parse_procs(ps_text)
+    assertions = parse_assertions(read_assertions())
+    info = read_system_info()
+    now = time.time()
+
+    if not sessions:
+        print(f"Keep-awake is OFF. Normal sleep applies (on {info.source}):")
+        print_profiles(info, indent="    ")
+    for s in sessions:
+        print(
+            f"Keep-awake is ON: {fmt_span(s.until - now)} left, until {fmt_time(s.until)}"
+            f" (started {fmt_time(s.since)}, {fmt_span(s.until - s.since)} in total)."
+        )
+        kinds = [a.kind for a in assertions if a.pid == s.caffeinate_pid and a.kind in SLEEP_KINDS]
+        if kinds:
+            print(f"  - caffeinate pid {s.caffeinate_pid} holds {', '.join(kinds)}")
+        else:
+            print(f"  ⚠️ watcher pid {s.watcher_pid} holds no sleep assertion, so the Mac CAN sleep; run `mac-keepawake on` again")
+        current = info.settings.get(info.source, {})
+        if current.get("displaysleep"):
+            print(f"  - Display still turns off after {current['displaysleep']} min idle (on {info.source})")
+        if lid := lid_line(info):
+            print(f"  - {lid}")
+        print("  - When it ends, normal sleep comes back:")
+        print_profiles(info)
+    print_blockers(assertions, procs, exclude_pids={s.caffeinate_pid for s in sessions})
+    if line := last_log_line():
+        print(f"Last log entry: {line}")
+
+
+def cmd_watch(since: int, until: int) -> None:
+    """The detached session process: hold the assertion until the deadline, then end it."""
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    backstop = until - int(time.time()) + BACKSTOP_SECS
+    # -w: caffeinate exits with this process, however it dies.
+    caffeinate = subprocess.Popen([CAFFEINATE, *CAFFEINATE_FLAGS, "-w", str(os.getpid()), "-t", str(backstop)])
+    try:
+        while caffeinate.poll() is None and time.time() < until:
+            time.sleep(max(min(POLL_SECS, until - time.time()), 0.05))
+    finally:
+        caffeinate.terminate()
+        caffeinate.wait()
+    # Same ending as `off`: the assertion is gone and the event is logged.
+    if time.time() >= until:
+        log_event(f"OFF  expired after {fmt_span(until - since)}")
+    else:
+        log_event(f"OFF  caffeinate exited unexpectedly (code {caffeinate.returncode}) after {fmt_span(time.time() - since)}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="mac-keepawake",
+        description="Keep the Mac from sleeping for up to 24h; the display still sleeps as usual.",
+        epilog="examples:\n  mac-keepawake on              # 24h\n  mac-keepawake on 8h --screen-off\n"
+        "  mac-keepawake off\n  mac-keepawake                 # status",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = parser.add_subparsers(dest="cmd", metavar="{on,off,status}")
+    on = sub.add_parser("on", help="keep awake for DURATION (default and maximum 24h)")
+    on.add_argument("duration", nargs="?", help="like 8h, 90m, 1h30m (default 24h, at most 24h)")
+    on.add_argument("--screen-off", action="store_true", help="also turn the display off right away")
+    sub.add_parser("off", help="stop keeping awake now")
+    sub.add_parser("status", help="show what is active (the default)")
+    watch = sub.add_parser("_watch")
+    watch.add_argument("--since", type=int, required=True)
+    watch.add_argument("--until", type=int, required=True)
+    args = parser.parse_args()
+
+    try:
+        if args.cmd == "on":
+            cmd_on(args.duration, args.screen_off)
+        elif args.cmd == "off":
+            cmd_off()
+        elif args.cmd == "_watch":
+            cmd_watch(args.since, args.until)
+        else:
+            cmd_status()
+    except ValueError as e:
+        print(f"mac-keepawake: {e}", file=sys.stderr)
+        return 2
+    except (RuntimeError, subprocess.CalledProcessError) as e:
+        print(f"mac-keepawake: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
