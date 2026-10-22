@@ -14,7 +14,7 @@ Fetch a Hacker News discussion thread and extract the most valuable insights fro
 
 ## Available Scripts
 
-- **`scripts/hn_flat.py`** — Fetches an HN thread and converts it to flat markdown with nested comment structure.
+- **`scripts/hn_flat.py`** — Fetches an HN thread and converts it to flat markdown with nested comment structure. Fetches with `curl` by default; `--fetcher requests` switches to python-requests.
 
 ## Workflow
 
@@ -75,6 +75,12 @@ Fetch a Hacker News discussion thread and extract the most valuable insights fro
    ```
 
 5. **Language**: Present the analysis in the same language the user used when invoking the skill. If the user wrote in Chinese, respond in Chinese. If in English, respond in English.
+
+## Fetching and Rate Limits
+
+- If HN refuses a fetch (HTTP 419, 429, 503, or a body that just says "Sorry"), do not retry right away. Wait a few minutes, then retry once, optionally with `--fetcher requests`. The script already fetches with curl, so there is no need to download the HTML by hand.
+- When reading several threads in one task, run the script for one thread at a time, never in parallel, and wait at least 30 seconds between fetches (HN's robots.txt sets `Crawl-delay: 30`), e.g. `sleep 30` between calls.
+- In batch runs, pass `--cache-dir <dir>` so that rereading a thread you already fetched loads it from disk instead of hitting HN again.
 
 ## Notes
 

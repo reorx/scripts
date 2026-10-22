@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
 # dependencies = [
@@ -26,6 +26,9 @@ Examples:
     # Use cache to avoid repeated fetching
     uv run hn-flat.py "https://news.ycombinator.com/item?id=12345" --cache-dir ~/.cache/hn
 
+    # Fetch with python-requests instead of curl (the default)
+    uv run hn-flat.py "https://news.ycombinator.com/item?id=12345" --fetcher requests
+
     # Condense long discussions to 50% of original size
     uv run hn-flat.py "https://news.ycombinator.com/item?id=12345" --condense 0.5
 
@@ -37,6 +40,7 @@ import argparse
 import hashlib
 import os
 import re
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from html import unescape
@@ -53,7 +57,7 @@ class Comment:
     author: str
     text: str
     indent: int
-    children: list["Comment"] = field(default_factory=list)
+    children: list['Comment'] = field(default_factory=list)
 
     def descendant_count(self) -> int:
         """Count all descendants recursively."""
@@ -82,91 +86,111 @@ def get_cache_path(url: str, cache_dir: str) -> Path:
     # Extract item ID for readability
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
-    item_id = params.get("id", ["unknown"])[0]
-    filename = f"hn_{item_id}_{url_hash}.html"
+    item_id = params.get('id', ['unknown'])[0]
+    filename = f'hn_{item_id}_{url_hash}.html'
     return Path(cache_dir) / filename
 
 
-def fetch_html(url: str, verbose: bool = False, cache_dir: str | None = None) -> str:
+def fetch_with_curl(url: str) -> str:
+    """Fetch URL with the curl binary; curl's own error message goes to stderr."""
+    result = subprocess.run(
+        ['curl', '--silent', '--show-error', '--fail', '--location', '--max-time', '30', url],
+        stdout=subprocess.PIPE,
+        check=True,
+    )
+    return result.stdout.decode('utf-8')
+
+
+def fetch_with_requests(url: str) -> str:
+    """Fetch URL with python-requests."""
+    # Keep the library's own User-Agent: HN answers 419 when python-requests poses as a browser
+    response = requests.get(url, timeout=30)
+    response.raise_for_status()
+    return response.text
+
+
+FETCHERS = {
+    'curl': fetch_with_curl,
+    'requests': fetch_with_requests,
+}
+
+
+def fetch_html(url: str, verbose: bool = False, cache_dir: str | None = None, fetcher: str = 'curl') -> str:
     """Fetch HTML content from URL, with optional caching."""
     # Check cache first
     if cache_dir:
         cache_path = get_cache_path(url, cache_dir)
         if cache_path.exists():
-            print(f"Loading from cache: {cache_path}", file=sys.stderr)
-            html = cache_path.read_text(encoding="utf-8")
+            print(f'Loading from cache: {cache_path}', file=sys.stderr)
+            html = cache_path.read_text(encoding='utf-8')
             if verbose:
-                print(f"Loaded {len(html)} bytes from cache", file=sys.stderr)
+                print(f'Loaded {len(html)} bytes from cache', file=sys.stderr)
             return html
 
-    print(f"Fetching {url}...", file=sys.stderr)
+    print(f'Fetching {url} with {fetcher}...', file=sys.stderr)
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"
-    }
-    response = requests.get(url, headers=headers, timeout=30)
-    response.raise_for_status()
+    html = FETCHERS[fetcher](url)
 
     if verbose:
-        print(f"Fetched {len(response.text)} bytes", file=sys.stderr)
+        print(f'Fetched {len(html)} bytes', file=sys.stderr)
 
     # Save to cache
     if cache_dir:
         cache_path = get_cache_path(url, cache_dir)
         os.makedirs(cache_dir, exist_ok=True)
-        cache_path.write_text(response.text, encoding="utf-8")
+        cache_path.write_text(html, encoding='utf-8')
         if verbose:
-            print(f"Saved to cache: {cache_path}", file=sys.stderr)
+            print(f'Saved to cache: {cache_path}', file=sys.stderr)
 
-    return response.text
+    return html
 
 
 def extract_text_from_element(element) -> str:
     """Extract plain text from HTML element, stripping all formatting."""
     if element is None:
-        return ""
+        return ''
 
     texts = []
     for child in element.children:
         if isinstance(child, NavigableString):
             texts.append(str(child))
-        elif child.name == "p":
+        elif child.name == 'p':
             # Paragraph break
-            if texts and texts[-1] != "\n\n":
-                texts.append("\n\n")
+            if texts and texts[-1] != '\n\n':
+                texts.append('\n\n')
             texts.append(extract_text_from_element(child))
-            texts.append("\n\n")
-        elif child.name == "br":
-            texts.append("\n")
-        elif child.name in ("a", "i", "b", "code", "pre", "span", "font"):
+            texts.append('\n\n')
+        elif child.name == 'br':
+            texts.append('\n')
+        elif child.name in ('a', 'i', 'b', 'code', 'pre', 'span', 'font'):
             # Strip formatting, keep text
             texts.append(extract_text_from_element(child))
         else:
             texts.append(extract_text_from_element(child))
 
-    result = "".join(texts)
+    result = ''.join(texts)
     # Clean up multiple newlines
-    result = re.sub(r"\n{3,}", "\n\n", result)
+    result = re.sub(r'\n{3,}', '\n\n', result)
     return unescape(result.strip())
 
 
 def is_flagged_comment(comment_div) -> bool:
     """Check if comment is flagged as inappropriate (has c73 class)."""
-    commtext = comment_div.select_one("div.commtext")
-    if commtext and "c73" in commtext.get("class", []):
+    commtext = comment_div.select_one('div.commtext')
+    if commtext and 'c73' in commtext.get('class', []):
         return True
     return False
 
 
 def is_deleted_comment(comment_div) -> bool:
     """Check if comment is deleted or dead."""
-    commtext = comment_div.select_one("div.commtext")
+    commtext = comment_div.select_one('div.commtext')
     if commtext:
         text = commtext.get_text(strip=True)
-        if text in ("[deleted]", "[dead]", "[flagged]"):
+        if text in ('[deleted]', '[dead]', '[flagged]'):
             return True
     # Also check if there's no commtext at all but has a comhead
-    comhead = comment_div.select_one("span.comhead")
+    comhead = comment_div.select_one('span.comhead')
     if comhead and not commtext:
         return True
     return False
@@ -175,74 +199,76 @@ def is_deleted_comment(comment_div) -> bool:
 def parse_comments(html: str, verbose: bool = False) -> list[Comment]:
     """Parse HTML and extract comments into a flat list with indent levels."""
     if verbose:
-        print("Parsing HTML...", file=sys.stderr)
+        print('Parsing HTML...', file=sys.stderr)
 
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, 'html.parser')
     comments = []
 
     # Find all comment table rows
-    comment_rows = soup.select("tr.athing.comtr")
+    comment_rows = soup.select('tr.athing.comtr')
 
     if verbose:
-        print(f"Found {len(comment_rows)} comment rows", file=sys.stderr)
+        print(f'Found {len(comment_rows)} comment rows', file=sys.stderr)
 
     for row in comment_rows:
         # Get indent level from the indent image width
-        indent_td = row.select_one("td.ind img")
-        indent = int(indent_td.get("width", 0)) if indent_td else 0
+        indent_td = row.select_one('td.ind img')
+        indent = int(indent_td.get('width', 0)) if indent_td else 0
 
         # Get comment div
-        comment_div = row.select_one("td.default div.comment")
+        comment_div = row.select_one('td.default div.comment')
         if not comment_div:
             continue
 
         # Skip flagged comments
         if is_flagged_comment(comment_div):
             if verbose:
-                print(f"Skipping flagged comment", file=sys.stderr)
+                print(f'Skipping flagged comment', file=sys.stderr)
             continue
 
         # Skip deleted/dead comments
         if is_deleted_comment(comment_div):
             if verbose:
-                print(f"Skipping deleted/dead comment", file=sys.stderr)
+                print(f'Skipping deleted/dead comment', file=sys.stderr)
             continue
 
         # Get author
-        author_elem = row.select_one("a.hnuser")
-        author = author_elem.get_text() if author_elem else "unknown"
+        author_elem = row.select_one('a.hnuser')
+        author = author_elem.get_text() if author_elem else 'unknown'
 
         # Get comment text
-        commtext = comment_div.select_one("div.commtext")
-        text = extract_text_from_element(commtext) if commtext else ""
+        commtext = comment_div.select_one('div.commtext')
+        text = extract_text_from_element(commtext) if commtext else ''
 
         # Skip empty comments
         if not text:
             continue
 
         # Get comment ID
-        comment_id = row.get("id", "")
+        comment_id = row.get('id', '')
 
-        comments.append(Comment(
-            id=comment_id,
-            author=author,
-            text=text,
-            indent=indent,
-        ))
+        comments.append(
+            Comment(
+                id=comment_id,
+                author=author,
+                text=text,
+                indent=indent,
+            )
+        )
 
     if verbose:
-        print(f"Parsed {len(comments)} valid comments", file=sys.stderr)
+        print(f'Parsed {len(comments)} valid comments', file=sys.stderr)
 
     return comments
 
 
 def extract_post_metadata(html: str) -> dict:
     """Extract post title and link URL from HN page."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, 'html.parser')
     title_elem = soup.select_one('tr.athing.submission span.titleline a')
-    title = title_elem.get_text() if title_elem else "Unknown"
-    link_url = title_elem.get('href') if title_elem else ""
-    return {"title": title, "link_url": link_url}
+    title = title_elem.get_text() if title_elem else 'Unknown'
+    link_url = title_elem.get('href') if title_elem else ''
+    return {'title': title, 'link_url': link_url}
 
 
 def generate_frontmatter(title: str, url: str, link_url: str) -> str:
@@ -284,7 +310,7 @@ def build_comment_tree(flat_comments: list[Comment]) -> list[Comment]:
 
 def format_comment_text(text: str, indent_str: str) -> str:
     """Format multi-line comment text with proper indentation."""
-    lines = text.split("\n")
+    lines = text.split('\n')
     result_lines = []
 
     for i, line in enumerate(lines):
@@ -293,25 +319,25 @@ def format_comment_text(text: str, indent_str: str) -> str:
         else:
             # Indent continuation lines to align with content after "- @user: "
             if line.strip():
-                result_lines.append(indent_str + "  " + line)
+                result_lines.append(indent_str + '  ' + line)
             else:
-                result_lines.append("")
+                result_lines.append('')
 
-    return "\n".join(result_lines)
+    return '\n'.join(result_lines)
 
 
 def render_markdown(comments: list[Comment], depth: int = 0) -> str:
     """Render comment tree as markdown list."""
     lines = []
-    indent_str = "  " * depth
+    indent_str = '  ' * depth
 
     for comment in comments:
         desc_count = comment.descendant_count()
-        count_str = f" [+{desc_count}]" if desc_count > 0 else ""
+        count_str = f' [+{desc_count}]' if desc_count > 0 else ''
 
         # Format the first line
         formatted_text = format_comment_text(comment.text, indent_str)
-        line = f"{indent_str}- @{comment.author}{count_str}: {formatted_text}"
+        line = f'{indent_str}- @{comment.author}{count_str}: {formatted_text}'
         lines.append(line)
 
         # Render children
@@ -319,10 +345,12 @@ def render_markdown(comments: list[Comment], depth: int = 0) -> str:
             child_md = render_markdown(comment.children, depth + 1)
             lines.append(child_md)
 
-    return "\n".join(lines)
+    return '\n'.join(lines)
 
 
-def get_all_leaves(comments: list[Comment], parent: Comment | None = None) -> list[tuple[Comment, Comment | None, list[Comment]]]:
+def get_all_leaves(
+    comments: list[Comment], parent: Comment | None = None
+) -> list[tuple[Comment, Comment | None, list[Comment]]]:
     """Get all leaf comments with their parent and parent's children list."""
     leaves = []
 
@@ -347,7 +375,9 @@ def calculate_depth(comment: Comment, comments: list[Comment], depth: int = 0) -
     return -1
 
 
-def condense_comments(root_comments: list[Comment], target_rate: float, verbose: bool = False, step_size: int = 4) -> list[Comment]:
+def condense_comments(
+    root_comments: list[Comment], target_rate: float, verbose: bool = False, step_size: int = 4
+) -> list[Comment]:
     """Condense comments by removing low-weight leaves until target rate is reached."""
     import copy
 
@@ -357,9 +387,9 @@ def condense_comments(root_comments: list[Comment], target_rate: float, verbose:
     original_length = len(original_md)
 
     if verbose:
-        print(f"Original length: {original_length} chars", file=sys.stderr)
-        print(f"Target rate: {target_rate}", file=sys.stderr)
-        print(f"Step size: {step_size}", file=sys.stderr)
+        print(f'Original length: {original_length} chars', file=sys.stderr)
+        print(f'Target rate: {target_rate}', file=sys.stderr)
+        print(f'Step size: {step_size}', file=sys.stderr)
 
     iteration = 0
     while True:
@@ -368,7 +398,7 @@ def condense_comments(root_comments: list[Comment], target_rate: float, verbose:
         current_rate = current_length / original_length if original_length > 0 else 1.0
 
         if verbose:
-            print(f"Current rate: {current_rate:.3f} ({current_length}/{original_length})", file=sys.stderr)
+            print(f'Current rate: {current_rate:.3f} ({current_length}/{original_length})', file=sys.stderr)
 
         if current_rate <= target_rate:
             break
@@ -378,7 +408,7 @@ def condense_comments(root_comments: list[Comment], target_rate: float, verbose:
 
         if not leaves:
             if verbose:
-                print("No more leaves to remove", file=sys.stderr)
+                print('No more leaves to remove', file=sys.stderr)
             break
 
         # Find leaf with minimum weight, using depth as tiebreaker (deeper first)
@@ -398,6 +428,7 @@ def condense_comments(root_comments: list[Comment], target_rate: float, verbose:
                             if result >= 0:
                                 return result
                     return -1
+
                 depth = find_depth(root_comments, leaf)
             return (weight, -depth)  # Lower weight first, then deeper first
 
@@ -414,7 +445,7 @@ def condense_comments(root_comments: list[Comment], target_rate: float, verbose:
 
         iteration += 1
         if verbose:
-            print(f"Iteration {iteration}: removed {removed_count} leaves", file=sys.stderr)
+            print(f'Iteration {iteration}: removed {removed_count} leaves', file=sys.stderr)
 
     return comments
 
@@ -423,9 +454,9 @@ def extract_id_from_url(url: str) -> str:
     """Extract the item ID from a HN URL."""
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
-    if "id" in params:
-        return params["id"][0]
-    return "unknown"
+    if 'id' in params:
+        return params['id'][0]
+    return 'unknown'
 
 
 def main():
@@ -440,6 +471,9 @@ Examples:
   %(prog)s "https://news.ycombinator.com/item?id=12345" --cache-dir ~/.cache/hn
       Cache HTML to avoid repeated fetching
 
+  %(prog)s "https://news.ycombinator.com/item?id=12345" --fetcher requests
+      Fetch with python-requests instead of curl
+
   %(prog)s "https://news.ycombinator.com/item?id=12345" --condense 0.5
       Condense to 50%% of original size by removing low-weight comments
 
@@ -447,32 +481,47 @@ Examples:
       Save without YAML frontmatter
 """
     parser = argparse.ArgumentParser(
-        description="Fetch and flatten Hacker News discussions into readable markdown.",
+        description='Fetch and flatten Hacker News discussions into readable markdown.',
         epilog=epilog,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("url", help="Hacker News item URL")
+    parser.add_argument('url', help='Hacker News item URL')
 
     # Mutually exclusive output options
     output_group = parser.add_mutually_exclusive_group()
-    output_group.add_argument("-o", "--output", metavar="FILE", help="Output file path")
-    output_group.add_argument("--out-dir", metavar="DIR", help="Output directory (filename auto-generated)")
+    output_group.add_argument('-o', '--output', metavar='FILE', help='Output file path')
+    output_group.add_argument('--out-dir', metavar='DIR', help='Output directory (filename auto-generated)')
 
-    parser.add_argument("--stdout", action="store_true", help="Print to stdout instead of file")
-    parser.add_argument("--condense", type=float, metavar="RATE",
-                        help="Condense comments to target rate (0.0-1.0)")
-    parser.add_argument("--condense-step-size", type=int, default=4, metavar="N",
-                        help="Number of comments to remove per condense iteration (default: 4)")
-    parser.add_argument("--cache-dir", metavar="DIR",
-                        help="Directory to cache/load HTML files")
-    parser.add_argument("--no-frontmatter", action="store_true",
-                        help="Omit YAML frontmatter from output")
-    parser.add_argument("--verbose", action="store_true", help="Show progress to stderr")
+    parser.add_argument('--stdout', action='store_true', help='Print to stdout instead of file')
+    parser.add_argument('--condense', type=float, metavar='RATE', help='Condense comments to target rate (0.0-1.0)')
+    parser.add_argument(
+        '--condense-step-size',
+        type=int,
+        default=4,
+        metavar='N',
+        help='Number of comments to remove per condense iteration (default: 4)',
+    )
+    parser.add_argument('--cache-dir', metavar='DIR', help='Directory to cache/load HTML files')
+    parser.add_argument(
+        '--fetcher', choices=FETCHERS, default='curl', help='HTTP client used to fetch the page (default: curl)'
+    )
+    parser.add_argument('--no-frontmatter', action='store_true', help='Omit YAML frontmatter from output')
+    parser.add_argument('--verbose', action='store_true', help='Show progress to stderr')
 
     args = parser.parse_args()
 
     # Fetch and parse
-    html = fetch_html(args.url, args.verbose, args.cache_dir)
+    try:
+        html = fetch_html(args.url, args.verbose, args.cache_dir, args.fetcher)
+    except (subprocess.CalledProcessError, requests.RequestException) as e:
+        other = 'requests' if args.fetcher == 'curl' else 'curl'
+        print(f'Error: {args.fetcher} failed to fetch {args.url}: {e}', file=sys.stderr)
+        print(
+            f'HN may be rate limiting or blocking this client. Wait a few minutes before retrying, '
+            f'or try --fetcher {other}.',
+            file=sys.stderr,
+        )
+        sys.exit(1)
     flat_comments = parse_comments(html, args.verbose)
     comment_tree = build_comment_tree(flat_comments)
 
@@ -488,7 +537,7 @@ Examples:
 
     # Prepend frontmatter unless disabled
     if not args.no_frontmatter:
-        frontmatter = generate_frontmatter(metadata["title"], args.url, metadata["link_url"])
+        frontmatter = generate_frontmatter(metadata['title'], args.url, metadata['link_url'])
         markdown = frontmatter + markdown
 
     # Output
@@ -496,7 +545,7 @@ Examples:
         print(markdown)
     else:
         item_id = extract_id_from_url(args.url)
-        filename = f"hn.{item_id}.md"
+        filename = f'hn.{item_id}.md'
         if args.output:
             output_path = args.output
         elif args.out_dir:
@@ -504,13 +553,13 @@ Examples:
             output_path = os.path.join(args.out_dir, filename)
         else:
             output_path = filename
-        with open(output_path, "w") as f:
+        with open(output_path, 'w') as f:
             f.write(markdown)
-        print(f"Output: {output_path}", file=sys.stderr)
+        print(f'Output: {output_path}', file=sys.stderr)
         if args.cache_dir:
             cache_path = get_cache_path(args.url, args.cache_dir)
-            print(f"Cache:  {cache_path}", file=sys.stderr)
+            print(f'Cache:  {cache_path}', file=sys.stderr)
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
