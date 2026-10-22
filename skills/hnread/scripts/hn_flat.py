@@ -26,8 +26,8 @@ Examples:
     # Use cache to avoid repeated fetching
     uv run hn-flat.py "https://news.ycombinator.com/item?id=12345" --cache-dir ~/.cache/hn
 
-    # Fetch with python-requests instead of curl (the default)
-    uv run hn-flat.py "https://news.ycombinator.com/item?id=12345" --fetcher requests
+    # Use one fetcher only; the default "auto" tries curl, then requests, then the Algolia API
+    uv run hn-flat.py "https://news.ycombinator.com/item?id=12345" --fetcher algolia
 
     # Condense long discussions to 50% of original size
     uv run hn-flat.py "https://news.ycombinator.com/item?id=12345" --condense 0.5
@@ -38,6 +38,7 @@ Examples:
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -49,6 +50,23 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 from bs4 import BeautifulSoup, NavigableString
+
+# Overridable so tests can stand in a local server
+ALGOLIA_ITEM_URL = os.environ.get('HNREAD_ALGOLIA_ITEM_URL', 'https://hn.algolia.com/api/v1/items/{id}')
+FIREBASE_ITEM_URL = os.environ.get('HNREAD_FIREBASE_ITEM_URL', 'https://hacker-news.firebaseio.com/v0/item/{id}.json')
+
+# (connect, read) seconds; a short connect timeout moves on quickly when a host is unreachable
+TIMEOUT = (10, 30)
+
+REMOVED_TEXTS = ('[deleted]', '[dead]', '[flagged]')
+
+
+class FetchError(Exception):
+    """A fetcher could not get the thread."""
+
+
+class FetchFailed(Exception):
+    """Every fetcher tried for a thread failed."""
 
 
 @dataclass
@@ -79,70 +97,92 @@ class Comment:
         return len(self.children) == 0
 
 
-def get_cache_path(url: str, cache_dir: str) -> Path:
-    """Generate cache file path for a URL."""
+@dataclass
+class Thread:
+    title: str
+    link_url: str
+    comments: list[Comment]
+
+
+def get_cache_path(url: str, cache_dir: str, fmt: str = 'html') -> Path:
+    """Generate cache file path for a URL; fmt is the extension of what was fetched (html or json)."""
     # Use URL hash for filename to handle special characters
     url_hash = hashlib.md5(url.encode()).hexdigest()[:12]
     # Extract item ID for readability
     parsed = urlparse(url)
     params = parse_qs(parsed.query)
     item_id = params.get('id', ['unknown'])[0]
-    filename = f'hn_{item_id}_{url_hash}.html'
+    filename = f'hn_{item_id}_{url_hash}.{fmt}'
     return Path(cache_dir) / filename
 
 
 def fetch_with_curl(url: str) -> str:
-    """Fetch URL with the curl binary; curl's own error message goes to stderr."""
+    """Fetch URL with the curl binary."""
     result = subprocess.run(
-        ['curl', '--silent', '--show-error', '--fail', '--location', '--max-time', '30', url],
-        stdout=subprocess.PIPE,
-        check=True,
+        [
+            'curl',
+            '--silent',
+            '--show-error',
+            '--fail',
+            '--location',
+            '--connect-timeout',
+            str(TIMEOUT[0]),
+            '--max-time',
+            str(sum(TIMEOUT)),
+            url,
+        ],
+        capture_output=True,
     )
+    if result.returncode != 0:
+        raise FetchError(result.stderr.decode('utf-8', 'replace').strip().removeprefix('curl: '))
     return result.stdout.decode('utf-8')
 
 
 def fetch_with_requests(url: str) -> str:
     """Fetch URL with python-requests."""
     # Keep the library's own User-Agent: HN answers 419 when python-requests poses as a browser
-    response = requests.get(url, timeout=30)
+    response = requests.get(url, timeout=TIMEOUT)
     response.raise_for_status()
     return response.text
 
 
+def fetch_ranked_kids(item_id: str) -> list[int]:
+    """Fetch the ids of an item's direct replies, in HN's ranking, from the official API."""
+    response = requests.get(FIREBASE_ITEM_URL.format(id=item_id), timeout=TIMEOUT)
+    response.raise_for_status()
+    return (response.json() or {}).get('kids', [])
+
+
+def order_by_rank(nodes: list[dict], ranked_ids: list[int]) -> list[dict]:
+    """Sort Algolia nodes by ranked_ids; nodes missing from it keep their order at the end."""
+    rank = {node_id: i for i, node_id in enumerate(ranked_ids)}
+    return sorted(nodes, key=lambda node: rank.get(node['id'], len(rank)))
+
+
+def fetch_from_algolia(url: str) -> str:
+    """Fetch the whole thread as JSON from the Algolia HN API, top-level comments ranked as on HN."""
+    item_id = extract_id_from_url(url)
+    response = requests.get(ALGOLIA_ITEM_URL.format(id=item_id), timeout=TIMEOUT)
+    response.raise_for_status()
+    item = response.json()
+    # Algolia lists replies by id. One request to HN's official API restores the ranking of top-level
+    # comments; deeper levels would need a request per comment, so they stay chronological.
+    try:
+        ranked_ids = fetch_ranked_kids(item_id)
+    except requests.RequestException as e:
+        print(f'Could not fetch the HN ranking ({e}); top-level comments stay chronological', file=sys.stderr)
+    else:
+        item['children'] = order_by_rank(item['children'], ranked_ids)
+    return json.dumps(item, ensure_ascii=False)
+
+
+# name -> (fetch function, format of what it returns); auto mode tries them in this order
 FETCHERS = {
-    'curl': fetch_with_curl,
-    'requests': fetch_with_requests,
+    'curl': (fetch_with_curl, 'html'),
+    'requests': (fetch_with_requests, 'html'),
+    'algolia': (fetch_from_algolia, 'json'),
 }
-
-
-def fetch_html(url: str, verbose: bool = False, cache_dir: str | None = None, fetcher: str = 'curl') -> str:
-    """Fetch HTML content from URL, with optional caching."""
-    # Check cache first
-    if cache_dir:
-        cache_path = get_cache_path(url, cache_dir)
-        if cache_path.exists():
-            print(f'Loading from cache: {cache_path}', file=sys.stderr)
-            html = cache_path.read_text(encoding='utf-8')
-            if verbose:
-                print(f'Loaded {len(html)} bytes from cache', file=sys.stderr)
-            return html
-
-    print(f'Fetching {url} with {fetcher}...', file=sys.stderr)
-
-    html = FETCHERS[fetcher](url)
-
-    if verbose:
-        print(f'Fetched {len(html)} bytes', file=sys.stderr)
-
-    # Save to cache
-    if cache_dir:
-        cache_path = get_cache_path(url, cache_dir)
-        os.makedirs(cache_dir, exist_ok=True)
-        cache_path.write_text(html, encoding='utf-8')
-        if verbose:
-            print(f'Saved to cache: {cache_path}', file=sys.stderr)
-
-    return html
+FETCH_ERRORS = (FetchError, FileNotFoundError, requests.RequestException)
 
 
 def extract_text_from_element(element) -> str:
@@ -187,7 +227,7 @@ def is_deleted_comment(comment_div) -> bool:
     commtext = comment_div.select_one('div.commtext')
     if commtext:
         text = commtext.get_text(strip=True)
-        if text in ('[deleted]', '[dead]', '[flagged]'):
+        if text in REMOVED_TEXTS:
             return True
     # Also check if there's no commtext at all but has a comhead
     comhead = comment_div.select_one('span.comhead')
@@ -196,12 +236,8 @@ def is_deleted_comment(comment_div) -> bool:
     return False
 
 
-def parse_comments(html: str, verbose: bool = False) -> list[Comment]:
-    """Parse HTML and extract comments into a flat list with indent levels."""
-    if verbose:
-        print('Parsing HTML...', file=sys.stderr)
-
-    soup = BeautifulSoup(html, 'html.parser')
+def parse_comments(soup: BeautifulSoup, verbose: bool = False) -> list[Comment]:
+    """Extract comments from a parsed HN page into a flat list with indent levels."""
     comments = []
 
     # Find all comment table rows
@@ -262,13 +298,103 @@ def parse_comments(html: str, verbose: bool = False) -> list[Comment]:
     return comments
 
 
-def extract_post_metadata(html: str) -> dict:
-    """Extract post title and link URL from HN page."""
-    soup = BeautifulSoup(html, 'html.parser')
+def extract_post_metadata(soup: BeautifulSoup) -> dict:
+    """Extract post title and link URL from a parsed HN page."""
     title_elem = soup.select_one('tr.athing.submission span.titleline a')
     title = title_elem.get_text() if title_elem else 'Unknown'
     link_url = title_elem.get('href') if title_elem else ''
     return {'title': title, 'link_url': link_url}
+
+
+def parse_html_thread(html: str, verbose: bool = False) -> Thread:
+    """Parse an HN item page into a Thread."""
+    if verbose:
+        print('Parsing HTML...', file=sys.stderr)
+    soup = BeautifulSoup(html, 'html.parser')
+    # Error and rate-limit pages can come back with status 200
+    if not soup.select_one('table.fatitem'):
+        raise FetchError('the page has no HN item in it')
+    metadata = extract_post_metadata(soup)
+    comments = build_comment_tree(parse_comments(soup, verbose))
+    return Thread(title=metadata['title'], link_url=metadata['link_url'], comments=comments)
+
+
+def convert_algolia_children(nodes: list[dict], depth: int = 0) -> list[Comment]:
+    """Convert Algolia comment nodes to Comments; replies to a removed comment take its place."""
+    comments = []
+    for node in nodes:
+        text = extract_text_from_element(BeautifulSoup(node['text'], 'html.parser')) if node.get('text') else ''
+        if not node.get('author') or not text or text in REMOVED_TEXTS:
+            comments.extend(convert_algolia_children(node['children'], depth))
+            continue
+        replies = convert_algolia_children(node['children'], depth + 1)
+        comments.append(
+            Comment(id=str(node['id']), author=node['author'], text=text, indent=depth * 40, children=replies)
+        )
+    return comments
+
+
+def parse_algolia_thread(raw: str, verbose: bool = False) -> Thread:
+    """Parse an Algolia HN API item into a Thread."""
+    item = json.loads(raw)
+    comments = convert_algolia_children(item['children'])
+    if verbose:
+        print(f'Parsed {sum(c.descendant_count() + 1 for c in comments)} valid comments', file=sys.stderr)
+    print(
+        'Note: thread from the Algolia API. Replies under each top-level comment are chronological, not ranked; '
+        'Algolia leaves out deleted and dead comments together with all their replies, '
+        'and keeps downvoted ones that the HN page path skips.',
+        file=sys.stderr,
+    )
+    return Thread(title=item.get('title') or 'Unknown', link_url=item.get('url') or '', comments=comments)
+
+
+PARSERS = {
+    'html': parse_html_thread,
+    'json': parse_algolia_thread,
+}
+
+
+def load_cached_thread(url: str, cache_dir: str, verbose: bool = False) -> Thread | None:
+    """Load a thread from a cached HN page or Algolia item, if either exists."""
+    for fmt, parse in PARSERS.items():
+        cache_path = get_cache_path(url, cache_dir, fmt)
+        if cache_path.exists():
+            print(f'Loading from cache: {cache_path}', file=sys.stderr)
+            return parse(cache_path.read_text(encoding='utf-8'), verbose)
+    return None
+
+
+def save_cached_thread(url: str, cache_dir: str, fmt: str, raw: str, verbose: bool = False) -> None:
+    """Save what a fetcher returned so the next run can skip the network."""
+    cache_path = get_cache_path(url, cache_dir, fmt)
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path.write_text(raw, encoding='utf-8')
+    if verbose:
+        print(f'Saved to cache: {cache_path}', file=sys.stderr)
+
+
+def load_thread(url: str, fetcher: str = 'auto', cache_dir: str | None = None, verbose: bool = False) -> Thread:
+    """Load a thread from the cache, else fetch it; 'auto' tries each fetcher until one returns a thread."""
+    if cache_dir:
+        thread = load_cached_thread(url, cache_dir, verbose)
+        if thread is not None:
+            return thread
+
+    names = list(FETCHERS) if fetcher == 'auto' else [fetcher]
+    for name in names:
+        fetch, fmt = FETCHERS[name]
+        print(f'Fetching {url} with {name}...', file=sys.stderr)
+        try:
+            raw = fetch(url)
+            thread = PARSERS[fmt](raw, verbose)
+        except FETCH_ERRORS as e:
+            print(f'{name} failed: {e}', file=sys.stderr)
+            continue
+        if cache_dir:
+            save_cached_thread(url, cache_dir, fmt, raw, verbose)
+        return thread
+    raise FetchFailed(', '.join(names))
 
 
 def generate_frontmatter(title: str, url: str, link_url: str) -> str:
@@ -471,8 +597,8 @@ Examples:
   %(prog)s "https://news.ycombinator.com/item?id=12345" --cache-dir ~/.cache/hn
       Cache HTML to avoid repeated fetching
 
-  %(prog)s "https://news.ycombinator.com/item?id=12345" --fetcher requests
-      Fetch with python-requests instead of curl
+  %(prog)s "https://news.ycombinator.com/item?id=12345" --fetcher algolia
+      Use only the Algolia API instead of trying curl, requests, then Algolia
 
   %(prog)s "https://news.ycombinator.com/item?id=12345" --condense 0.5
       Condense to 50%% of original size by removing low-weight comments
@@ -501,9 +627,12 @@ Examples:
         metavar='N',
         help='Number of comments to remove per condense iteration (default: 4)',
     )
-    parser.add_argument('--cache-dir', metavar='DIR', help='Directory to cache/load HTML files')
+    parser.add_argument('--cache-dir', metavar='DIR', help='Directory to cache/load fetched pages')
     parser.add_argument(
-        '--fetcher', choices=FETCHERS, default='curl', help='HTTP client used to fetch the page (default: curl)'
+        '--fetcher',
+        choices=['auto', *FETCHERS],
+        default='auto',
+        help='How to fetch the thread; auto (default) tries curl, then requests, then the Algolia API',
     )
     parser.add_argument('--no-frontmatter', action='store_true', help='Omit YAML frontmatter from output')
     parser.add_argument('--verbose', action='store_true', help='Show progress to stderr')
@@ -512,21 +641,17 @@ Examples:
 
     # Fetch and parse
     try:
-        html = fetch_html(args.url, args.verbose, args.cache_dir, args.fetcher)
-    except (subprocess.CalledProcessError, requests.RequestException) as e:
-        other = 'requests' if args.fetcher == 'curl' else 'curl'
-        print(f'Error: {args.fetcher} failed to fetch {args.url}: {e}', file=sys.stderr)
-        print(
-            f'HN may be rate limiting or blocking this client. Wait a few minutes before retrying, '
-            f'or try --fetcher {other}.',
-            file=sys.stderr,
-        )
+        thread = load_thread(args.url, args.fetcher, args.cache_dir, args.verbose)
+    except FetchFailed as e:
+        print(f'Error: could not fetch {args.url} with {e}.', file=sys.stderr)
+        if args.fetcher == 'auto':
+            print(
+                'HN and Algolia may be rate limiting this client. Wait a few minutes before retrying.', file=sys.stderr
+            )
+        else:
+            print('Run with --fetcher auto (the default) to fall back to the other fetchers.', file=sys.stderr)
         sys.exit(1)
-    flat_comments = parse_comments(html, args.verbose)
-    comment_tree = build_comment_tree(flat_comments)
-
-    # Extract metadata for frontmatter
-    metadata = extract_post_metadata(html)
+    comment_tree = thread.comments
 
     # Condense if requested
     if args.condense is not None:
@@ -537,7 +662,7 @@ Examples:
 
     # Prepend frontmatter unless disabled
     if not args.no_frontmatter:
-        frontmatter = generate_frontmatter(metadata['title'], args.url, metadata['link_url'])
+        frontmatter = generate_frontmatter(thread.title, args.url, thread.link_url)
         markdown = frontmatter + markdown
 
     # Output
@@ -557,8 +682,10 @@ Examples:
             f.write(markdown)
         print(f'Output: {output_path}', file=sys.stderr)
         if args.cache_dir:
-            cache_path = get_cache_path(args.url, args.cache_dir)
-            print(f'Cache:  {cache_path}', file=sys.stderr)
+            for fmt in PARSERS:
+                cache_path = get_cache_path(args.url, args.cache_dir, fmt)
+                if cache_path.exists():
+                    print(f'Cache:  {cache_path}', file=sys.stderr)
 
 
 if __name__ == '__main__':

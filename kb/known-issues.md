@@ -34,3 +34,16 @@
 
 - 记录：2026-09-29（早就存在，这次才发现）
 - 注释里引用的 shebang `uv run --script` 含 `--`，XML 规范不允许注释里出现它。launchd 和 plutil 能容忍，所以任务一直正常；Python 的 `plistlib`（expat）会直接报错，launchd-list 靠 plutil 兜底才读得出来。想彻底消除，就把注释里的 `--script` 改写掉。
+
+## hnread：已删除评论的回复会被挂到上一条无关评论下面（HN 页面路径）
+
+- 记录：2026-10-22（拿 3000+ 评论的帖子 50112657 对比 Algolia 时发现）
+- `parse_comments()` 直接跳过 `[deleted]`/dead 行，`build_comment_tree()` 再按缩进建树，被删评论的回复就接到了前面最近一条缩进更小的评论下。例：@kcb 回复的是已删除的 @wilg，输出里成了 @danielovichdk「Wouldn't drive a Tesla…」的回复。这个帖子里约 190 条评论所在的子树因此挂错位置，会误导「谁在回复谁」的辩论分析。
+- Algolia 路径没有这个问题：Algolia 直接不返回被删评论和它的整棵子树（代价是这些回复缺失）。
+- 处理方向：跳过被删评论时留一个占位，建树后把占位节点的回复提升到它的位置，和 `convert_algolia_children()` 的做法一致。
+
+## hnread：被踩灰的评论只跳过 `c73` 一档，更灰的 `c88` 反而保留
+
+- 记录：2026-10-22
+- `is_flagged_comment()` 把 `commtext c73` 当作 flagged 跳过，但那是 HN 给低分评论的灰度 class 之一，同一个帖子里还有 25 条更浅、分更低的 `c88`，都被保留了。Algolia 路径分辨不出灰度，这些评论全部保留，两条路径的结果因此不一致。
+- 处理方向：先决定要不要过滤低分评论；要过滤就匹配所有非 `c00` 的灰度 class，不要就去掉这个判断。
