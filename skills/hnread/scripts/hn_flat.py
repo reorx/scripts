@@ -76,6 +76,8 @@ class Comment:
     text: str
     indent: int
     children: list['Comment'] = field(default_factory=list)
+    # Deleted, dead or low-score comment kept only so that its replies land in its place
+    removed: bool = False
 
     def descendant_count(self) -> int:
         """Count all descendants recursively."""
@@ -214,12 +216,11 @@ def extract_text_from_element(element) -> str:
     return unescape(result.strip())
 
 
-def is_flagged_comment(comment_div) -> bool:
-    """Check if comment is flagged as inappropriate (has c73 class)."""
+def is_low_score_comment(comment_div) -> bool:
+    """Check if HN grays the comment out for a low score (any color class on commtext but c00)."""
     commtext = comment_div.select_one('div.commtext')
-    if commtext and 'c73' in commtext.get('class', []):
-        return True
-    return False
+    classes = commtext.get('class', []) if commtext else []
+    return any(re.fullmatch(r'c[0-9a-f]{2}', cls) and cls != 'c00' for cls in classes)
 
 
 def is_deleted_comment(comment_div) -> bool:
@@ -237,7 +238,11 @@ def is_deleted_comment(comment_div) -> bool:
 
 
 def parse_comments(soup: BeautifulSoup, verbose: bool = False) -> list[Comment]:
-    """Extract comments from a parsed HN page into a flat list with indent levels."""
+    """Extract comments from a parsed HN page into a flat list with indent levels.
+
+    Deleted, dead and low-score comments stay in the list marked as removed, so that
+    build_comment_tree can put their replies in their place.
+    """
     comments = []
 
     # Find all comment table rows
@@ -247,53 +252,30 @@ def parse_comments(soup: BeautifulSoup, verbose: bool = False) -> list[Comment]:
         print(f'Found {len(comment_rows)} comment rows', file=sys.stderr)
 
     for row in comment_rows:
+        # Replies inside a collapsed flagged or dead comment, which HN hides by default
+        if 'noshow' in row.get('class', []):
+            continue
+
         # Get indent level from the indent image width
         indent_td = row.select_one('td.ind img')
         indent = int(indent_td.get('width', 0)) if indent_td else 0
 
-        # Get comment div
-        comment_div = row.select_one('td.default div.comment')
-        if not comment_div:
-            continue
-
-        # Skip flagged comments
-        if is_flagged_comment(comment_div):
-            if verbose:
-                print(f'Skipping flagged comment', file=sys.stderr)
-            continue
-
-        # Skip deleted/dead comments
-        if is_deleted_comment(comment_div):
-            if verbose:
-                print(f'Skipping deleted/dead comment', file=sys.stderr)
-            continue
-
-        # Get author
+        comment_id = row.get('id', '')
         author_elem = row.select_one('a.hnuser')
         author = author_elem.get_text() if author_elem else 'unknown'
 
-        # Get comment text
-        commtext = comment_div.select_one('div.commtext')
+        comment_div = row.select_one('td.default div.comment')
+        commtext = comment_div.select_one('div.commtext') if comment_div else None
         text = extract_text_from_element(commtext) if commtext else ''
 
-        # Skip empty comments
-        if not text:
-            continue
+        removed = not text or is_deleted_comment(comment_div) or is_low_score_comment(comment_div)
+        if removed and verbose:
+            print(f'Skipping deleted, dead or low-score comment {comment_id}', file=sys.stderr)
 
-        # Get comment ID
-        comment_id = row.get('id', '')
-
-        comments.append(
-            Comment(
-                id=comment_id,
-                author=author,
-                text=text,
-                indent=indent,
-            )
-        )
+        comments.append(Comment(id=comment_id, author=author, text=text, indent=indent, removed=removed))
 
     if verbose:
-        print(f'Parsed {len(comments)} valid comments', file=sys.stderr)
+        print(f'Parsed {sum(not c.removed for c in comments)} valid comments', file=sys.stderr)
 
     return comments
 
@@ -341,9 +323,9 @@ def parse_algolia_thread(raw: str, verbose: bool = False) -> Thread:
     if verbose:
         print(f'Parsed {sum(c.descendant_count() + 1 for c in comments)} valid comments', file=sys.stderr)
     print(
-        'Note: thread from the Algolia API. Replies under each top-level comment are chronological, not ranked; '
-        'Algolia leaves out deleted and dead comments together with all their replies, '
-        'and keeps downvoted ones that the HN page path skips.',
+        'Note: thread from the Algolia API. Replies under each top-level comment are chronological, not ranked. '
+        'Algolia has no scores or flags, so low-score comments and some replies HN hides under flagged '
+        'comments are included.',
         file=sys.stderr,
     )
     return Thread(title=item.get('title') or 'Unknown', link_url=item.get('url') or '', comments=comments)
@@ -410,26 +392,25 @@ description: discussions are represented in markdown lists, nested replies are k
 
 
 def build_comment_tree(flat_comments: list[Comment]) -> list[Comment]:
-    """Build a tree structure from flat comments based on indent levels."""
-    if not flat_comments:
-        return []
+    """Build a tree structure from flat comments based on indent levels.
 
+    Removed comments are left out, and their replies take their place.
+    """
     root_comments = []
-    stack: list[Comment] = []  # Stack of (comment, indent_level)
+    # (indent, list that deeper comments go into) for each ancestor of the current comment
+    stack: list[tuple[int, list[Comment]]] = []
 
     for comment in flat_comments:
         # Pop from stack until we find parent
-        while stack and stack[-1].indent >= comment.indent:
+        while stack and stack[-1][0] >= comment.indent:
             stack.pop()
 
-        if stack:
-            # This is a child of the last comment in stack
-            stack[-1].children.append(comment)
+        siblings = stack[-1][1] if stack else root_comments
+        if comment.removed:
+            stack.append((comment.indent, siblings))
         else:
-            # This is a root-level comment
-            root_comments.append(comment)
-
-        stack.append(comment)
+            siblings.append(comment)
+            stack.append((comment.indent, comment.children))
 
     return root_comments
 

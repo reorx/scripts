@@ -35,7 +35,8 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 ## Hacker News threads
 
 - `skills/hnread/scripts/hn_flat.py` fetches with curl, falling back to requests and then the Algolia API (`--fetcher auto`); a 200 page without `table.fatitem` counts as a failure. Never give python-requests a browser User-Agent: HN answers that with HTTP 419, while curl (any UA) and requests' own UA pass.
-- Algolia lists replies by id and drops deleted/dead comments with their whole subtree. One Firebase request (`kids` of the story) restores HN's top-level ranking; deeper levels stay chronological. Run `uv run skills/hnread/scripts/test_hn_flat.py` when changing the script.
+- The HN page path follows HN's default view: `noshow` rows (replies hidden under a collapsed flagged/dead comment) are dropped; deleted comments and low-score ones (any `commtext` color class but `c00`) are dropped while their replies take their place.
+- Algolia lists replies by id and has no scores or flags, so it keeps low-score comments and part of what HN hides. One Firebase request (`kids` of the story) restores HN's top-level ranking; deeper levels stay chronological. Run `uv run skills/hnread/scripts/test_hn_flat.py` when changing the script.
 
 ## Git history squashing
 

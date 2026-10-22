@@ -79,7 +79,7 @@ Fetch a Hacker News discussion thread and extract the most valuable insights fro
 ## Fetching and Rate Limits
 
 - The script handles a refused fetch itself: when HN rejects curl (HTTP 419, 429, 503, or a page that is not the thread), it retries with requests, then falls back to the Algolia API. Don't download the HTML by hand or switch `--fetcher` yourself.
-- If stderr says the thread came from the Algolia API, keep in mind that replies under each top-level comment are in chronological order, not HN's ranking, and that replies to deleted comments are missing.
+- If stderr says the thread came from the Algolia API, keep in mind that replies under each top-level comment are in chronological order, not HN's ranking, and that low-score comments (which the normal path filters out) are included.
 - If every fetcher fails, do not retry right away. Wait a few minutes, then retry once.
 - When reading several threads in one task, run the script for one thread at a time, never in parallel, and wait at least 30 seconds between fetches (HN's robots.txt sets `Crawl-delay: 30`), e.g. `sleep 30` between calls.
 - In batch runs, pass `--cache-dir <dir>` so that rereading a thread you already fetched loads it from disk instead of hitting HN again.

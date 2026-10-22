@@ -41,6 +41,30 @@ ITEM_HTML = """<html><body><center><table id="hnmain">
 </table></center></body></html>"""
 
 
+def comment_row(row_id, depth, author, body, row_class='', comment_class=''):
+    """One comment row as HN renders it; body is what goes inside div.comment."""
+    user = f'<a href="user?id={author}" class="hnuser">{author}</a> ' if author else ''
+    return f"""<tr class="athing comtr {row_class}" id="{row_id}"><td><table><tr>
+<td class="ind" indent="{depth}"><img src="s.gif" height="1" width="{depth * 40}"></td>
+<td class="default"><div><span class="comhead">{user}<span class="age">1 day ago</span></span></div><br>
+<div class="comment {comment_class}">{body}</div></td>
+</tr></table></td></tr>"""
+
+
+def text(color, words):
+    return f'<div class="commtext {color}">{words}</div>'
+
+
+def item_page(*rows):
+    return f"""<html><body><center><table id="hnmain">
+<tr><td><table class="fatitem">
+<tr class="athing submission" id="100"><td class="title"><span class="titleline">
+<a href="https://example.com/post">Example post</a></span></td></tr>
+</table></td></tr>
+<tr><td><table class="comment-tree">{''.join(rows)}</table></td></tr>
+</table></center></body></html>"""
+
+
 def algolia_node(node_id, author, text, children=()):
     return {'id': node_id, 'type': 'comment', 'author': author, 'text': text, 'children': list(children)}
 
@@ -187,6 +211,45 @@ class FetcherBehavior(HNFlatCLI):
         result = self.run_script('--fetcher', 'algolia')
         self.assert_rendered_algolia(result)
         self.assert_order(result.stdout, '@alice', '@dave', '@erin')
+
+
+class HNPageTreeBehavior(HNFlatCLI):
+    def test_given_deleted_comment_with_replies_when_parsed_then_replies_take_its_place(self):
+        FakeHN.html_body = item_page(
+            comment_row(101, 0, 'alice', text('c00', 'Top level point')),
+            comment_row(102, 1, 'bob', text('c00', 'A reply')),
+            comment_row(103, 0, None, '[deleted]'),
+            comment_row(104, 1, 'dave', text('c00', 'Orphan reply')),
+            comment_row(105, 2, 'erin', text('c00', 'Reply to dave')),
+            comment_row(106, 0, 'fay', text('c00', 'Last')),
+        )
+        result = self.run_script()
+        self.assert_rendered_html(result)
+        self.assertIn('\n- @dave [+1]: Orphan reply\n  - @erin: Reply to dave\n- @fay: Last', '\n' + result.stdout)
+        self.assertNotIn('deleted', result.stdout)
+
+    def test_given_low_score_comments_when_parsed_then_skip_every_gray_level_but_keep_replies(self):
+        FakeHN.html_body = item_page(
+            comment_row(101, 0, 'gary', text('c5a', 'Slightly downvoted')),
+            comment_row(102, 1, 'hank', text('c00', 'Rebuttal')),
+            comment_row(103, 0, 'ivan', text('c73', 'Downvoted')),
+            comment_row(104, 0, 'jack', text('c88', 'Downvoted more')),
+            comment_row(105, 0, 'judy', text('c00', 'Fine')),
+        )
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), '- @hank: Rebuttal\n- @judy: Fine')
+
+    def test_given_flagged_comment_when_parsed_then_drop_the_replies_hn_hides(self):
+        FakeHN.html_body = item_page(
+            comment_row(101, 0, 'kim', '[flagged]<div class="reply"></div>', 'coll', 'noshow'),
+            comment_row(102, 1, 'leo', text('c00', 'Hidden reply'), 'noshow'),
+            comment_row(103, 1, None, '[dead]<div class="reply"></div>', 'coll noshow', 'noshow'),
+            comment_row(104, 0, 'mia', text('c00', 'Visible')),
+        )
+        result = self.run_script()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), '- @mia: Visible')
 
 
 class FallbackBehavior(HNFlatCLI):
