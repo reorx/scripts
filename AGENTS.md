@@ -32,6 +32,11 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 - `yt-transcript.py <url-or-id>` fetches one caption track through the `yt-dlp` binary and prints `[mm:ss]` lines (`--format plain|json`, `--lang`, `--list`). Default track: uploaded subtitles in the video's language, else that language's `-orig` ASR track — auto-dubbed videos carry one `-orig` per audio track, so match on `info.language`, not the suffix.
 - Keep downloads to exactly one `--sub-langs` code: requesting several (e.g. `en.*,zh.*`) gets HTTP 429 from YouTube. Run `uv run test_yt_transcript.py` when changing it.
 
+## Tailscale forwards
+
+- `tsfwd.sh` wraps `tailscale serve --tcp` and runs under macOS `/bin/bash` 3.2 (no `mapfile` or associative arrays). A forward is dead when `nc -z` to its `TCPForward` target fails; `-p` removes dead TCP forwards only and never touches Web handlers.
+- `$TAILSCALE` points the script at another CLI; `test-tsfwd.sh` uses it to run against a stub and never touches the real tailnet. Run `./test-tsfwd.sh` when changing it.
+
 ## Hacker News threads
 
 - `skills/hnread/scripts/hn_flat.py` fetches with curl, falling back to requests and then the Algolia API (`--fetcher auto`); a 200 page without `table.fatitem` counts as a failure. Never give python-requests a browser User-Agent: HN answers that with HTTP 419, while curl (any UA) and requests' own UA pass.
