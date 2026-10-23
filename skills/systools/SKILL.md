@@ -1,6 +1,6 @@
 ---
 name: systools
-description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing what's on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots and live memory pressure — CPU temp, load, memory, swap, pageouts (\"how's my mac\", \"why is my mac slow\"); releasing leaked test resources — booted iOS simulators, agent-browser Chrome, the shared cargo target dir (\"clean up simulators\", \"清理模拟器\", \"清理 cargo 缓存\"); WindowServer CPU/GPU (\"WindowServer is hot\", \"UI feels laggy\"); keeping the Mac awake up to 24h (\"keep my mac awake\", \"防止休眠\"); the daily pmset wake/sleep schedule (\"sleep my mac at 1am\", \"自动休眠计划\"); auditing launchd + cron jobs and Background Task Management items (\"定时任务\", \"why isn't my launch agent running\"); repairing PostgreSQL that won't start under brew services (\"lock file postmaster.pid already exists\", \"数据库起不来\"); and tuning the local monitoring stack's per-process CPU alerts (\"prl_vm_app alert is noisy\", \"调 CPU 告警阈值\"). macOS-only except port management."
+description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing what's on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots and live memory pressure — CPU temp, load, memory, swap, pageouts (\"how's my mac\", \"why is my mac slow\"); releasing leaked test resources — booted iOS simulators, agent-browser Chrome, the shared cargo target dir (\"clean up simulators\", \"清理模拟器\", \"清理 cargo 缓存\"), and the 23:00 job that closes Hearthstone/Battle.net (\"关掉游戏\", \"炉石没关\"); WindowServer CPU/GPU (\"WindowServer is hot\", \"UI feels laggy\"); keeping the Mac awake up to 24h (\"keep my mac awake\", \"防止休眠\"); the daily pmset wake/sleep schedule (\"sleep my mac at 1am\", \"自动休眠计划\"); auditing launchd + cron jobs and Background Task Management items (\"定时任务\", \"why isn't my launch agent running\"); repairing PostgreSQL that won't start under brew services (\"lock file postmaster.pid already exists\", \"数据库起不来\"); and tuning the local monitoring stack's per-process CPU alerts (\"prl_vm_app alert is noisy\", \"调 CPU 告警阈值\"). macOS-only except port management."
 ---
 
 # systools
@@ -148,6 +148,8 @@ The two biggest recurring causes of a degraded `mac-health` reading, and neither
 
 Plus one that eats disk instead: **the shared cargo target dir** (`build.target-dir` in `~/.cargo/config.toml`, here `~/Library/Caches/cargo-target`) that every Rust project builds into. It only grows — each dependency version, feature set and toolchain leaves its own artifacts — and reached 24 GB before this step existed.
 
+And one opt-in step that is **never part of the default run**: `--only games` closes Hearthstone and Battle.net in the evening. Left open, Hearthstone keeps the display awake for hours (it holds a display-sleep assertion *and* injects input events, so the system thinks someone is at the keyboard), and Battle.net's helpers keep competing for CPU with agents during the night's dark wakes.
+
 **How to use:**
 
 ```bash
@@ -168,7 +170,11 @@ mac-dev-cleanup --min-age 2
 # One-off deeper cargo cleanup: drop what no build used for a week, cap at 15 GiB
 mac-dev-cleanup --only cargo --cargo-days 7 --cargo-max-size 15GiB
 
-# Behaviour checks (50 assertions, no side effects)
+# Close games and their launchers (only ever runs when asked for explicitly)
+mac-dev-cleanup --only games --dry-run
+mac-dev-cleanup --only games
+
+# Behaviour checks (63 assertions, no side effects)
 mac-dev-cleanup --selftest
 ```
 
@@ -179,9 +185,10 @@ mac-dev-cleanup --selftest
 | agent-browser | Groups Chrome processes into sessions by `--user-data-dir=…/agent-browser-chrome-<uuid>`, links each to its spawning daemon via the root process's PPID, then `agent-browser close --all`, then SIGTERM→SIGKILL any survivor |
 | simulators | `xcrun simctl shutdown all`, then quit Simulator.app via AppleScript, falling back to signals when it refuses |
 | cargo target | Finds the shared target via `cargo metadata` on a throwaway stub project, takes cargo's build locks, then `cargo sweep --time 21` (artifacts no build touched in 21 days) and `cargo sweep --maxsize 20GiB` (least recently used first) |
+| games (`--only games`) | Matches Hearthstone (+ its BlizzardBrowser), Battle.net (+ its Helpers) and the Blizzard update Agent by executable path, asks the apps to quit via AppleScript by bundle id, waits 20s, then SIGTERM→SIGKILL whatever is left |
 | report | Free-memory % and swap before/after (process steps); target size before/after (cargo step) |
 
-**Exit code:** 0 on success. Under `--dry-run`, 1 means there is something to clean — composable as a check like `mac-health`.
+**Exit code:** 0 on success, 2 if a step crashed (the remaining steps still run). Under `--dry-run`, 1 means there is something to clean — composable as a check like `mac-health`.
 
 **Notes / gotchas:**
 
@@ -191,6 +198,8 @@ mac-dev-cleanup --selftest
 - `simctl shutdown all` preserves device data; only running-app state is lost, and devices re-boot on demand.
 - Simulator.app routinely ignores `quit app "Simulator"`; the signal fallback is the normal path, not an error.
 - Counting these processes by hand with `ps -A | grep -c <pattern>` self-matches the grep and the parent shell. Use a bracket pattern (`'[s]imruntime'`) or the script's own report.
+- Each step runs isolated: on 2026-10-23 `xcrun simctl list` hung for 60s right after the 05:30 wake (0.2s when retried later), and the traceback used to take the cargo step down with it. Now the step is reported as failed, the rest still run, and the exit code is 2.
+- **Games step:** Battle.net's Helper processes run from `~/Library/Application Support/Battle.net/Versions/…/battle.net-core.framework`, *not* from inside `Battle.net.app` — match on both. Quit by bundle id (`net.battle.app`, `unity.Blizzard Entertainment.Hearthstone`): Launch Services does not resolve the name "Battle.net" (`open -a Battle.net` fails). The AppleScript is guarded with `is running` (a bare `tell application` would *launch* the app) and wrapped in `ignoring application responses` (a quit confirmation dialog would otherwise hang osascript). The Blizzard Agent has no app to quit and always takes the signal path after the 20s grace. Steam is deliberately not on the list; add a `Game(...)` entry to `GAMES` to extend it.
 
 **Cargo step: why it doesn't cause rebuild churn, and its traps:**
 
@@ -211,11 +220,14 @@ launchctl bootout gui/$(id -u)/com.reorx.mac-dev-cleanup        # unload
 
 It deliberately has **no `RunAtLoad`** — the job kills browsers and simulators, so it must only fire on schedule, never on login or reload. For the same reason, don't `kickstart` it just to test the cargo step; run `mac-dev-cleanup --only cargo` instead. The plist's `PATH` includes `~/.cargo/bin` for that step; after editing the plist, `bootout` + `bootstrap` it, because launchd reads it only at load.
 
+A second agent, `com.reorx.mac-dev-cleanup-games` (`launchd/com.reorx.mac-dev-cleanup-games.plist`, also symlinked), runs `mac-dev-cleanup --only games` **daily at 23:00**, ahead of the 01:30 scheduled sleep, and logs to the same file. It is a separate job because a plist has only one `ProgramArguments`, and games must stay out of the 06:00 default run. Same rules apply: no `RunAtLoad`, and `kickstart` it only when no game is running or when you mean to close them.
+
 **Typical scenarios:**
 - "Why is my mac hot / loud / slow?" → run `mac-health`; if load or temp is high, run `mac-dev-cleanup --dry-run` **before** investigating anything else — this has been the top cause
 - After finishing browser automation or iOS testing → run `mac-dev-cleanup` as the verification teardown step
 - Periodic hygiene while other sessions may be working → `mac-dev-cleanup --min-age 2`
 - "The cargo target / Rust cache is huge" → `mac-dev-cleanup --only cargo --dry-run`, then run it; lower `--cargo-days` or `--cargo-max-size` for a one-off deeper cut
+- "The screen never turned off" / "something is busy at night" and a game was left open → `mac-dev-cleanup --only games`
 
 ## macOS WindowServer Diagnostics
 

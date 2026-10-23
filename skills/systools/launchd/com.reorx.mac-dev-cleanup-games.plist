@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.reorx.mac-dev-cleanup-games</string>
+
+    <!-- Closes Hearthstone + Battle.net before the night. Left open they keep the display
+         from sleeping (Hearthstone holds a display assertion and injects input events) and
+         Battle.net's helpers compete with agents during the 01:30 scheduled sleep's dark
+         wakes. Games are deliberately not part of the 06:00 default run. -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/reorx/Code/scripts/skills/systools/scripts/mac-dev-cleanup</string>
+        <string>--only</string>
+        <string>games</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- uv for the shebang (~/.local/bin); ps + osascript + memory_pressure (/usr/bin, /bin),
+             sysctl (/usr/sbin). -->
+        <key>PATH</key>
+        <string>/Users/reorx/.local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <!-- 23:00 daily. System sleep is disabled (pmset sleep 0) until the 01:30 scheduled
+         sleep, so the machine is reliably awake at this point. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>23</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <!-- No RunAtLoad: this closes games, and must only ever fire on the schedule. -->
+
+    <key>StandardOutPath</key>
+    <string>/Users/reorx/Library/Logs/mac-dev-cleanup.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/reorx/Library/Logs/mac-dev-cleanup.log</string>
+</dict>
+</plist>

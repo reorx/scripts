@@ -10,8 +10,12 @@ iOS daemons and widget extensions alive (hundreds of processes, GBs of RAM); a l
 agent-browser session keeps a ~10-process headless Chrome tree spinning at ~100% CPU
 per renderer, indefinitely; and a target dir shared by every Rust project only grows.
 
-Exit code: 0 on success. With --dry-run, 1 means there is something to clean (so it
-composes as a check, like mac-health).
+`--only games` (never part of the default run) closes Hearthstone and Battle.net before
+the night, when the Mac wakes on its own for agents: left open, the game keeps the
+display from sleeping and Battle.net's helpers compete with the agents' work.
+
+Exit code: 0 on success, 2 if a section crashed (the others still ran). With --dry-run,
+1 means there is something to clean (so it composes as a check, like mac-health).
 """
 
 import argparse
@@ -25,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -42,6 +47,33 @@ SIMULATOR_APP_RE = re.compile(r"Simulator\.app/Contents/MacOS/Simulator\b")
 PS_ARGS = ["ps", "-Awwo", "pid,ppid,etime,pcpu,command"]
 
 DANGER_MARKER = "⚠️"
+
+DEFAULT_TARGETS = ["browser", "sim", "cargo"]
+
+
+@dataclass(frozen=True)
+class Game:
+    """A game or launcher to close in the evening, matched on its executable path."""
+
+    name: str
+    exe_re: re.Pattern
+    bundle_id: str | None = None  # asked to quit via AppleScript; None = background helper, signals only
+
+
+GAMES = [
+    Game(
+        "Hearthstone",
+        re.compile(r"/(?:Hearthstone|Hearthstone Beta Launcher|BlizzardBrowser)\.app/Contents/MacOS/"),
+        bundle_id="unity.Blizzard Entertainment.Hearthstone",
+    ),
+    # Its Helper processes (Chromium renderers etc.) run from a versioned framework under
+    # ~/Library/Application Support/Battle.net/Versions/, not from inside the app bundle.
+    Game("Battle.net", re.compile(r"/Battle\.net\.app/Contents/|/Battle\.net/Versions/"), bundle_id="net.battle.app"),
+    Game("Blizzard Agent", re.compile(r"/Battle\.net/Agent/")),
+]
+GAMES_PS_ARGS = ["ps", "-Awwo", "pid=,comm="]
+# Long enough for a game to save and shut down on its own before it gets signalled.
+GAME_QUIT_GRACE = 20.0
 
 
 @dataclass
@@ -152,6 +184,33 @@ def parse_booted_devices(simctl_json: str) -> list[dict[str, str]]:
                     }
                 )
     return booted
+
+
+def parse_game_procs(ps_output: str) -> dict[str, set[int]]:
+    """Running game processes by game name, from `ps -o pid=,comm=` output."""
+    found: dict[str, set[int]] = {}
+    for line in ps_output.splitlines():
+        fields = line.split(maxsplit=1)
+        if len(fields) < 2 or not fields[0].isdigit():
+            continue
+        game = next((g for g in GAMES if g.exe_re.search(fields[1])), None)
+        if game:
+            found.setdefault(game.name, set()).add(int(fields[0]))
+    return found
+
+
+def quit_script(bundle_id: str) -> list[str]:
+    """AppleScript lines that ask a running app to quit, without launching or waiting on it.
+
+    By bundle id: Launch Services does not resolve "Battle.net" as an app name (`open -a` fails).
+    """
+    return [
+        f'if application id "{bundle_id}" is running then',
+        "ignoring application responses",
+        f'tell application id "{bundle_id}" to quit',
+        "end ignoring",
+        "end if",
+    ]
 
 
 # ── Process helpers ─────────────────────────────────────────
@@ -336,6 +395,42 @@ def cleanup_simulators(dry_run: bool) -> int:
         + (f", {DANGER_MARKER} Simulator.app still up" if app_left else "")
     )
     return (runtime_procs - left) + (len(app_pids) - app_left)
+
+
+# ── games cleanup ───────────────────────────────────────────
+def cleanup_games(dry_run: bool) -> int:
+    """Quit games and their launchers, then signal whatever outlived the quit. Returns processes found."""
+    print("── games ──────────────────────────────────────────")
+    found = parse_game_procs(run(GAMES_PS_ARGS, timeout=20).stdout)
+    if not found:
+        print("nothing to clean")
+        return 0
+
+    for name, pids in found.items():
+        print(f"  {name:<16} {len(pids):>2} process(es)")
+    targets = set().union(*found.values())
+    if dry_run:
+        print(f"[dry-run] would close {', '.join(found)} ({len(targets)} processes)")
+        return len(targets)
+
+    for game in GAMES:
+        if game.bundle_id and game.name in found:
+            run(["osascript", *[arg for line in quit_script(game.bundle_id) for arg in ("-e", line)]], timeout=30)
+    deadline = time.monotonic() + GAME_QUIT_GRACE
+    while time.monotonic() < deadline and any(alive(pid) for pid in targets):
+        time.sleep(0.5)
+
+    stubborn = {pid for pid in targets if alive(pid)}
+    if stubborn:
+        _, forced = kill_pids(stubborn)
+        print(f"  {len(stubborn)} process(es) outlived the quit, signalled" + (f", {forced} needed SIGKILL" if forced else ""))
+
+    left = parse_game_procs(run(GAMES_PS_ARGS, timeout=20).stdout)
+    print(
+        f"✅ done, closed {', '.join(found)}"
+        + (f", {DANGER_MARKER} still running: {', '.join(left)}" if left else "")
+    )
+    return len(targets)
 
 
 # ── cargo target cleanup ────────────────────────────────────
@@ -523,6 +618,20 @@ SIMCTL_FIXTURE = """\
 }
 """
 
+# `ps -Awwo pid=,comm=`: the executable path only, so a path mentioned in some other
+# process's arguments (an editor, a grep) can never match.
+GAMES_PS_FIXTURE = """\
+    1 /sbin/launchd
+62114 /Applications/Hearthstone/Hearthstone.app/Contents/MacOS/Hearthstone
+62120 /Applications/Hearthstone/BlizzardBrowser/BlizzardBrowser.app/Contents/MacOS/BlizzardBrowser
+51000 /Applications/Battle.net.app/Contents/MacOS/Battle.net
+51010 /Users/me/Library/Application Support/Battle.net/Versions/Battle.net.17952/battle.net-core.framework/Frameworks/Battle.net Helper.app/Contents/MacOS/Battle.net Helper
+51020 /Users/me/Library/Application Support/Battle.net/Versions/Battle.net.17952/battle.net-core.framework/Frameworks/Battle.net Helper.app/Contents/MacOS/
+50990 /Users/Shared/Battle.net/Agent/Agent.9824/Agent.app/Contents/MacOS/Agent
+  778 /Applications/Steam.app/Contents/MacOS/steam_osx
+  779 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+"""
+
 _FAILED = 0
 
 
@@ -665,6 +774,44 @@ def selftest() -> int:
         os.close(busy)
         check("no lock files → nothing to take", lock_target(target / "missing"), [])
 
+    print("\ngames: parse_game_procs")
+    found = parse_game_procs(GAMES_PS_FIXTURE)
+    check("Hearthstone with its embedded browser", sorted(found.get("Hearthstone", [])), [62114, 62120])
+    check("Battle.net with its helpers", sorted(found.get("Battle.net", [])), [51000, 51010, 51020])
+    check("Blizzard's background update agent", sorted(found.get("Blizzard Agent", [])), [50990])
+    touched = set().union(*found.values())
+    check("SAFETY: Steam untouched (not on the list)", 778 in touched, False)
+    check("SAFETY: the user's Chrome untouched", 779 in touched, False)
+    check("SAFETY: launchd untouched", 1 in touched, False)
+    check("no games running → empty", parse_game_procs("    1 /sbin/launchd\n"), {})
+
+    print("\ngames: quit_script")
+    script = quit_script("net.battle.app")
+    # `tell application` launches an app that isn't running.
+    check("only targets an app that is running", script[0], 'if application id "net.battle.app" is running then')
+    # A quit confirmation dialog would otherwise hang osascript until the subprocess timeout.
+    check("does not wait for the app to answer", "ignoring application responses" in script, True)
+
+    print("\ngames: default run")
+    # The 06:00 run and any manual `mac-dev-cleanup` must never close a game mid-match;
+    # games are closed only by the explicit `--only games` evening job.
+    check("games are not in the default targets", "games" in DEFAULT_TARGETS, False)
+
+    print("\nrun_sections")
+    ran = []
+
+    def hung_simctl() -> int:
+        raise subprocess.TimeoutExpired(["xcrun", "simctl", "list"], 60)
+
+    def cargo_ok() -> int:
+        ran.append("cargo")
+        return 3
+
+    found_count, failed = run_sections([("sim", hung_simctl), ("cargo", cargo_ok)])
+    check("a crashing section does not skip the rest (2026-10-23 06:00)", ran, ["cargo"])
+    check("the failed section is reported by name", failed, ["sim"])
+    check("found still counts the sections that ran", found_count, 3)
+
     print()
     if _FAILED:
         print(f"❌ {_FAILED} check(s) failed")
@@ -674,6 +821,24 @@ def selftest() -> int:
 
 
 # ── Main ────────────────────────────────────────────────────
+def run_sections(sections: list[tuple[str, Callable[[], int]]]) -> tuple[int, list[str]]:
+    """Run each cleanup in turn. Returns (total found, names of sections that crashed).
+
+    Part of main's top level: one section crashing must not skip the rest. On
+    2026-10-23 `simctl list` hung for 60s right after the 05:30 wake, and the traceback
+    took the cargo sweep down with it.
+    """
+    found, failed = 0, []
+    for name, section in sections:
+        try:
+            found += section()
+        except Exception as e:  # noqa: BLE001
+            failed.append(name)
+            print(f"{DANGER_MARKER} {name} failed: {e!r}")
+        print()
+    return found, failed
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Release iOS simulator, agent-browser and cargo target resources",
@@ -682,8 +847,9 @@ def main() -> int:
     parser.add_argument("-n", "--dry-run", action="store_true", help="Report what would be cleaned, change nothing")
     parser.add_argument(
         "--only",
-        choices=["sim", "browser", "cargo"],
-        help="Clean only simulators, only agent-browser, or only the cargo target (default: all)",
+        choices=["sim", "browser", "cargo", "games"],
+        help="Clean only simulators, only agent-browser, only the cargo target, or close games "
+        "(default: all but games, which only ever run when asked for explicitly)",
     )
     parser.add_argument(
         "--min-age",
@@ -723,22 +889,19 @@ def main() -> int:
     if not sys.stdout.isatty():
         print(f"═══ mac-dev-cleanup {time.strftime('%Y-%m-%d %H:%M:%S')} ═══")
 
-    targets = [args.only] if args.only else ["browser", "sim", "cargo"]
+    targets = [args.only] if args.only else DEFAULT_TARGETS
     # Only processes affect memory; the cargo sweep frees disk.
-    track_memory = "browser" in targets or "sim" in targets
+    track_memory = "cargo" not in targets or len(targets) > 1
     if track_memory:
         free_before, swap_before = mem_stats()
 
-    found = 0
-    if "browser" in targets:
-        found += cleanup_agent_browser(args.min_age, args.dry_run)
-        print()
-    if "sim" in targets:
-        found += cleanup_simulators(args.dry_run)
-        print()
-    if "cargo" in targets:
-        found += cleanup_cargo(args.cargo_days, args.cargo_max_size, args.dry_run)
-        print()
+    sections = {
+        "browser": lambda: cleanup_agent_browser(args.min_age, args.dry_run),
+        "sim": lambda: cleanup_simulators(args.dry_run),
+        "cargo": lambda: cleanup_cargo(args.cargo_days, args.cargo_max_size, args.dry_run),
+        "games": lambda: cleanup_games(args.dry_run),
+    }
+    found, failed = run_sections([(name, sections[name]) for name in targets])
 
     if track_memory and not args.dry_run:
         free_after, swap_after = mem_stats()
@@ -750,6 +913,8 @@ def main() -> int:
         if parts:
             print("  ".join(parts))
 
+    if failed:
+        return 2
     # Under --dry-run, a non-zero exit means "there is something to clean".
     return 1 if args.dry_run and found else 0
 
