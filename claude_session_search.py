@@ -824,6 +824,13 @@ def print_session(info: SessionInfo, full: bool):
         print(f'    {one}')
 
 
+def newest_first(infos: list[SessionInfo]) -> list[SessionInfo]:
+    """Newest first prompt first, sessions without one last; ties go to the most recently updated,
+    then to the session ID, so the order never depends on how a directory happens to be listed."""
+    by_id = sorted(infos, key=lambda i: i.session_id)
+    return sorted(by_id, key=lambda i: (i.started, i.updated), reverse=True)
+
+
 def list_sessions(args):
     cutoff_iso = ms_to_iso((time.time() - args.days * 86400) * 1000) if args.days else ''
     history = load_history()
@@ -833,7 +840,7 @@ def list_sessions(args):
         transcripts = [session_info(f) for f in proj_dir.glob('*.jsonl')] if proj_dir.is_dir() else []
         infos = merge_sessions(transcripts, history_sessions(history.get(key, [])))
         infos = [i for i in infos if i.updated >= cutoff_iso]
-        infos.sort(key=lambda i: i.started, reverse=True)
+        infos = newest_first(infos)
         n_hist = sum(1 for i in infos if i.source == 'history')
         print(f'{C_BOLD}{key}{C_RESET} {C_DIM}({len(infos)} sessions, {len(infos) - n_hist} with transcript){C_RESET}')
         for info in infos:
@@ -858,7 +865,8 @@ def find_sessions(prefix: str) -> list[tuple[str, SessionInfo]]:
     for key, rows in load_history().items():
         rows = [r for r in rows if (r.get('sessionId') or '').startswith(prefix)]
         found += [(key, info) for info in history_sessions(rows) if info.session_id not in seen]
-    return sorted(found, key=lambda t: t[1].started, reverse=True)
+    order = {id(info): n for n, info in enumerate(newest_first([info for _, info in found]))}
+    return sorted(found, key=lambda t: order[id(t[1])])
 
 
 def show_sessions(args):
