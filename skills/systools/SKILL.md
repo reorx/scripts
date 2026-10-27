@@ -1,6 +1,6 @@
 ---
 name: systools
-description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing what's on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots and live memory pressure — CPU temp, load, memory, swap, pageouts (\"how's my mac\", \"why is my mac slow\"); releasing leaked test resources — booted iOS simulators, agent-browser Chrome, the shared cargo target dir (\"clean up simulators\", \"清理模拟器\", \"清理 cargo 缓存\"), and the 23:00 job that closes Hearthstone/Battle.net (\"关掉游戏\", \"炉石没关\"); WindowServer CPU/GPU (\"WindowServer is hot\", \"UI feels laggy\"); keeping the Mac awake up to 24h (\"keep my mac awake\", \"防止休眠\"); the daily pmset wake/sleep schedule (\"sleep my mac at 1am\", \"自动休眠计划\"); auditing launchd + cron jobs and Background Task Management items (\"定时任务\", \"why isn't my launch agent running\"); repairing PostgreSQL that won't start under brew services (\"lock file postmaster.pid already exists\", \"数据库起不来\"); and tuning the local monitoring stack's per-process CPU alerts (\"prl_vm_app alert is noisy\", \"调 CPU 告警阈值\"). macOS-only except port management."
+description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing what's on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots and live memory pressure — CPU temp, load, memory, swap, pageouts (\"how's my mac\", \"why is my mac slow\"); releasing leaked test resources — booted iOS simulators, agent-browser Chrome, the shared cargo target dir, the uv cache (\"clean up simulators\", \"清理模拟器\", \"清理 cargo 缓存\", \"清理 uv 缓存\", \"~/.cache/uv is huge\"), and the 23:00 job that closes Hearthstone/Battle.net (\"关掉游戏\", \"炉石没关\"); WindowServer CPU/GPU (\"WindowServer is hot\", \"UI feels laggy\"); keeping the Mac awake up to 24h (\"keep my mac awake\", \"防止休眠\"); the daily pmset wake/sleep schedule (\"sleep my mac at 1am\", \"自动休眠计划\"); auditing launchd + cron jobs and Background Task Management items (\"定时任务\", \"why isn't my launch agent running\"); repairing PostgreSQL that won't start under brew services (\"lock file postmaster.pid already exists\", \"数据库起不来\"); and tuning the local monitoring stack's per-process CPU alerts (\"prl_vm_app alert is noisy\", \"调 CPU 告警阈值\"). macOS-only except port management."
 ---
 
 # systools
@@ -135,18 +135,18 @@ This script samples virtual-memory counters at regular intervals and reports rea
 
 ## macOS Dev Resource Cleanup
 
-### Release leaked iOS simulators, agent-browser sessions, and stale cargo artifacts
+### Release leaked iOS simulators, agent-browser sessions, stale cargo artifacts and old uv cache entries
 
 **Script:** `scripts/mac-dev-cleanup`
 
-**Prerequisites:** macOS only. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Wraps `ps`, `xcrun simctl`, `agent-browser close`, `osascript`, `memory_pressure`, and for the cargo step `cargo` + [`cargo-sweep`](https://github.com/holmgr/cargo-sweep) (`cargo install cargo-sweep`; the step is skipped if either is missing).
+**Prerequisites:** macOS only. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Wraps `ps`, `xcrun simctl`, `agent-browser close`, `osascript`, `memory_pressure`, for the cargo step `cargo` + [`cargo-sweep`](https://github.com/holmgr/cargo-sweep) (`cargo install cargo-sweep`; the step is skipped if either is missing), and for the uv step `uv` + `lsof`.
 
 The two biggest recurring causes of a degraded `mac-health` reading, and neither cleans up after itself:
 
 - **Booted iOS simulators** — each booted device keeps a full `launchd_sim` tree alive: SpringBoard plus dozens of iOS widget extensions at 200–330 MB each. One booted device measured **~196 processes**.
 - **Leaked `agent-browser` sessions** — the CLI spawns a detached daemon (PPID 1) plus a ~10-process headless Chrome tree that survives the session that created it. Observed running for **days**, with renderers pinned at ~100% CPU each, ~5 of 10 cores gone.
 
-Plus one that eats disk instead: **the shared cargo target dir** (`build.target-dir` in `~/.cargo/config.toml`, here `~/Library/Caches/cargo-target`) that every Rust project builds into. It only grows — each dependency version, feature set and toolchain leaves its own artifacts — and reached 24 GB before this step existed.
+Plus two that eat disk instead: **the shared cargo target dir** (`build.target-dir` in `~/.cargo/config.toml`, here `~/Library/Caches/cargo-target`) that every Rust project builds into. It only grows — each dependency version, feature set and toolchain leaves its own artifacts — and reached 24 GB before this step existed. And **the uv cache** (`~/.cache/uv`), which keeps every wheel uv ever downloaded and every environment `uv run --script` / `uv run --with` / `uvx` ever built. It showed 13 GB on 2026-10-27; the first run took `du` to 5.6 GB but freed only 3.3 GB of real disk, because the rest was shared with installed venvs (see the uv notes below).
 
 And one opt-in step that is **never part of the default run**: `--only games` closes Hearthstone and Battle.net in the evening. Left open, Hearthstone keeps the display awake for hours (it holds a display-sleep assertion *and* injects input events, so the system thinks someone is at the keyboard), and Battle.net's helpers keep competing for CPU with agents during the night's dark wakes.
 
@@ -163,6 +163,7 @@ mac-dev-cleanup
 mac-dev-cleanup --only sim
 mac-dev-cleanup --only browser
 mac-dev-cleanup --only cargo
+mac-dev-cleanup --only uv
 
 # Safe to run mid-session: spare agent-browser sessions younger than 2h
 mac-dev-cleanup --min-age 2
@@ -170,11 +171,14 @@ mac-dev-cleanup --min-age 2
 # One-off deeper cargo cleanup: drop what no build used for a week, cap at 15 GiB
 mac-dev-cleanup --only cargo --cargo-days 7 --cargo-max-size 15GiB
 
+# One-off deeper uv cleanup: wheels and environments created more than 30 days ago
+mac-dev-cleanup --only uv --uv-days 30
+
 # Close games and their launchers (only ever runs when asked for explicitly)
 mac-dev-cleanup --only games --dry-run
 mac-dev-cleanup --only games
 
-# Behaviour checks (63 assertions, no side effects)
+# Behaviour checks (88 assertions, no side effects)
 mac-dev-cleanup --selftest
 ```
 
@@ -185,8 +189,9 @@ mac-dev-cleanup --selftest
 | agent-browser | Groups Chrome processes into sessions by `--user-data-dir=…/agent-browser-chrome-<uuid>`, links each to its spawning daemon via the root process's PPID, then `agent-browser close --all`, then SIGTERM→SIGKILL any survivor |
 | simulators | `xcrun simctl shutdown all`, then quit Simulator.app via AppleScript, falling back to signals when it refuses |
 | cargo target | Finds the shared target via `cargo metadata` on a throwaway stub project, takes cargo's build locks, then `cargo sweep --time 21` (artifacts no build touched in 21 days) and `cargo sweep --maxsize 20GiB` (least recently used first) |
+| uv cache | Skips unless the `uv` binary contains every cache bucket name the script knows, and skips the day if a uv that holds the cache lock started < 10min ago. Then deletes: top-level entries that are not a current bucket (old/foreign bucket versions, temp dirs of dead runs) and archives nothing links to, both if created > 1 day ago; downloaded wheels and cached environments created > `--uv-days` (90) ago. Never touches wheels built from source, or anything a running process's command line points into |
 | games (`--only games`) | Matches Hearthstone (+ its BlizzardBrowser), Battle.net (+ its Helpers) and the Blizzard update Agent by executable path, asks the apps to quit via AppleScript by bundle id, waits 20s, then SIGTERM→SIGKILL whatever is left |
-| report | Free-memory % and swap before/after (process steps); target size before/after (cargo step) |
+| report | Free-memory % and swap before/after (process steps); target size before/after (cargo step); cache size before/after and the volume's real free-space gain (uv step) |
 
 **Exit code:** 0 on success, 2 if a step crashed (the remaining steps still run). Under `--dry-run`, 1 means there is something to clean — composable as a check like `mac-health`.
 
@@ -203,12 +208,22 @@ mac-dev-cleanup --selftest
 
 **Cargo step: why it doesn't cause rebuild churn, and its traps:**
 
-- "Last used" is the atime of the files in `.fingerprint/<unit>-<hash>/`: cargo reads the hash file there on every build, fresh or not, to decide whether to recompile. So anything a project still builds keeps a fresh atime and survives; only units that no project has touched in N days go. The price is that a project left alone for 3+ weeks rebuilds its dependencies once.
+- "Last used" is the atime of the files in `.fingerprint/<unit>-<hash>/`: cargo reads the hash file there on every build, fresh or not, to decide whether to recompile. The intent was that anything a project still builds keeps a fresh atime and survives. **But this Mac updates atime on a read only while atime < mtime** (measured 2026-10-27, see the uv notes): after a unit is rebuilt, the first fresh build bumps its atime once, and later fresh builds leave it alone. So the atime really says "first build after the last rebuild", and a dependency used daily but not recompiled for 21 days is swept and rebuilt once. Tracked in `kb/known-issues.md`.
 - **`cargo sweep --installed` / `--toolchains` poison that signal** — they read every fingerprint `.json` (even with `--dry-run`), stamping the whole target "used today", after which `--time` finds nothing for weeks. The script only uses `--time` / `--maxsize` (stat-only), and before each sweep resets any fingerprint `.json` whose atime is newer than its mtime back to its mtime. Cargo itself reads the `.json` only right before rewriting it, so this loses nothing. Old-toolchain artifacts need no `--installed`: after a `rustup update` nobody uses them, and `--time` collects them.
 - cargo-sweep takes only a project path and resolves the target via `cargo metadata`; pointing it at the target dir itself fails. The stub project in a temp dir keeps the job independent of any real project.
 - If a build holds any of `.cargo-lock` / `.cargo-build-lock` / `.cargo-artifact-lock` (all flock(2)), the step skips the run. While sweeping it holds them itself, so a build that starts meanwhile prints `Blocking waiting for file lock on build directory` and waits (both verified against cargo 1.98).
 - **Size units:** cargo-sweep reads `GB` as 10⁹ and sums apparent file sizes, counting the hardlinks between `incremental/` and `deps/` twice, so its total runs ~5% above `du`. Pass `GiB`.
 - `~/.cargo/registry` needs none of this: cargo ≥1.88 garbage-collects it on its own.
+
+**uv step: why not `uv cache prune`, and its traps** (all verified against uv 0.9.17 source and this cache):
+
+- **`uv cache prune` cannot run unattended here.** Every `uv` process holds a shared flock on `~/.cache/uv/.lock` for its whole life, and the resident `uv run` jobs (proc-top, condenser-probe) live for weeks, so prune waits forever for its exclusive lock. With `--force` it goes ahead, and its step two **deletes every cached environment unconditionally**, including `environments-v2/proc-top-*`, which the monitoring job is running from. The step does the same garbage collection by hand and skips entries in use.
+- **Cache layout** (0.9.17): downloads are unpacked into `archive-v0/<id>/`. The only references prune counts are symlinks: `wheels-v5/<index>/<pkg>/<ver>-<tag>` (downloaded wheels) and `sdists-v9/…` (wheels built from source). `environments-v2/` holds two kinds of entry: `<script>-<hash>/` real venvs from `uv run --script`, and `<interpreter-hash>/<hash>` symlinks into `archive-v0` for `uv run --with` / `uvx` environments. The step counts all three link sources, plus any archive id named inside a `.http`/`.rev` pointer file, before calling an archive unreferenced.
+- **Deleting a wheel's archive is safe.** The step removes the archive and its symlink but keeps the `.http` pointer: uv reads it, sees the archive is missing (`CachedWheel::from_http_pointer`: "Ignore stale pointers"), and downloads again. Verified by deleting the archive of `requests==2.32.3` and installing it again.
+- **Age is creation time.** uv keeps no last-use time, and atime doesn't help either: this Mac updates atime on a read only while atime < mtime (`cat`/Python read of a file whose atime is already past its mtime leaves it unchanged; proc-top's `pyvenv.cfg`, read at every start, still shows its June birth atime). So a wheel used weekly is re-downloaded every 90 days, and an environment is rebuilt from the archives, both in seconds. Wheels built from source never age out: rebuilding needs a toolchain and can take minutes.
+- **`du` overstates the cache.** uv installs by APFS clone (`link-mode` default on macOS), so a cached file and every installed copy share blocks. `du` counts each in full, but deleting the cache copy frees nothing while a venv still holds the blocks. On 2026-10-27, `du` showed archive-v0 at 10.1 GiB, but only 2.55 GiB of it was not shared with a clone (`getattrlist` `ATTR_CMNEXT_PRIVATESIZE`). The step therefore reports the volume's real free-space gain next to `du`. To free the rest, delete venvs you no longer use.
+- **In use** = some process's command line contains the entry's path. `uv run` execs `<env>/bin/python3` by full path, so that covers resident jobs and this script's own environment. Entries are renamed into a trash dir before deletion, so a uv that looks at the same moment sees each one whole or not at all.
+- **Layout guard:** uv bumps a bucket's version whenever its format changes (e.g. `wheels-v6` / `simple-v21` from a newer uv). The step reads the uv binary and requires all the names in `UV_BUCKETS` as literal bytes. If any is missing, it logs a `⚠️` and skips: check `CacheBucket::to_str` in `crates/uv-cache/src/lib.rs` for the new version and update the constants and this note.
 
 **Scheduled run:** a launchd agent runs the full cleanup **daily at 06:00** (30min after the 5:30AM `pmset repeat wakepoweron`; system sleep is disabled so the machine is reliably awake). Plist lives in the repo at `launchd/com.reorx.mac-dev-cleanup.plist`, symlinked to `~/Library/LaunchAgents/`. Log: `~/Library/Logs/mac-dev-cleanup.log` (each run is stamped — the script prints a timestamp header whenever stdout is not a TTY).
 
@@ -227,6 +242,7 @@ A second agent, `com.reorx.mac-dev-cleanup-games` (`launchd/com.reorx.mac-dev-cl
 - After finishing browser automation or iOS testing → run `mac-dev-cleanup` as the verification teardown step
 - Periodic hygiene while other sessions may be working → `mac-dev-cleanup --min-age 2`
 - "The cargo target / Rust cache is huge" → `mac-dev-cleanup --only cargo --dry-run`, then run it; lower `--cargo-days` or `--cargo-max-size` for a one-off deeper cut
+- "`~/.cache/uv` is huge" / "清理 uv 缓存" → `mac-dev-cleanup --only uv --dry-run`, then run it; `--uv-days 30` for a deeper cut. **Never `uv cache prune --force` / `uv cache clean --force`** on this Mac: they delete the environment proc-top runs from
 - "The screen never turned off" / "something is busy at night" and a game was left open → `mac-dev-cleanup --only games`
 
 ## macOS WindowServer Diagnostics

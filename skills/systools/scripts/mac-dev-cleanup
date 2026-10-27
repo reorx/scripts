@@ -2,13 +2,14 @@
 # /// script
 # requires-python = ">=3.11"
 # ///
-"""Release macOS dev resources: booted iOS simulators, agent-browser Chrome trees, and
-stale Rust build artifacts in the shared cargo target dir.
+"""Release macOS dev resources: booted iOS simulators, agent-browser Chrome trees, stale
+Rust build artifacts in the shared cargo target dir, and old entries in the uv cache.
 
 None of them cleans up after itself. A booted simulator keeps a full launchd_sim tree of
 iOS daemons and widget extensions alive (hundreds of processes, GBs of RAM); a leaked
 agent-browser session keeps a ~10-process headless Chrome tree spinning at ~100% CPU
-per renderer, indefinitely; and a target dir shared by every Rust project only grows.
+per renderer, indefinitely; and a target dir shared by every Rust project only grows, as
+does the uv cache, which keeps every wheel and environment it ever made.
 
 `--only games` (never part of the default run) closes Hearthstone and Battle.net before
 the night, when the Mac wakes on its own for agents: left open, the game keeps the
@@ -48,7 +49,9 @@ PS_ARGS = ["ps", "-Awwo", "pid,ppid,etime,pcpu,command"]
 
 DANGER_MARKER = "⚠️"
 
-DEFAULT_TARGETS = ["browser", "sim", "cargo"]
+DEFAULT_TARGETS = ["browser", "sim", "cargo", "uv"]
+# These free disk, not memory.
+DISK_TARGETS = {"cargo", "uv"}
 
 
 @dataclass(frozen=True)
@@ -591,6 +594,236 @@ def cleanup_cargo(keep_days: int, max_size: str, dry_run: bool) -> int:
                 os.close(fd)
 
 
+# ── uv cache cleanup ────────────────────────────────────────
+# `uv cache prune` cannot run here unattended. Resident `uv run` jobs (proc-top, …) hold a
+# shared lock on the cache for as long as they live, so prune waits forever; and with
+# --force it deletes every cached environment, including the ones those jobs run from.
+# This section does the same garbage collection by hand, leaving in-use entries alone.
+#
+# The cache layout of uv 0.9.17 (CacheBucket::to_str in crates/uv-cache/src/lib.rs).
+# uv bumps a bucket's version whenever its format changes, so a uv binary that does not
+# contain every one of these names lays the cache out differently, and is left alone.
+UV_BUCKETS = (
+    "sdists-v9",
+    "flat-index-v2",
+    "git-v0",
+    "interpreter-v4",
+    "simple-v18",
+    "wheels-v5",
+    "archive-v0",
+    "builds-v0",
+    "environments-v2",
+    "python-v0",
+    "binaries-v0",
+)
+UV_MARKERS = {"CACHEDIR.TAG", ".gitignore", ".git", ".lock"}
+UV_TRASH_PREFIX = ".mac-dev-cleanup-trash-"
+# An install persists an archive first and links it after; anything younger may be mid-install.
+UV_GRACE_SECONDS = 86400
+# A uv holding the cache lock for less than this may be installing right now.
+UV_BUSY_SECONDS = 600
+UV_KIND_LABELS = {
+    "stale": "old buckets, temp dirs",
+    "orphan": "unreferenced archives",
+    "wheel": "downloaded wheels",
+    "env": "environments",
+}
+
+
+@dataclass
+class UvRemoval:
+    """A cache entry to delete, with the symlinks that point at it (removed alongside)."""
+
+    kind: str  # one of UV_KIND_LABELS
+    path: Path
+    links: list[Path] = field(default_factory=list)
+
+
+def uv_layout_matches(binary: Path) -> bool:
+    """Whether this uv binary was built with every bucket name in UV_BUCKETS."""
+    data = binary.read_bytes()
+    return all(name.encode() in data for name in UV_BUCKETS)
+
+
+def young_uv_holders(holders: set[int], ps_rows: list[tuple], self_pid: int, min_age: int) -> list[int]:
+    """Lock holders started less than min_age seconds ago, other than this script's own launcher."""
+    parents = {pid: ppid for pid, ppid, *_ in ps_rows}
+    ages = {pid: age for pid, _, age, *_ in ps_rows}
+    ancestors, pid = set(), self_pid
+    while pid in parents and pid not in ancestors:
+        ancestors.add(pid)
+        pid = parents[pid]
+    return sorted(p for p in holders - ancestors if p in ages and ages[p] < min_age)
+
+
+def uv_archive_links(cache: Path) -> dict[str, dict[str, list[Path]]]:
+    """Archive id → {"wheels" | "sdists" | "envs": [symlinks pointing at that archive]}."""
+    archive_root = os.path.realpath(cache / "archive-v0")
+    found: dict[str, dict[str, list[Path]]] = {}
+
+    def add(source: str, path: Path) -> None:
+        target = os.path.realpath(path)
+        if os.path.dirname(target) == archive_root:
+            found.setdefault(os.path.basename(target), {}).setdefault(source, []).append(path)
+
+    for source, bucket in (("wheels", "wheels-v5"), ("sdists", "sdists-v9")):
+        for dirpath, dirs, files in os.walk(cache / bucket):
+            dirs[:] = [d for d in dirs if d != "src"]  # unpacked source trees, as uv skips them too
+            for name in dirs + files:
+                if os.path.islink(os.path.join(dirpath, name)):
+                    add(source, Path(dirpath, name))
+    # Cached environments (`uv run --with`, uvx) are environments-v2/<interpreter>/<hash> links;
+    # the other entries there are `uv run --script` environments, real venvs not worth walking.
+    for top in sorted((cache / "environments-v2").glob("*")):
+        if top.is_symlink():
+            add("envs", top)
+        elif top.is_dir() and not (top / "pyvenv.cfg").exists():
+            for child in sorted(top.iterdir()):
+                if child.is_symlink():
+                    add("envs", child)
+    return found
+
+
+def uv_pointer_bytes(cache: Path) -> bytes:
+    """All .http/.rev pointer files, concatenated. They name archives by id inside msgpack."""
+    chunks = []
+    for bucket in ("wheels-v5", "sdists-v9"):
+        for dirpath, dirs, files in os.walk(cache / bucket):
+            dirs[:] = [d for d in dirs if d != "src"]
+            chunks += [Path(dirpath, f).read_bytes() for f in files if f.endswith((".http", ".rev"))]
+    return b"\n".join(chunks)
+
+
+def plan_uv_cleanup(cache: Path, keep_days: int, ps_output: str, now: float) -> tuple[list[UvRemoval], list[str]]:
+    """What to delete from the cache. Returns (removals, entries kept only because a process uses them).
+
+    uv records no last-use time and this Mac only updates atime on the first read after a
+    write, so age is creation time: a still-needed wheel is downloaded once more, an
+    environment rebuilt from the archives. Wheels built from source stay, since rebuilding
+    them takes minutes and a toolchain.
+    """
+    grace_cutoff = now - UV_GRACE_SECONDS
+    age_cutoff = now - keep_days * 86400
+    removals: list[UvRemoval] = []
+    in_use: list[str] = []
+
+    def born(path: Path) -> float:
+        return path.lstat().st_birthtime
+
+    def consider(kind: str, path: Path, cutoff: float, links: list[Path] | None = None) -> None:
+        if born(path) >= cutoff:
+            return
+        links = links or []
+        if any(f"{p}/" in ps_output for p in (path, *links)):
+            in_use.append(str((links[0] if links else path).relative_to(cache)))
+            return
+        removals.append(UvRemoval(kind, path, links))
+
+    for entry in sorted(cache.iterdir()):
+        if entry.name not in UV_BUCKETS and entry.name not in UV_MARKERS:
+            consider("stale", entry, grace_cutoff)
+
+    links_by_id = uv_archive_links(cache)
+    pointers = uv_pointer_bytes(cache)
+    for archive in sorted((cache / "archive-v0").iterdir()):
+        sources = links_by_id.get(archive.name, {})
+        links = [lk for group in sources.values() for lk in group]
+        if not sources:
+            if archive.name.encode() not in pointers:
+                consider("orphan", archive, grace_cutoff)
+        elif set(sources) == {"wheels"}:
+            consider("wheel", archive, age_cutoff, links)
+        elif set(sources) == {"envs"}:
+            consider("env", archive, age_cutoff, links)
+
+    for env in sorted((cache / "environments-v2").glob("*/pyvenv.cfg")):
+        consider("env", env.parent, age_cutoff)
+    return removals, in_use
+
+
+def apply_uv_plan(cache: Path, removals: list[UvRemoval]) -> None:
+    """Rename each entry into a trash dir, so uv sees it whole or not at all, then delete the trash."""
+    trash = Path(tempfile.mkdtemp(prefix=UV_TRASH_PREFIX, dir=cache))
+    for i, item in enumerate(removals):
+        for link in item.links:
+            link.unlink(missing_ok=True)
+        item.path.rename(trash / f"{i}-{item.path.name}")
+    shutil.rmtree(trash)
+
+
+def tree_bytes(paths: list[Path], seen: set[int]) -> int:
+    """Allocated bytes under paths, each inode once (what du reports)."""
+    total = 0
+    for root in paths:
+        for dirpath, _dirs, files in os.walk(root):
+            for name in [dirpath, *(os.path.join(dirpath, f) for f in files)]:
+                st = os.lstat(name)
+                if st.st_ino not in seen:
+                    seen.add(st.st_ino)
+                    total += st.st_blocks * 512
+    return total
+
+
+def volume_free(path: Path) -> int:
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize
+
+
+def cleanup_uv(keep_days: int, dry_run: bool) -> int:
+    """Trim the uv cache. Returns bytes cleaned (or that would be), as du counts them."""
+    print("── uv cache ───────────────────────────────────────")
+    uv = shutil.which("uv")
+    if not uv:
+        print("uv not found, skipped")
+        return 0
+    if not uv_layout_matches(Path(uv).resolve()):
+        version = run([uv, "--version"]).stdout.strip()
+        print(f"{DANGER_MARKER} {version} lays out its cache differently, skipped (update UV_BUCKETS)")
+        return 0
+    cache = Path(run([uv, "cache", "dir"]).stdout.strip())
+    if not (cache / "archive-v0").is_dir():
+        print(f"no uv cache at {cache}, nothing to clean")
+        return 0
+
+    holders = {int(pid) for pid in run(["lsof", "-t", "--", str(cache / ".lock")]).stdout.split()}
+    ps_rows = parse_ps(ps_snapshot())
+    busy = young_uv_holders(holders, ps_rows, os.getpid(), UV_BUSY_SECONDS)
+    if busy:
+        print(f"uv started < {UV_BUSY_SECONDS // 60}m ago may be installing (pid {', '.join(map(str, busy))}), skipped this run")
+        return 0
+
+    removals, in_use = plan_uv_cleanup(cache, keep_days, "\n".join(row[-1] for row in ps_rows), time.time())
+    before = dir_size(cache)
+    print(f"  {cache}  {human_bytes(before)}")
+    seen: set[int] = set()
+    total = 0
+    for kind, label in UV_KIND_LABELS.items():
+        items = [i for i in removals if i.kind == kind]
+        if not items:
+            continue
+        size = tree_bytes([i.path for i in items], seen)
+        total += size
+        age = "" if kind in ("stale", "orphan") else f" > {keep_days}d"
+        print(f"  {label + age:<26} {len(items):>5}  {human_bytes(size)}")
+    if in_use:
+        print(f"  kept, in use: {', '.join(in_use)}")
+    if not removals:
+        print("nothing to clean")
+        return 0
+    if dry_run:
+        print(f"[dry-run] would remove {len(removals)} entries, {human_bytes(total)} by du")
+        return total
+
+    free_before = volume_free(cache)
+    apply_uv_plan(cache, removals)
+    # uv installs by APFS clone, so blocks shared with installed venvs stay allocated.
+    print(
+        f"✅ done, {human_bytes(before)} → {human_bytes(dir_size(cache))}, "
+        f"volume free +{human_bytes(max(volume_free(cache) - free_before, 0))}"
+    )
+    return total
+
+
 # ── Self tests (behaviour spec) ─────────────────────────────
 PS_FIXTURE = """\
   PID  PPID     ELAPSED  %CPU COMMAND
@@ -630,6 +863,17 @@ GAMES_PS_FIXTURE = """\
 50990 /Users/Shared/Battle.net/Agent/Agent.9824/Agent.app/Contents/MacOS/Agent
   778 /Applications/Steam.app/Contents/MacOS/steam_osx
   779 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+"""
+
+# Lock holders of the uv cache: two residents up for days, a brewer.py started 2 minutes
+# ago, and this script (901) with the `uv run --script` that launched it (900).
+UV_PS_FIXTURE = """\
+  PID  PPID     ELAPSED  %CPU COMMAND
+ 1514     1 12-23:16:58   0.0 /Users/reorx/.local/bin/uv run condenser-probe watch
+ 1515     1 12-23:16:58   0.0 /Users/reorx/.local/bin/uv run /Users/reorx/.local/share/proc-top/proc_top.py
+47020 47000       02:19   0.0 /Users/reorx/.local/bin/uv run ./brewer.py upgrade
+  900     1       00:03   0.0 /Users/reorx/.local/bin/uv run --script /Users/reorx/Code/scripts/skills/systools/scripts/mac-dev-cleanup
+  901   900       00:02   0.0 /Users/reorx/.cache/uv/environments-v2/mac-dev-cleanup-0123456789abcdef/bin/python3 mac-dev-cleanup
 """
 
 _FAILED = 0
@@ -797,6 +1041,121 @@ def selftest() -> int:
     # games are closed only by the explicit `--only games` evening job.
     check("games are not in the default targets", "games" in DEFAULT_TARGETS, False)
 
+    print("\nuv: uv_layout_matches")
+    with tempfile.TemporaryDirectory() as tmp:
+        binary = Path(tmp) / "uv"
+        # Rust packs string literals back to back, with no separator.
+        binary.write_bytes(b"\x00junk" + "".join(UV_BUCKETS).encode() + b"more")
+        check("a uv built with every bucket name we know", uv_layout_matches(binary), True)
+        binary.write_bytes("".join(UV_BUCKETS).replace("wheels-v5", "wheels-v6").encode())
+        check("a uv whose wheel bucket moved on → skip", uv_layout_matches(binary), False)
+
+    print("\nuv: young_uv_holders")
+    rows = parse_ps(UV_PS_FIXTURE)
+    check(
+        "a uv started minutes ago is busy; residents and our own launcher are not",
+        young_uv_holders({1514, 1515, 47020, 900}, rows, self_pid=901, min_age=600),
+        [47020],
+    )
+    check("a holder that exited since lsof is ignored", young_uv_holders({99999}, rows, self_pid=901, min_age=600), [])
+
+    print("\nuv: plan_uv_cleanup")
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp)
+        now = time.time()
+        old, recent, fresh = now - 200 * 86400, now - 5 * 86400, now
+        archive = cache / "archive-v0"
+
+        def entry(path: Path, born: float, venv: bool = False) -> Path:
+            path.mkdir(parents=True)
+            if venv:
+                (path / "pyvenv.cfg").write_text("uv = 0.9.17\n")
+            os.utime(path, (born, born))  # an mtime before the birth time moves the birth time back on APFS
+            return path
+
+        def link(path: Path, target: Path) -> Path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.symlink_to(target)
+            return path
+
+        for name in ("CACHEDIR.TAG", ".gitignore", ".lock"):
+            (cache / name).touch()
+        current_bucket = entry(cache / "simple-v18", old)
+        entry(cache / "simple-v15", old)  # an older uv's bucket
+        entry(cache / ".tmpCrashed", recent)  # temp dir of a uv run that died
+        in_flight_tmp = entry(cache / ".tmpInFlight", fresh)  # temp dir of a uv run going on now
+
+        old_wheel = entry(archive / "OLDWHEELxxxxxxxxxxxxx", old)
+        old_wheel_link = link(cache / "wheels-v5/pypi/foo/1.0-py3-none-any", old_wheel)
+        old_wheel_pointer = cache / "wheels-v5/pypi/foo/1.0-py3-none-any.http"
+        old_wheel_pointer.write_bytes(b"\x95\xb5" + old_wheel.name.encode())
+        new_wheel = entry(archive / "NEWWHEELxxxxxxxxxxxxx", recent)
+        link(cache / "wheels-v5/pypi/foo/2.0-py3-none-any", new_wheel)
+        built = entry(archive / "BUILTxxxxxxxxxxxxxxxx", old)
+        link(cache / "sdists-v9/pypi/bar/1.0/rev/bar-1.0-py3-none-any", built)
+        orphan = entry(archive / "ORPHANxxxxxxxxxxxxxxx", recent)
+        fresh_orphan = entry(archive / "FRESHORPHANxxxxxxxxxx", fresh)
+        pointer_only = entry(archive / "POINTERONLYxxxxxxxxxx", recent)
+        (cache / "sdists-v9/pypi/baz").mkdir(parents=True)
+        (cache / "sdists-v9/pypi/baz/revision.http").write_bytes(b"\xb5" + pointer_only.name.encode() + b"\x92")
+        old_env_archive = entry(archive / "OLDENVxxxxxxxxxxxxxxx", old, venv=True)
+        old_env_link = link(cache / "environments-v2/1111aaaa/2222bbbb", old_env_archive)
+        busy_env_archive = entry(archive / "BUSYENVxxxxxxxxxxxxxx", old, venv=True)
+        link(cache / "environments-v2/1111aaaa/3333cccc", busy_env_archive)
+        old_script = entry(cache / "environments-v2/oldscript-abc", old, venv=True)
+        resident = entry(cache / "environments-v2/proc-top-e16", old, venv=True)
+        new_script = entry(cache / "environments-v2/newscript-def", recent, venv=True)
+        ps_output = (
+            f"{resident}/bin/python3 /Users/me/.local/share/proc-top/proc_top.py\n"
+            f"{cache}/environments-v2/1111aaaa/3333cccc/bin/python -m some_tool\n"
+        )
+
+        removals, in_use = plan_uv_cleanup(cache, keep_days=90, ps_output=ps_output, now=now)
+        by_kind: dict[str, list[str]] = {}
+        for item in removals:
+            by_kind.setdefault(item.kind, []).append(item.path.name)
+        check("old buckets and dead runs' temp dirs", sorted(by_kind.get("stale", [])), [".tmpCrashed", "simple-v15"])
+        check("unreferenced archives", by_kind.get("orphan"), [orphan.name])
+        check("downloaded wheels past the age limit", by_kind.get("wheel"), [old_wheel.name])
+        check(
+            "script and cached environments past the age limit",
+            sorted(by_kind.get("env", [])),
+            sorted([old_env_archive.name, old_script.name]),
+        )
+        wheel = next(i for i in removals if i.kind == "wheel")
+        check("a wheel goes with its index symlink", wheel.links, [old_wheel_link])
+        cached_env = next(i for i in removals if i.path == old_env_archive)
+        check("a cached env goes with its environments-v2 symlink", cached_env.links, [old_env_link])
+        check(
+            "SAFETY: environments a process runs from are kept and reported",
+            sorted(in_use),
+            ["environments-v2/1111aaaa/3333cccc", "environments-v2/proc-top-e16"],
+        )
+        removed = {i.path for i in removals}
+        for what, path in [
+            ("an archive created in the last day (install in flight)", fresh_orphan),
+            ("a wheel built from source (rebuilding needs a toolchain)", built),
+            ("an archive only a pointer file names", pointer_only),
+            ("a recent wheel", new_wheel),
+            ("a recent script env", new_script),
+            ("the bucket the installed uv uses", current_bucket),
+            ("a running uv's temp dir", in_flight_tmp),
+        ]:
+            check(f"SAFETY: keeps {what}", path in removed, False)
+        check("SAFETY: never touches uv's marker files", {p.name for p in removed} & UV_MARKERS, set())
+
+        apply_uv_plan(cache, removals)
+        check("removed entries are gone", [i.path for i in removals if i.path.exists()], [])
+        check("their symlinks are gone", [lk for i in removals for lk in i.links if lk.is_symlink()], [])
+        # uv 0.9.17 treats a pointer to a missing archive as stale and downloads again.
+        check("the wheel's .http pointer stays", old_wheel_pointer.exists(), True)
+        kept = (fresh_orphan, built, pointer_only, new_wheel, busy_env_archive, resident, new_script)
+        check("kept entries survive", [p.name for p in kept if not p.exists()], [])
+        check("no trash left behind", [p.name for p in cache.iterdir() if p.name.startswith(UV_TRASH_PREFIX)], [])
+
+    print("\nuv: default run")
+    check("the uv cache is trimmed by the daily run", "uv" in DEFAULT_TARGETS, True)
+
     print("\nrun_sections")
     ran = []
 
@@ -841,15 +1200,15 @@ def run_sections(sections: list[tuple[str, Callable[[], int]]]) -> tuple[int, li
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Release iOS simulator, agent-browser and cargo target resources",
+        description="Release iOS simulator, agent-browser, cargo target and uv cache resources",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-n", "--dry-run", action="store_true", help="Report what would be cleaned, change nothing")
     parser.add_argument(
         "--only",
-        choices=["sim", "browser", "cargo", "games"],
-        help="Clean only simulators, only agent-browser, only the cargo target, or close games "
-        "(default: all but games, which only ever run when asked for explicitly)",
+        choices=["sim", "browser", "cargo", "uv", "games"],
+        help="Clean only simulators, only agent-browser, only the cargo target, only the uv cache, "
+        "or close games (default: all but games, which only ever run when asked for explicitly)",
     )
     parser.add_argument(
         "--min-age",
@@ -875,6 +1234,14 @@ def main() -> int:
         help="Then remove least recently used artifacts until the target fits SIZE, as cargo-sweep "
         "measures it: apparent size, a bit above du (default: 20GiB; note GB means 10^9)",
     )
+    parser.add_argument(
+        "--uv-days",
+        type=int,
+        default=90,
+        metavar="DAYS",
+        help="Remove downloaded wheels and cached environments in the uv cache created more than "
+        "DAYS ago (default: 90). uv keeps no last-use time; a still-needed one is just fetched again",
+    )
     parser.add_argument("--selftest", action="store_true", help="Run behaviour checks and exit")
     args = parser.parse_args()
 
@@ -890,8 +1257,8 @@ def main() -> int:
         print(f"═══ mac-dev-cleanup {time.strftime('%Y-%m-%d %H:%M:%S')} ═══")
 
     targets = [args.only] if args.only else DEFAULT_TARGETS
-    # Only processes affect memory; the cargo sweep frees disk.
-    track_memory = "cargo" not in targets or len(targets) > 1
+    # Only processes affect memory; the cargo sweep and uv trim free disk.
+    track_memory = not set(targets) <= DISK_TARGETS
     if track_memory:
         free_before, swap_before = mem_stats()
 
@@ -899,6 +1266,7 @@ def main() -> int:
         "browser": lambda: cleanup_agent_browser(args.min_age, args.dry_run),
         "sim": lambda: cleanup_simulators(args.dry_run),
         "cargo": lambda: cleanup_cargo(args.cargo_days, args.cargo_max_size, args.dry_run),
+        "uv": lambda: cleanup_uv(args.uv_days, args.dry_run),
         "games": lambda: cleanup_games(args.dry_run),
     }
     found, failed = run_sections([(name, sections[name]) for name in targets])
