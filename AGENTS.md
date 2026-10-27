@@ -57,6 +57,11 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 
 - `skills/squash-docs/scripts/squash-docs.ts` folds linear runs of commits whose subject matches `--pattern` (default `docs:`) into one, reusing original trees and keeping merges; preview by default, `--apply` updates only the current branch behind a `refs/squash-docs-backup/` ref. It is the repo's only TypeScript script: Node >= 22.18, no dependencies, run `node test-squash-docs.ts` when changing it.
 
+## Homebrew upgrades
+
+- `brewer.py` (linked as `brewer`: `outdated`, `upgrade`, `whitelist`) looks only at formulae installed on request and levels each update by the first differing version segment (major / minor / patch, revision-only counts as patch). `upgrade` auto-upgrades `~/.config/brewer/whitelist`, reviews the remaining major/minor updates in a textual TUI, and runs one `brew upgrade --formula` per formula.
+- Outcomes, including formulae brew upgraded along the way, come from diffing `brew outdated` before and after, never from parsing brew's text output. Tests run against a fake `brew` first in PATH; run `uv run test_brewer.py` when changing it. PRD and design: `kb/plans/2026-10-27-brewer.md`.
+
 ## Documentation
 
 - `kb/docs/skill-invocation.md` — Read before changing skill invocation policies or synchronizing installed skills; explicit-only skills need both Claude Code and Codex settings.
