@@ -3,13 +3,16 @@
 # requires-python = ">=3.11"
 # ///
 """Release macOS dev resources: booted iOS simulators, agent-browser Chrome trees, stale
-Rust build artifacts in the shared cargo target dir, and old entries in the uv cache.
+Rust build artifacts in the shared cargo target dir, old entries in the uv cache, and
+code-sign clones left behind by browsers that did not quit normally.
 
 None of them cleans up after itself. A booted simulator keeps a full launchd_sim tree of
 iOS daemons and widget extensions alive (hundreds of processes, GBs of RAM); a leaked
 agent-browser session keeps a ~10-process headless Chrome tree spinning at ~100% CPU
 per renderer, indefinitely; and a target dir shared by every Rust project only grows, as
-does the uv cache, which keeps every wheel and environment it ever made.
+does the uv cache, which keeps every wheel and environment it ever made. Every killed
+Chrome leaves a copy of its app bundle under /var/folders, which keeps the version it
+was launched from on disk after the app has updated.
 
 `--only games` (never part of the default run) closes Hearthstone and Battle.net before
 the night, when the Mac wakes on its own for agents: left open, the game keeps the
@@ -23,6 +26,7 @@ import argparse
 import fcntl
 import json
 import os
+import plistlib
 import re
 import shutil
 import signal
@@ -49,9 +53,10 @@ PS_ARGS = ["ps", "-Awwo", "pid,ppid,etime,pcpu,command"]
 
 DANGER_MARKER = "⚠️"
 
-DEFAULT_TARGETS = ["browser", "sim", "cargo", "uv"]
+# clones runs after browser, so it also takes the clones of the sessions browser just killed.
+DEFAULT_TARGETS = ["browser", "sim", "cargo", "uv", "clones"]
 # These free disk, not memory.
-DISK_TARGETS = {"cargo", "uv"}
+DISK_TARGETS = {"cargo", "uv", "clones"}
 
 
 @dataclass(frozen=True)
@@ -824,6 +829,130 @@ def cleanup_uv(keep_days: int, dry_run: bool) -> int:
     return total
 
 
+# ── browser code-sign clone cleanup ─────────────────────────
+# At launch, Chromium browsers (Chrome, AdsPower's SunBrowser, …) copy their app bundle to
+# <DARWIN_USER_TEMP_DIR>/../X/<bundle id>.code_sign_clone/code_sign_clone.XXXXXX/, so that an
+# update replacing the app on disk cannot break the running browser's code signature. A
+# browser that quits normally deletes its clone; one that is killed or crashes leaves it, and
+# by 2026-10-27 agent-browser sessions had left 35 of them, 74 GiB by du.
+#
+# Most of that is not real disk use: the clones are APFS clones, sharing blocks with the
+# installed app and with each other. A clone only costs space once the app updates and it is
+# left holding the old version, ~0.7 GiB per Chrome version however many clones share it.
+#
+# Neither lsof nor `codesign -dv <pid>` can tell which running browser owns a clone: the main
+# executable in every clone of one version is a hard link to the same inode, so both name an
+# arbitrary sibling. Launch time can: a browser clones itself within a second or two of starting.
+CLONE_GLOB = "*.code_sign_clone/code_sign_clone.*"
+# Clone birth time minus the browser's start time, in seconds. ps reports elapsed time in
+# whole seconds, so the estimated start can be a little late.
+CLONE_MATCH_WINDOW = (-30, 300)
+CLONE_TRASH_PREFIX = ".mac-dev-cleanup-trash-"
+# A trash dir younger than this may belong to a run still deleting it.
+CLONE_TRASH_GRACE = 3600
+
+
+@dataclass
+class Clone:
+    """One code_sign_clone.XXXXXX dir, with the running browser that owns it if any."""
+
+    path: Path
+    born: float
+    exe: str | None  # CFBundleExecutable of the cloned app, None when there is no Info.plist
+    owner: int | None = None
+
+
+def clone_root() -> Path:
+    return Path(run(["getconf", "DARWIN_USER_TEMP_DIR"]).stdout.strip()).parent / "X"
+
+
+def read_clones(root: Path) -> list[Clone]:
+    clones = []
+    for path in sorted(root.glob(CLONE_GLOB)):
+        plists = sorted(path.glob("*/Contents/Info.plist"))
+        exe = plistlib.loads(plists[0].read_bytes()).get("CFBundleExecutable") if plists else None
+        clones.append(Clone(path, path.stat().st_birthtime, exe))
+    return clones
+
+
+def browser_starts(ps_rows: list[tuple], exe: str, now: float) -> list[tuple[int, float]]:
+    """(pid, start time) of every running browser process of the app whose executable is exe."""
+    exe_re = re.compile(rf"/Contents/MacOS/{re.escape(exe)}(?: |$)")
+    # Helpers sit in other bundles but carry the exe's name as a prefix, and all have a --type=.
+    return [(pid, now - age) for pid, _, age, _, cmd in ps_rows if exe_re.search(cmd) and "--type=" not in cmd]
+
+
+def plan_clone_cleanup(clones: list[Clone], ps_rows: list[tuple], now: float) -> tuple[list[Clone], list[Clone]]:
+    """Split clones into (orphans, kept). A clone is kept when a running browser of its app
+    started just before it was made (its owner is set), or when its app is unknown."""
+    low, high = CLONE_MATCH_WINDOW
+    orphans, kept = [], []
+    for clone in clones:
+        if clone.exe is None:
+            kept.append(clone)
+            continue
+        starts = browser_starts(ps_rows, clone.exe, now)
+        clone.owner = next((pid for pid, start in starts if low <= clone.born - start <= high), None)
+        (kept if clone.owner else orphans).append(clone)
+    return orphans, kept
+
+
+def stale_clone_trash(root: Path, now: float) -> list[Path]:
+    """Trash dirs that a run which crashed before deleting them left in root."""
+    return sorted(p for p in root.glob(f"{CLONE_TRASH_PREFIX}*") if p.stat().st_birthtime < now - CLONE_TRASH_GRACE)
+
+
+def remove_clones(root: Path, orphans: list[Clone], stale_trash: list[Path]) -> int:
+    """Rename each orphan into a trash dir, then delete it and the stale trash. Returns orphans removed.
+
+    The rename keeps this from racing a browser that is deleting its own clone right now,
+    such as one the agent-browser step just closed.
+    """
+    trash = Path(tempfile.mkdtemp(prefix=CLONE_TRASH_PREFIX, dir=root))
+    removed = 0
+    for i, clone in enumerate(orphans):
+        try:
+            clone.path.rename(trash / f"{i}-{clone.path.name}")
+        except FileNotFoundError:
+            continue  # its browser got there first
+        removed += 1
+    for path in [trash, *stale_trash]:
+        shutil.rmtree(path)
+    return removed
+
+
+def cleanup_clones(dry_run: bool) -> int:
+    """Delete code-sign clones no running browser owns. Returns clones removed (or that would be)."""
+    print("── browser code-sign clones ───────────────────────")
+    root = clone_root()
+    # Read the clones before ps: a browser that clones itself after this is not in the list.
+    clones = read_clones(root)
+    ps_rows = parse_ps(ps_snapshot())
+    now = time.time()
+    orphans, kept = plan_clone_cleanup(clones, ps_rows, now)
+    stale_trash = stale_clone_trash(root, now)
+    if not orphans and not stale_trash:
+        print("nothing to clean" + (f" ({len(kept)} in use)" if kept else ""))
+        return 0
+
+    for app in sorted({c.path.parent.name for c in orphans}):
+        items = [c.path for c in orphans if c.path.parent.name == app]
+        print(f"  {app.removesuffix('.code_sign_clone'):<28} {len(items):>3} orphaned  {human_bytes(tree_bytes(items, set()))} by du")
+    if stale_trash:
+        print(f"  {len(stale_trash)} trash dir(s) left by an earlier run")
+    for clone in kept:
+        owner = f"pid {clone.owner}" if clone.owner else "unknown app"
+        print(f"  keeping {clone.path.parent.name.removesuffix('.code_sign_clone')}/{clone.path.name}  ({owner})")
+    if dry_run:
+        print(f"[dry-run] would remove {len(orphans)} clone(s); they share blocks with the app and each other, so far less than du is freed")
+        return len(orphans) + len(stale_trash)
+
+    free_before = volume_free(root)
+    removed = remove_clones(root, orphans, stale_trash)
+    print(f"✅ done, removed {removed} clone(s), volume free +{human_bytes(max(volume_free(root) - free_before, 0))}")
+    return removed
+
+
 # ── Self tests (behaviour spec) ─────────────────────────────
 PS_FIXTURE = """\
   PID  PPID     ELAPSED  %CPU COMMAND
@@ -874,6 +1003,18 @@ UV_PS_FIXTURE = """\
 47020 47000       02:19   0.0 /Users/reorx/.local/bin/uv run ./brewer.py upgrade
   900     1       00:03   0.0 /Users/reorx/.local/bin/uv run --script /Users/reorx/Code/scripts/skills/systools/scripts/mac-dev-cleanup
   901   900       00:02   0.0 /Users/reorx/.cache/uv/environments-v2/mac-dev-cleanup-0123456789abcdef/bin/python3 mac-dev-cleanup
+"""
+
+# Browsers that may own a code-sign clone: the user's Chrome up for 12 days with a renderer,
+# an agent-browser Chrome started 5 minutes ago, AdsPower's SunBrowser, and a renderer that
+# outlived its browser (killed two hours ago).
+CLONE_PS_FIXTURE = """\
+  PID  PPID     ELAPSED  %CPU COMMAND
+84743     1 12-13:54:29   0.0 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+84750 84743 12-13:54:28   0.0 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/155.0.8059.79/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer) --type=renderer
+97388 97387       05:00   0.0 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=0 --no-first-run --user-data-dir=/var/folders/3n/07t8/T/agent-browser-chrome-7b38b244-8dff-466b-9124-6323ec0ca515
+24480 90486 01-10:45:37   0.0 /Users/reorx/Library/Application Support/adspower_global/cwd_global/chrome_152/SunBrowser.app/Contents/MacOS/SunBrowser --force-color-profile=srgb
+55555     1    02:00:00   0.0 /Applications/Google Chrome.app/Contents/Frameworks/Google Chrome Framework.framework/Versions/156.0.8078.48/Helpers/Google Chrome Helper (Renderer).app/Contents/MacOS/Google Chrome Helper (Renderer) --type=renderer
 """
 
 _FAILED = 0
@@ -1156,6 +1297,68 @@ def selftest() -> int:
     print("\nuv: default run")
     check("the uv cache is trimmed by the daily run", "uv" in DEFAULT_TARGETS, True)
 
+    print("\nclones: plan_clone_cleanup")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        now = time.time()
+        rows = parse_ps(CLONE_PS_FIXTURE)
+        starts = {pid: now - age for pid, _, age, *_ in rows}
+
+        def make_clone(bundle_id: str, suffix: str, exe: str | None, born: float) -> Path:
+            path = root / f"{bundle_id}.code_sign_clone/code_sign_clone.{suffix}"
+            contents = path / f"{exe or 'Unknown'}.app.bundle/Contents"
+            contents.mkdir(parents=True)
+            if exe:
+                (contents / "Info.plist").write_bytes(plistlib.dumps({"CFBundleExecutable": exe}))
+            os.utime(path, (born, born))  # moves the birth time back, see uv above
+            return path
+
+        chrome, sun = "com.google.Chrome", "com.adspower.SunBrowser"
+        make_clone(chrome, "MAIN01", "Google Chrome", starts[84743] + 1)
+        make_clone(chrome, "AGENT1", "Google Chrome", starts[97388] + 1)
+        make_clone(sun, "SUN001", "SunBrowser", starts[24480] - 2)
+        make_clone(chrome, "NOPLST", None, now - 30 * 86400)
+        make_clone(chrome, "BEFORE", "Google Chrome", starts[84743] - 50_000)
+        make_clone(chrome, "LATER1", "Google Chrome", starts[84743] + 3600)
+        killed = make_clone(chrome, "KILLED", "Google Chrome", starts[55555] + 1)
+        make_clone(chrome, "OTHER1", "Google Chrome", starts[24480] + 1)
+
+        orphans, kept = plan_clone_cleanup(read_clones(root), rows, now)
+        owners = {c.path.suffix[1:]: c.owner for c in kept}
+        check("the user's long-running Chrome keeps the clone it made at launch", owners.get("MAIN01"), 84743)
+        check("a running agent-browser Chrome keeps its clone", owners.get("AGENT1"), 97388)
+        check("another Chromium app is matched by its own executable", owners.get("SUN001"), 24480)
+        check("SAFETY: a clone whose app can't be identified is kept", "NOPLST" in owners, True)
+        check(
+            "orphans: born long before or after a launch, by a browser whose renderer outlived it, "
+            "or when only another app launched",
+            sorted(c.path.suffix[1:] for c in orphans),
+            ["BEFORE", "KILLED", "LATER1", "OTHER1"],
+        )
+
+        print("\nclones: remove_clones")
+        crashed_run = root / f"{CLONE_TRASH_PREFIX}crashed"
+        (crashed_run / "leftover").mkdir(parents=True)
+        os.utime(crashed_run, (now - 7200, now - 7200))
+        running = root / f"{CLONE_TRASH_PREFIX}running"
+        running.mkdir()
+        stale = stale_clone_trash(root, now)
+        check("trash a crashed run left behind is picked up, a running one's is not", stale, [crashed_run])
+
+        shutil.rmtree(killed)  # its browser deleted it between the plan and the removal
+        check("removes the orphans, skipping one already gone", remove_clones(root, orphans, stale), 3)
+        check("orphans are gone", [c.path.name for c in orphans if c.path.exists()], [])
+        check("kept clones survive", [c.path.name for c in kept if not c.path.exists()], [])
+        check(
+            "no trash left behind but the running one's",
+            sorted(p.name for p in root.glob(f"{CLONE_TRASH_PREFIX}*")),
+            [running.name],
+        )
+
+    print("\nclones: default run")
+    check("orphaned clones are removed by the daily run", "clones" in DEFAULT_TARGETS, True)
+    check("the clone step frees disk, not memory", "clones" in DISK_TARGETS, True)
+
     print("\nrun_sections")
     ran = []
 
@@ -1200,14 +1403,15 @@ def run_sections(sections: list[tuple[str, Callable[[], int]]]) -> tuple[int, li
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Release iOS simulator, agent-browser, cargo target and uv cache resources",
+        description="Release iOS simulator, agent-browser, cargo target, uv cache and browser code-sign clone resources",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-n", "--dry-run", action="store_true", help="Report what would be cleaned, change nothing")
     parser.add_argument(
         "--only",
-        choices=["sim", "browser", "cargo", "uv", "games"],
+        choices=["sim", "browser", "cargo", "uv", "clones", "games"],
         help="Clean only simulators, only agent-browser, only the cargo target, only the uv cache, "
+        "only orphaned browser code-sign clones, "
         "or close games (default: all but games, which only ever run when asked for explicitly)",
     )
     parser.add_argument(
@@ -1257,7 +1461,7 @@ def main() -> int:
         print(f"═══ mac-dev-cleanup {time.strftime('%Y-%m-%d %H:%M:%S')} ═══")
 
     targets = [args.only] if args.only else DEFAULT_TARGETS
-    # Only processes affect memory; the cargo sweep and uv trim free disk.
+    # Only processes affect memory; the cargo sweep, uv trim and clone removal free disk.
     track_memory = not set(targets) <= DISK_TARGETS
     if track_memory:
         free_before, swap_before = mem_stats()
@@ -1267,6 +1471,7 @@ def main() -> int:
         "sim": lambda: cleanup_simulators(args.dry_run),
         "cargo": lambda: cleanup_cargo(args.cargo_days, args.cargo_max_size, args.dry_run),
         "uv": lambda: cleanup_uv(args.uv_days, args.dry_run),
+        "clones": lambda: cleanup_clones(args.dry_run),
         "games": lambda: cleanup_games(args.dry_run),
     }
     found, failed = run_sections([(name, sections[name]) for name in targets])

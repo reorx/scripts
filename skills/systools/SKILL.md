@@ -1,6 +1,6 @@
 ---
 name: systools
-description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing what's on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots and live memory pressure — CPU temp, load, memory, swap, pageouts (\"how's my mac\", \"why is my mac slow\"); releasing leaked test resources — booted iOS simulators, agent-browser Chrome, the shared cargo target dir, the uv cache (\"clean up simulators\", \"清理模拟器\", \"清理 cargo 缓存\", \"清理 uv 缓存\", \"~/.cache/uv is huge\"), and the 23:00 job that closes Hearthstone/Battle.net (\"关掉游戏\", \"炉石没关\"); WindowServer CPU/GPU (\"WindowServer is hot\", \"UI feels laggy\"); keeping the Mac awake up to 24h (\"keep my mac awake\", \"防止休眠\"); the daily pmset wake/sleep schedule (\"sleep my mac at 1am\", \"自动休眠计划\"); auditing launchd + cron jobs and Background Task Management items (\"定时任务\", \"why isn't my launch agent running\"); repairing PostgreSQL that won't start under brew services (\"lock file postmaster.pid already exists\", \"数据库起不来\"); and tuning the local monitoring stack's per-process CPU alerts (\"prl_vm_app alert is noisy\", \"调 CPU 告警阈值\"). macOS-only except port management."
+description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing what's on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots and live memory pressure — CPU temp, load, memory, swap, pageouts (\"how's my mac\", \"why is my mac slow\"); releasing leaked test resources — booted iOS simulators, agent-browser Chrome, the shared cargo target dir, the uv cache, browser code-sign clones under /var/folders (\"clean up simulators\", \"清理模拟器\", \"清理 cargo 缓存\", \"清理 uv 缓存\", \"~/.cache/uv is huge\", \"/var/folders is huge\", \"code_sign_clone\"), and the 23:00 job that closes Hearthstone/Battle.net (\"关掉游戏\", \"炉石没关\"); WindowServer CPU/GPU (\"WindowServer is hot\", \"UI feels laggy\"); keeping the Mac awake up to 24h (\"keep my mac awake\", \"防止休眠\"); the daily pmset wake/sleep schedule (\"sleep my mac at 1am\", \"自动休眠计划\"); auditing launchd + cron jobs and Background Task Management items (\"定时任务\", \"why isn't my launch agent running\"); repairing PostgreSQL that won't start under brew services (\"lock file postmaster.pid already exists\", \"数据库起不来\"); and tuning the local monitoring stack's per-process CPU alerts (\"prl_vm_app alert is noisy\", \"调 CPU 告警阈值\"). macOS-only except port management."
 ---
 
 # systools
@@ -135,18 +135,18 @@ This script samples virtual-memory counters at regular intervals and reports rea
 
 ## macOS Dev Resource Cleanup
 
-### Release leaked iOS simulators, agent-browser sessions, stale cargo artifacts and old uv cache entries
+### Release leaked iOS simulators, agent-browser sessions, stale cargo artifacts, old uv cache entries and orphaned browser code-sign clones
 
 **Script:** `scripts/mac-dev-cleanup`
 
-**Prerequisites:** macOS only. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Wraps `ps`, `xcrun simctl`, `agent-browser close`, `osascript`, `memory_pressure`, for the cargo step `cargo` + [`cargo-sweep`](https://github.com/holmgr/cargo-sweep) (`cargo install cargo-sweep`; the step is skipped if either is missing), and for the uv step `uv` + `lsof`.
+**Prerequisites:** macOS only. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Wraps `ps`, `xcrun simctl`, `agent-browser close`, `osascript`, `memory_pressure`, for the cargo step `cargo` + [`cargo-sweep`](https://github.com/holmgr/cargo-sweep) (`cargo install cargo-sweep`; the step is skipped if either is missing), for the uv step `uv` + `lsof`, and for the clones step `getconf`.
 
 The two biggest recurring causes of a degraded `mac-health` reading, and neither cleans up after itself:
 
 - **Booted iOS simulators** — each booted device keeps a full `launchd_sim` tree alive: SpringBoard plus dozens of iOS widget extensions at 200–330 MB each. One booted device measured **~196 processes**.
 - **Leaked `agent-browser` sessions** — the CLI spawns a detached daemon (PPID 1) plus a ~10-process headless Chrome tree that survives the session that created it. Observed running for **days**, with renderers pinned at ~100% CPU each, ~5 of 10 cores gone.
 
-Plus two that eat disk instead: **the shared cargo target dir** (`build.target-dir` in `~/.cargo/config.toml`, here `~/Library/Caches/cargo-target`) that every Rust project builds into. It only grows — each dependency version, feature set and toolchain leaves its own artifacts — and reached 24 GB before this step existed. And **the uv cache** (`~/.cache/uv`), which keeps every wheel uv ever downloaded and every environment `uv run --script` / `uv run --with` / `uvx` ever built. It showed 13 GB on 2026-10-27; the first run took `du` to 5.6 GB but freed only 3.3 GB of real disk, because the rest was shared with installed venvs (see the uv notes below).
+Plus two that eat disk instead: **the shared cargo target dir** (`build.target-dir` in `~/.cargo/config.toml`, here `~/Library/Caches/cargo-target`) that every Rust project builds into. It only grows — each dependency version, feature set and toolchain leaves its own artifacts — and reached 24 GB before this step existed. And **the uv cache** (`~/.cache/uv`), which keeps every wheel uv ever downloaded and every environment `uv run --script` / `uv run --with` / `uvx` ever built. It showed 13 GB on 2026-10-27; the first run took `du` to 5.6 GB but freed only 3.3 GB of real disk, because the rest was shared with installed venvs (see the uv notes below). And **browser code-sign clones** under `/var/folders/…/X/`: every Chrome that is killed rather than quit leaves a copy of its app bundle there. 35 of them, mostly from agent-browser sessions, made `/private/var/folders` show 81 GB on 2026-10-27, though they held only 0.7 GiB of real disk (see the clones notes below).
 
 And one opt-in step that is **never part of the default run**: `--only games` closes Hearthstone and Battle.net in the evening. Left open, Hearthstone keeps the display awake for hours (it holds a display-sleep assertion *and* injects input events, so the system thinks someone is at the keyboard), and Battle.net's helpers keep competing for CPU with agents during the night's dark wakes.
 
@@ -164,6 +164,7 @@ mac-dev-cleanup --only sim
 mac-dev-cleanup --only browser
 mac-dev-cleanup --only cargo
 mac-dev-cleanup --only uv
+mac-dev-cleanup --only clones
 
 # Safe to run mid-session: spare agent-browser sessions younger than 2h
 mac-dev-cleanup --min-age 2
@@ -178,7 +179,7 @@ mac-dev-cleanup --only uv --uv-days 30
 mac-dev-cleanup --only games --dry-run
 mac-dev-cleanup --only games
 
-# Behaviour checks (88 assertions, no side effects)
+# Behaviour checks (100 assertions, no side effects)
 mac-dev-cleanup --selftest
 ```
 
@@ -190,8 +191,9 @@ mac-dev-cleanup --selftest
 | simulators | `xcrun simctl shutdown all`, then quit Simulator.app via AppleScript, falling back to signals when it refuses |
 | cargo target | Finds the shared target via `cargo metadata` on a throwaway stub project, takes cargo's build locks, then `cargo sweep --time 21` (artifacts no build touched in 21 days) and `cargo sweep --maxsize 20GiB` (least recently used first) |
 | uv cache | Skips unless the `uv` binary contains every cache bucket name the script knows, and skips the day if a uv that holds the cache lock started < 10min ago. Then deletes: top-level entries that are not a current bucket (old/foreign bucket versions, temp dirs of dead runs) and archives nothing links to, both if created > 1 day ago; downloaded wheels and cached environments created > `--uv-days` (90) ago. Never touches wheels built from source, or anything a running process's command line points into |
+| clones | Lists `X/*.code_sign_clone/code_sign_clone.*` next to the user temp dir, reads each clone's `CFBundleExecutable`, then keeps every clone made within 30s before / 300s after a running browser of that app started (matched by executable, `--type=` helpers excluded) and every clone whose app it can't read. The rest are renamed into a trash dir and deleted |
 | games (`--only games`) | Matches Hearthstone (+ its BlizzardBrowser), Battle.net (+ its Helpers) and the Blizzard update Agent by executable path, asks the apps to quit via AppleScript by bundle id, waits 20s, then SIGTERM→SIGKILL whatever is left |
-| report | Free-memory % and swap before/after (process steps); target size before/after (cargo step); cache size before/after and the volume's real free-space gain (uv step) |
+| report | Free-memory % and swap before/after (process steps); target size before/after (cargo step); cache size before/after and the volume's real free-space gain (uv step); clones removed, their `du` size and the volume's real free-space gain (clones step) |
 
 **Exit code:** 0 on success, 2 if a step crashed (the remaining steps still run). Under `--dry-run`, 1 means there is something to clean — composable as a check like `mac-health`.
 
@@ -225,6 +227,13 @@ mac-dev-cleanup --selftest
 - **In use** = some process's command line contains the entry's path. `uv run` execs `<env>/bin/python3` by full path, so that covers resident jobs and this script's own environment. Entries are renamed into a trash dir before deletion, so a uv that looks at the same moment sees each one whole or not at all.
 - **Layout guard:** uv bumps a bucket's version whenever its format changes (e.g. `wheels-v6` / `simple-v21` from a newer uv). The step reads the uv binary and requires all the names in `UV_BUCKETS` as literal bytes. If any is missing, it logs a `⚠️` and skips: check `CacheBucket::to_str` in `crates/uv-cache/src/lib.rs` for the new version and update the constants and this note.
 
+**Clones step: what the clones are, and its traps** (verified 2026-10-27 against Chrome 156 and SunBrowser 152):
+
+- At launch, Chromium browsers copy their app bundle to `<DARWIN_USER_TEMP_DIR>/../X/<bundle id>.code_sign_clone/code_sign_clone.XXXXXX/<App>.app.bundle`, so that an update replacing the app on disk can't break the running browser's code signature. The kernel records the clone as the process's executable path (`codesign -dv <pid>` prints it), so deleting a running browser's clone would break keychain/TCC checks of that browser. A browser that quits normally deletes its own clone (observed when an agent-browser Chrome closed); `kill -9` leaves it behind (reproduced with a throwaway `--headless` Chrome).
+- **`du` overstates them by orders of magnitude.** The main executable is a hard link and everything else an APFS clone, so every clone shares blocks with the installed app and with the other clones of its version. On 2026-10-27, 37 clones were 78 GiB by `du` but 4.2 GiB of physical extents together with the app itself (`fcntl(F_LOG2PHYS_EXT)`). A clone costs real disk only once the app updates and it is left holding the old version, ~0.7 GiB per Chrome version however many clones share it. Deleting a clone of the current version frees almost nothing; the step reports the volume's real gain.
+- **Which browser owns a clone can't come from `lsof` or `codesign -dv <pid>`:** every clone of one version hard-links the same executable inode, so both name an arbitrary sibling. Launch time does: the clone's birth time is 0–1s after the browser's start in every case seen. The window is 30s before to 300s after, erring towards keeping.
+- The step runs after the agent-browser step, so it also takes the clones of sessions that step had to SIGKILL. Clones are renamed into a trash dir before deletion, so a browser deleting its own clone at the same moment can't make the step fail. Trash a crashed run left behind is deleted after an hour.
+
 **Scheduled run:** a launchd agent runs the full cleanup **daily at 06:00** (30min after the 5:30AM `pmset repeat wakepoweron`; system sleep is disabled so the machine is reliably awake). Plist lives in the repo at `launchd/com.reorx.mac-dev-cleanup.plist`, symlinked to `~/Library/LaunchAgents/`. Log: `~/Library/Logs/mac-dev-cleanup.log` (each run is stamped — the script prints a timestamp header whenever stdout is not a TTY).
 
 ```bash
@@ -243,6 +252,7 @@ A second agent, `com.reorx.mac-dev-cleanup-games` (`launchd/com.reorx.mac-dev-cl
 - Periodic hygiene while other sessions may be working → `mac-dev-cleanup --min-age 2`
 - "The cargo target / Rust cache is huge" → `mac-dev-cleanup --only cargo --dry-run`, then run it; lower `--cargo-days` or `--cargo-max-size` for a one-off deeper cut
 - "`~/.cache/uv` is huge" / "清理 uv 缓存" → `mac-dev-cleanup --only uv --dry-run`, then run it; `--uv-days 30` for a deeper cut. **Never `uv cache prune --force` / `uv cache clean --force`** on this Mac: they delete the environment proc-top runs from
+- "`/private/var/folders` is huge" / a disk analyzer shows tens of GB of `code_sign_clone` → `mac-dev-cleanup --only clones --dry-run`, then run it. Expect a small real gain (see the clones notes)
 - "The screen never turned off" / "something is busy at night" and a game was left open → `mac-dev-cleanup --only games`
 
 ## macOS WindowServer Diagnostics
