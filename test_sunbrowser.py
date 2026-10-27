@@ -5,16 +5,20 @@
 # ///
 """Behavior tests: uv run test_sunbrowser.py."""
 
+import contextlib
 import importlib.util
+import io
 import json
-import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from unittest.mock import patch
+from urllib.parse import unquote, urlsplit
 
-SCRIPT = Path(__file__).with_name('sunbrowser.py')
-SPEC = importlib.util.spec_from_file_location('sunbrowser', SCRIPT)
+SPEC = importlib.util.spec_from_file_location('sunbrowser', Path(__file__).with_name('sunbrowser.py'))
 app = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = app
 SPEC.loader.exec_module(app)
@@ -38,15 +42,33 @@ def helper_line(pid, udd):
     )
 
 
-def make_profile(root, name, port=60468, path='/devtools/browser/abc-123'):
+def make_profile(root, name, port=60468):
     udd = Path(root) / name
     udd.mkdir()
-    (udd / 'DevToolsActivePort').write_text(f'{port}\n{path}')
+    (udd / 'DevToolsActivePort').write_text(f'{port}\n/devtools/browser/abc-123')
     return str(udd)
 
 
-def bash_event(command):
-    return {'hook_event_name': 'PreToolUse', 'tool_name': 'Bash', 'tool_input': {'command': command}}
+class FakeDevTools(BaseHTTPRequestHandler):
+    """Answers the two DevTools HTTP endpoints sunbrowser.py uses, recording each request."""
+
+    requests = []
+
+    def do_PUT(self):
+        self.requests.append(('PUT', self.path))
+        self.reply(200, json.dumps({'id': f'TARGET{len(self.requests)}', 'type': 'page'}))
+
+    def do_GET(self):
+        self.requests.append(('GET', self.path))
+        self.reply(200, 'Target activated')
+
+    def reply(self, status, body):
+        self.send_response(status)
+        self.end_headers()
+        self.wfile.write(body.encode())
+
+    def log_message(self, *args):
+        pass
 
 
 class FindInstancesTest(unittest.TestCase):
@@ -70,136 +92,163 @@ class FindInstancesTest(unittest.TestCase):
         self.assertEqual(app.find_instances(ps), [])
 
 
-class ResolveWsTest(unittest.TestCase):
+class PickInstanceTest(unittest.TestCase):
+    A = app.Instance(1, f'{CACHE}/k1hy9lkt_i7i7fd')
+    B = app.Instance(2, f'{CACHE}/k1i7l6fc_i7i7fd')
+
+    def test_single_instance(self):
+        self.assertEqual(app.pick_instance([self.A]), self.A)
+
+    def test_not_running_tells_user_to_open_adspower(self):
+        with self.assertRaisesRegex(app.SunBrowserError, 'not running.*AdsPower'):
+            app.pick_instance([])
+
+    def test_several_instances_need_a_profile_choice(self):
+        with self.assertRaisesRegex(app.SunBrowserError, r'SUN_BROWSER_PROFILE.*k1hy9lkt.*k1i7l6fc'):
+            app.pick_instance([self.A, self.B])
+
+    def test_profile_choice_picks_the_matching_instance(self):
+        self.assertEqual(app.pick_instance([self.A, self.B], profile='k1i7l6fc'), self.B)
+
+    def test_unknown_profile_choice(self):
+        with self.assertRaisesRegex(app.SunBrowserError, 'nope'):
+            app.pick_instance([self.A], profile='nope')
+
+
+class DevtoolsPortTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
 
-    def test_single_instance_gives_ws_url_from_devtools_active_port(self):
-        udd = make_profile(self.tmp.name, 'k1hy9lkt_i7i7fd', 60468, '/devtools/browser/abc-123')
-        ws = app.resolve_ws([app.Instance(1, udd)])
-        self.assertEqual(ws, 'ws://127.0.0.1:60468/devtools/browser/abc-123')
-
-    def test_not_running_tells_user_to_open_adspower(self):
-        with self.assertRaisesRegex(app.SunBrowserError, 'not running.*AdsPower'):
-            app.resolve_ws([])
-
-    def test_several_instances_need_a_profile_choice(self):
-        a = make_profile(self.tmp.name, 'k1hy9lkt_i7i7fd', 1001)
-        b = make_profile(self.tmp.name, 'k1i7l6fc_i7i7fd', 1002)
-        with self.assertRaisesRegex(app.SunBrowserError, r'SUNBROWSER_PROFILE.*k1hy9lkt.*k1i7l6fc'):
-            app.resolve_ws([app.Instance(1, a), app.Instance(2, b)])
-
-    def test_profile_choice_picks_the_matching_instance(self):
-        a = make_profile(self.tmp.name, 'k1hy9lkt_i7i7fd', 1001)
-        b = make_profile(self.tmp.name, 'k1i7l6fc_i7i7fd', 1002)
-        ws = app.resolve_ws([app.Instance(1, a), app.Instance(2, b)], profile='k1i7l6fc')
-        self.assertTrue(ws.startswith('ws://127.0.0.1:1002/'))
-
-    def test_unknown_profile_choice(self):
-        a = make_profile(self.tmp.name, 'k1hy9lkt_i7i7fd')
-        with self.assertRaisesRegex(app.SunBrowserError, 'nope'):
-            app.resolve_ws([app.Instance(1, a)], profile='nope')
+    def test_port_comes_from_devtools_active_port(self):
+        udd = make_profile(self.tmp.name, 'k1hy9lkt_i7i7fd', 60468)
+        self.assertEqual(app.devtools_port(app.Instance(1, udd)), 60468)
 
     def test_missing_devtools_active_port(self):
         udd = Path(self.tmp.name) / 'k1hy9lkt_i7i7fd'
         udd.mkdir()
         with self.assertRaisesRegex(app.SunBrowserError, 'DevToolsActivePort'):
-            app.resolve_ws([app.Instance(1, str(udd))])
+            app.devtools_port(app.Instance(1, str(udd)))
 
 
-class PlanCommandsTest(unittest.TestCase):
-    WS = 'ws://127.0.0.1:60468/devtools/browser/abc'
+class DomainsTest(unittest.TestCase):
+    def test_default_is_claude_ai_and_claude_com(self):
+        self.assertEqual(app.parse_domains(None), ['claude.ai', 'claude.com'])
 
-    def test_attaches_with_pinned_tab_and_own_session(self):
-        [argv] = app.plan_commands(['open', 'https://claude.ai/new'], self.WS, env={})
-        self.assertEqual(
-            argv,
-            [
-                'agent-browser',
-                '--cdp',
-                self.WS,
-                '--pin-tab',
-                '--session',
-                'sunbrowser',
-                'open',
-                'https://claude.ai/new',
-            ],
+    def test_env_value_is_trimmed_and_lowercased(self):
+        self.assertEqual(app.parse_domains(' Claude.AI, .example.org ,,'), ['claude.ai', 'example.org'])
+
+    def test_domain_and_its_subdomains_match(self):
+        domains = ['claude.ai', 'claude.com']
+        for url in [
+            'https://claude.ai/code/artifact/abc',
+            'https://claude.com/cai/oauth/authorize?client_id=x&state=y',
+            'https://platform.claude.com/oauth/authorize',
+            'https://CLAUDE.AI:443/new',
+        ]:
+            with self.subTest(url=url):
+                self.assertTrue(app.matches(url, domains))
+
+    def test_lookalikes_and_other_urls_do_not_match(self):
+        domains = ['claude.ai', 'claude.com']
+        for url in [
+            'https://evilclaude.ai/',
+            'https://claude.ai.example.com/',
+            'https://example.com/?next=https://claude.ai',
+            'http://localhost:3000',
+            'mailto:support@claude.com',
+            'file:///tmp/claude.ai.html',
+        ]:
+            with self.subTest(url=url):
+                self.assertFalse(app.matches(url, domains))
+
+
+class OpenInSunBrowserTest(unittest.TestCase):
+    def setUp(self):
+        FakeDevTools.requests = []
+        self.server = HTTPServer(('127.0.0.1', 0), FakeDevTools)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        self.addCleanup(self.server.server_close)
+        self.addCleanup(self.server.shutdown)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def test_opens_a_new_tab_and_selects_it(self):
+        url = 'https://claude.com/cai/oauth/authorize?client_id=x&state=y#frag'
+        app.open_in_sun_browser(self.server.server_port, url)
+        (method, new_path), activate = FakeDevTools.requests
+        self.assertEqual(method, 'PUT')
+        split = urlsplit(new_path)
+        self.assertEqual(split.path, '/json/new')
+        self.assertEqual(unquote(split.query), url)
+        self.assertEqual(activate, ('GET', '/json/activate/TARGET1'))
+
+    def test_opens_every_url_then_brings_that_process_to_front(self):
+        udd = make_profile(self.tmp.name, 'k1hy9lkt_i7i7fd', self.server.server_port)
+        with (
+            patch.object(app, 'current_instance', return_value=app.Instance(24480, udd)),
+            patch.object(app, 'bring_to_front') as bring_to_front,
+        ):
+            app.open_all_in_sun_browser(['https://claude.ai/a', 'https://claude.ai/b'])
+        opened = [unquote(urlsplit(path).query) for method, path in FakeDevTools.requests if method == 'PUT']
+        self.assertEqual(opened, ['https://claude.ai/a', 'https://claude.ai/b'])
+        bring_to_front.assert_called_once_with(24480)
+
+
+class MainTest(unittest.TestCase):
+    def run_main(self, argv, env=None, sun_error=None):
+        stderr = io.StringIO()
+        with (
+            patch.dict(app.os.environ, env or {}, clear=False),
+            patch.object(app, 'open_all_in_sun_browser', side_effect=sun_error) as sun,
+            patch.object(app.subprocess, 'run', return_value=app.subprocess.CompletedProcess([], 0)) as run,
+            contextlib.redirect_stderr(stderr),
+        ):
+            code = app.main(argv)
+        return code, sun, run, stderr.getvalue()
+
+    def test_claude_url_goes_to_sun_browser(self):
+        code, sun, run, _ = self.run_main(['https://claude.ai/new'])
+        self.assertEqual(code, 0)
+        sun.assert_called_once_with(['https://claude.ai/new'])
+        run.assert_not_called()
+
+    def test_other_url_goes_to_open_without_touching_sun_browser(self):
+        code, sun, run, _ = self.run_main(['https://example.com/'])
+        self.assertEqual(code, 0)
+        run.assert_called_once_with(['open', 'https://example.com/'])
+        sun.assert_not_called()
+
+    def test_domains_come_from_env(self):
+        _, sun, run, _ = self.run_main(
+            ['https://claude.ai/new', 'https://example.com/'], env={'SUN_BROWSER_DOMAINS': 'example.com'}
         )
+        sun.assert_called_once_with(['https://example.com/'])
+        run.assert_called_once_with(['open', 'https://claude.ai/new'])
 
-    def test_explicit_session_is_kept(self):
-        [argv] = app.plan_commands(['--session', 'task1', 'snapshot'], self.WS, env={})
-        self.assertNotIn('sunbrowser', argv)
-        self.assertEqual(argv[-3:], ['--session', 'task1', 'snapshot'])
-
-    def test_session_from_env_is_kept(self):
-        [argv] = app.plan_commands(['snapshot'], self.WS, env={'AGENT_BROWSER_SESSION': 'task2'})
-        self.assertNotIn('--session', argv)
-
-    def test_close_closes_the_session_tab_first(self):
-        tab_close, close = app.plan_commands(['--session', 't', 'close'], self.WS, env={})
-        self.assertEqual(tab_close[-2:], ['tab', 'close'])
-        self.assertEqual(close[-1], 'close')
-
-    def test_tab_close_is_not_doubled(self):
-        commands = app.plan_commands(['tab', 'close'], self.WS, env={})
-        self.assertEqual(len(commands), 1)
-
-    def test_close_all_passes_through(self):
-        commands = app.plan_commands(['close', '--all'], self.WS, env={})
-        self.assertEqual(len(commands), 1)
-
-
-class HookTest(unittest.TestCase):
-    def test_denies_plain_agent_browser_on_claude_ai(self):
-        reason = app.hook_reason(bash_event('agent-browser open https://claude.ai/new'))
-        self.assertIn('sunbrowser.py', reason)
-
-    def test_denies_npx_and_flags_before_the_url(self):
-        reason = app.hook_reason(
-            bash_event('npx agent-browser --session x open claude.ai/code && agent-browser snapshot')
+    def test_sun_browser_not_running_fails_without_falling_back(self):
+        code, _, run, stderr = self.run_main(
+            ['https://claude.ai/new'], sun_error=app.SunBrowserError('Sun Browser is not running.')
         )
-        self.assertIsNotNone(reason)
+        self.assertEqual(code, 1)
+        self.assertIn('not running', stderr)
+        run.assert_not_called()
 
-    def test_allows_sunbrowser(self):
-        self.assertIsNone(app.hook_reason(bash_event('sunbrowser.py open https://claude.ai/artifact/abc')))
+    def test_unreachable_devtools_port_is_reported(self):
+        code, _, _, stderr = self.run_main(['https://claude.ai/new'], sun_error=ConnectionRefusedError('refused'))
+        self.assertEqual(code, 1)
+        self.assertIn('refused', stderr)
 
-    def test_allows_agent_browser_attached_through_sunbrowser(self):
-        command = 'agent-browser --cdp "$(sunbrowser.py --ws)" --pin-tab open https://claude.ai'
-        self.assertIsNone(app.hook_reason(bash_event(command)))
+    def test_options_are_never_passed_to_open(self):
+        code, sun, run, _ = self.run_main(['--hook'])
+        self.assertEqual(code, 2)
+        run.assert_not_called()
+        sun.assert_not_called()
 
-    def test_allows_other_sites(self):
-        self.assertIsNone(app.hook_reason(bash_event('agent-browser open http://localhost:3000')))
-
-    def test_allows_non_browser_commands_mentioning_claude_ai(self):
-        self.assertIsNone(app.hook_reason(bash_event('curl -sI https://claude.ai')))
-
-    def test_ignores_other_tools(self):
-        event = {'tool_name': 'WebFetch', 'tool_input': {'url': 'https://claude.ai'}}
-        self.assertIsNone(app.hook_reason(event))
-
-
-class HookCliTest(unittest.TestCase):
-    def run_hook(self, stdin):
-        return subprocess.run(
-            [sys.executable, str(SCRIPT), '--hook'], input=stdin, capture_output=True, text=True, timeout=10
-        )
-
-    def test_deny_is_reported_as_pretooluse_json(self):
-        result = self.run_hook(json.dumps(bash_event('agent-browser open https://claude.ai')))
-        self.assertEqual(result.returncode, 0)
-        output = json.loads(result.stdout)['hookSpecificOutput']
-        self.assertEqual(output['hookEventName'], 'PreToolUse')
-        self.assertEqual(output['permissionDecision'], 'deny')
-        self.assertIn('sunbrowser.py', output['permissionDecisionReason'])
-
-    def test_allow_prints_nothing(self):
-        result = self.run_hook(json.dumps(bash_event('ls -la')))
-        self.assertEqual((result.returncode, result.stdout), (0, ''))
-
-    def test_malformed_input_never_blocks(self):
-        result = self.run_hook('not json')
-        self.assertEqual((result.returncode, result.stdout), (0, ''))
+    def test_no_arguments_prints_usage(self):
+        code, _, _, stderr = self.run_main([])
+        self.assertEqual(code, 2)
+        self.assertIn('Usage', stderr)
 
 
 if __name__ == '__main__':

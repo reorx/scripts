@@ -37,11 +37,11 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 - `tsfwd.sh` wraps `tailscale serve --tcp` and runs under macOS `/bin/bash` 3.2 (no `mapfile` or associative arrays). A forward is dead when `nc -z` to its `TCPForward` target fails; `-p` removes dead TCP forwards only and never touches Web handlers.
 - `$TAILSCALE` points the script at another CLI; `test-tsfwd.sh` uses it to run against a stub and never touches the real tailnet. Run `./test-tsfwd.sh` when changing it.
 
-## Sun Browser (claude.ai automation)
+## Sun Browser URL routing
 
-- `sunbrowser.py <agent-browser args>` runs agent-browser in the AdsPower Sun Browser the user has open, the logged-in browser for claude.ai. AdsPower launches it with `--remote-debugging-port=0`, so the CDP URL is read from `DevToolsActivePort` in the profile's `--user-data-dir` on every call. `--ws` prints it; with several profiles open, `SUNBROWSER_PROFILE` picks one by AdsPower id.
-- Always attach with `--pin-tab`: without it `open` navigates the user's active tab. A pinned session opens its own tab, and agent-browser's `close` only detaches and leaves that tab behind, so `sunbrowser.py close` runs `tab close` first. The browser keeps running.
-- `sunbrowser.py --hook` is the global Claude Code PreToolUse (Bash) hook: it denies commands that open claude.ai with plain agent-browser. Run `uv run test_sunbrowser.py` when changing it.
+- `sunbrowser.py <url>...` is `BROWSER` in the global Claude Code settings; Claude Code runs `$BROWSER <url>` for every page it opens (login, artifacts, clicked links). Hosts under `SUN_BROWSER_DOMAINS` (default `claude.ai,claude.com`, matched on dot boundaries, so subdomains count and `evilclaude.ai` does not) open in the AdsPower Sun Browser; other URLs go to `open`.
+- Sun Browser is driven only through its DevTools HTTP endpoint: `PUT /json/new?<encoded url>`, then `/json/activate/<id>`. AdsPower launches it with `--remote-debugging-port=0`, so the port comes from `DevToolsActivePort` in the profile's `--user-data-dir`. With several profiles open, `SUN_BROWSER_PROFILE` picks one by AdsPower id.
+- Never reach it through `open -a` or its bundle id: when it is not running that starts a bare SunBrowser without AdsPower's proxy and fingerprint. Not running is an error, with no fallback to the default browser. `/json/activate` only selects the tab, so the window is raised with `NSRunningApplication` by pid. Run `uv run test_sunbrowser.py` when changing it.
 
 ## Claude session search
 
