@@ -10,6 +10,7 @@ Behavior tests for brewer.py
 Run: uv run test_brewer.py
 """
 
+import html
 import importlib.util
 import io
 import json
@@ -30,7 +31,8 @@ spec.loader.exec_module(br)
 
 
 # A stand-in for brew: serves info/outdated JSON from FAKE_BREW_DIR and logs every call.
-# `upgrade` drops the formula (plus whatever effects.json says it drags along) from outdated.json.
+# `upgrade` drops the formula (plus whatever effects.json says it drags along) from outdated.json;
+# `uninstall` refuses while another keg depends on the formula, else drops it from both files.
 FAKE_BREW = """\
 #!{python}
 import json, os, signal, sys
@@ -54,10 +56,10 @@ if args[:2] == ['info', '--json=v2']:
 if args[:2] == ['outdated', '--json=v2']:
     print((d / 'outdated.json').read_text())
     sys.exit(0)
-if args[:2] == ['upgrade', '--formula']:
+if args[:1] in (['upgrade'], ['uninstall']) and args[1:2] == ['--formula']:
     name = args[2]
     # brew 7 asks before upgrading unless told not to; nobody answers here, like an unattended run
-    if not os.environ.get('HOMEBREW_NO_ASK') and not {{'-y', '--yes', '--no-ask'}} & set(args):
+    if args[0] == 'upgrade' and not os.environ.get('HOMEBREW_NO_ASK') and not {{'-y', '--yes', '--no-ask'}} & set(args):
         print('==> Do you want to proceed with the upgrade? [y/n]')
         sys.exit(1)
     if name == os.environ.get('FAKE_INTERRUPT'):
@@ -65,6 +67,22 @@ if args[:2] == ['upgrade', '--formula']:
         sys.exit(130)
     if name in os.environ.get('FAKE_FAIL', '').split(','):
         sys.exit(1)
+if args[:2] == ['uninstall', '--formula']:
+    info = json.loads((d / 'info.json').read_text())
+    users = [
+        f['full_name'] for f in info['formulae']
+        if any(name in [r['full_name'] for r in k['runtime_dependencies']] for k in f['installed'])
+    ]
+    if users:
+        print(f'Error: Refusing to uninstall {{name}} because it is required by {{", ".join(users)}}')
+        sys.exit(1)
+    info['formulae'] = [f for f in info['formulae'] if f['full_name'] != name]
+    (d / 'info.json').write_text(json.dumps(info))
+    data = json.loads((d / 'outdated.json').read_text())
+    data['formulae'] = [f for f in data['formulae'] if f['name'] != name]
+    (d / 'outdated.json').write_text(json.dumps(data))
+    sys.exit(0)
+if args[:2] == ['upgrade', '--formula']:
     if name in os.environ.get('FAKE_NOOP', '').split(','):
         sys.exit(0)
     effects_file = d / 'effects.json'
@@ -78,8 +96,8 @@ sys.exit('fake brew: unexpected ' + line)
 """
 
 
-def spec_(name, installed, latest, on_request=True, pinned=False, desc='', homepage=''):
-    """One installed formula as both brew JSON views see it."""
+def spec_(name, installed, latest, on_request=True, pinned=False, desc='', homepage='', deps=()):
+    """One installed formula as both brew JSON views see it; `deps` are its runtime dependencies."""
     versions = [installed] if isinstance(installed, str) else list(installed)
     return {
         'name': name,
@@ -89,6 +107,7 @@ def spec_(name, installed, latest, on_request=True, pinned=False, desc='', homep
         'pinned': pinned,
         'desc': desc or f'{name} desc',
         'homepage': homepage or f'https://example.com/{name.split("/")[-1]}',
+        'deps': list(deps),
     }
 
 
@@ -101,7 +120,14 @@ def info_json(specs):
                 'desc': s['desc'],
                 'homepage': s['homepage'],
                 'pinned': s['pinned'],
-                'installed': [{'version': v, 'installed_on_request': s['on_request']} for v in s['versions']],
+                'installed': [
+                    {
+                        'version': v,
+                        'installed_on_request': s['on_request'],
+                        'runtime_dependencies': [{'full_name': d, 'version': '1.0'} for d in s['deps']],
+                    }
+                    for v in s['versions']
+                ],
             }
             for s in specs
         ],
@@ -126,8 +152,17 @@ def outdated_json(specs):
     }
 
 
-def formula(name, installed, latest, level, pinned=False):
-    return br.Formula(name, installed, latest, level, pinned, f'{name} desc', f'https://example.com/{name}')
+def formula(name, installed, latest, level, pinned=False, desc='', required_by=()):
+    return br.Formula(
+        name,
+        installed,
+        latest,
+        level,
+        pinned,
+        desc or f'{name} desc',
+        f'https://example.com/{name}',
+        list(required_by),
+    )
 
 
 class TestVersionLevel(unittest.TestCase):
@@ -222,6 +257,25 @@ class TestScan(unittest.TestCase):
         got = self.scan([spec_('gh', '2.101.0', None), spec_('fd', '10.2.0', '10.5.0')])
         self.assertEqual(list(got), ['fd'])
 
+    def test_required_by_lists_every_installed_formula_depending_on_it(self):
+        got = self.scan(
+            [
+                spec_('xz', '5.8.1', '6.0.0'),
+                spec_('zstd', '1.5.7', None, on_request=False, deps=['xz']),
+                spec_('ansible', '12.1.0', None, deps=['tree', 'xz']),
+                spec_('tree', '2.1.3', '2.4.0'),
+            ]
+        )
+        self.assertEqual(got['xz'].required_by, ['ansible', 'zstd'])
+        self.assertEqual(got['tree'].required_by, ['ansible'])
+
+    def test_kegs_without_dependency_records_require_nothing(self):
+        specs = [spec_('xz', '5.8.1', '6.0.0'), spec_('zstd', '1.5.7', None, on_request=False)]
+        info = info_json(specs)
+        info['formulae'][1]['installed'][0]['runtime_dependencies'] = None
+        got = br.parse_scan(info, outdated_json(specs))
+        self.assertEqual(got[0].required_by, [])
+
 
 class TestWhitelist(unittest.TestCase):
     def setUp(self):
@@ -288,12 +342,32 @@ class TestMakePlan(unittest.TestCase):
         self.assertEqual([f.name for f in plan.pinned], ['redis', 'node'])
 
 
+class TestRemovalOrder(unittest.TestCase):
+    def test_dependents_go_before_what_they_depend_on(self):
+        # ansible needs libyaml and pyyaml, pyyaml needs libyaml (dependency lists are recursive)
+        formulae = [
+            formula('libyaml', '0.2.5', '1.0.0', 'major', required_by=['ansible', 'pyyaml']),
+            formula('ansible', '12.1.0', '13.0.0', 'major'),
+            formula('pyyaml', '6.0.2', '7.0.0', 'major', required_by=['ansible']),
+            formula('bat', '0.25.0', '0.26.1', 'minor', required_by=['other']),
+        ]
+        self.assertEqual([f.name for f in br.removal_order(formulae)], ['ansible', 'bat', 'pyyaml', 'libyaml'])
+
+
+LONG_DESC = 'Search tool like grep and The Silver Searcher, but faster and gitignore-aware'
+
+
+def screen_text(app):
+    """What the terminal shows, as plain text (the SVG export encodes spaces)."""
+    return html.unescape(app.export_screenshot()).replace('\xa0', ' ')
+
+
 class TestReviewApp(unittest.IsolatedAsyncioTestCase):
     def make_app(self):
         return br.ReviewApp(
             [
-                formula('ripgrep', '14.1.1', '15.2.0', 'major'),
-                formula('bat', '0.25.0', '0.26.1', 'minor'),
+                formula('ripgrep', '14.1.1', '15.2.0', 'major', desc=LONG_DESC),
+                formula('bat', '0.25.0', '0.26.1', 'minor', required_by=['delta', 'tmux', 'zellij']),
                 formula('tmux', '3.5a', '3.8', 'minor'),
             ]
         )
@@ -303,6 +377,80 @@ class TestReviewApp(unittest.IsolatedAsyncioTestCase):
         async with app.run_test(size=(140, 30)) as pilot:
             await pilot.press(*keys)
         return app
+
+    async def test_x_marks_for_uninstall_and_drops_the_other_marks(self):
+        app = await self.run_keys('d', 'x', 'enter')
+        self.assertEqual(app.return_value, br.Choice([], [], ['ripgrep']))
+
+    async def test_x_again_drops_the_uninstall_mark(self):
+        app = await self.run_keys('x', 'x', 'enter')
+        self.assertEqual(app.return_value, br.Choice([], [], []))
+
+    async def test_space_or_d_on_a_row_marked_for_uninstall_drops_that_mark(self):
+        app = await self.run_keys('x', 'space', 'down', 'x', 'd', 'enter')
+        self.assertEqual(app.return_value, br.Choice(['ripgrep', 'bat'], ['bat'], []))
+
+    async def test_x_on_a_formula_others_need_warns_but_still_marks(self):
+        with mock.patch.object(br.ReviewApp, 'notify') as notify:
+            app = await self.run_keys('down', 'x', 'enter')
+        self.assertEqual(app.return_value, br.Choice([], [], ['bat']))
+        message = notify.call_args.args[0]
+        self.assertIn('delta, tmux, zellij', message)
+        self.assertEqual(notify.call_args.kwargs.get('severity'), 'warning')
+
+    async def test_dependents_already_marked_for_uninstall_are_not_warned_about(self):
+        with mock.patch.object(br.ReviewApp, 'notify') as notify:
+            await self.run_keys('down', 'down', 'x', 'up', 'x', 'enter')
+        message = notify.call_args.args[0]
+        self.assertIn('delta, zellij', message)
+        self.assertNotIn('tmux', message)
+
+    async def test_x_on_a_formula_nothing_needs_does_not_warn(self):
+        with mock.patch.object(br.ReviewApp, 'notify') as notify:
+            await self.run_keys('x', 'enter')
+        notify.assert_not_called()
+
+    async def test_uninstall_marks_and_count_are_visible(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.press('x', 'down', 'down', 'x')
+            screen = app.export_screenshot()
+            status = app.status_text()
+            await pilot.press('q')
+        self.assertEqual(screen.count('✗'), 2)
+        self.assertIn('2 to uninstall', status)
+
+    async def test_i_shows_full_description_homepage_and_dependents(self):
+        app = self.make_app()
+        async with app.run_test(size=(140, 30)) as pilot:
+            await pilot.press('i')
+            ripgrep = (isinstance(app.screen, br.InfoScreen), screen_text(app))
+            await pilot.press('escape', 'down', 'i')
+            bat = screen_text(app)
+            await pilot.press('escape')
+            closed = not isinstance(app.screen, br.InfoScreen)
+            await pilot.press('q')
+        self.assertTrue(ripgrep[0])
+        self.assertIn(LONG_DESC, ripgrep[1])
+        self.assertIn('https://example.com/ripgrep', ripgrep[1])
+        self.assertIn('none', ripgrep[1])
+        self.assertIn('delta, tmux, zellij', bat)
+        self.assertTrue(closed)
+
+    async def test_i_and_q_close_the_info_panel_too(self):
+        for key in ('i', 'q'):
+            with self.subTest(key=key):
+                app = await self.run_keys('i', key, 'space', 'enter')
+                self.assertEqual(app.return_value, br.Choice(['ripgrep'], []))
+
+    async def test_o_in_the_info_panel_opens_that_homepage(self):
+        with mock.patch.object(br.webbrowser, 'open') as opened:
+            await self.run_keys('down', 'i', 'o', 'escape', 'q')
+        opened.assert_called_once_with('https://example.com/bat')
+
+    async def test_marking_keys_and_enter_do_nothing_in_the_info_panel(self):
+        app = await self.run_keys('i', 'space', 'd', 'x', 'enter', 'escape', 'space', 'enter')
+        self.assertEqual(app.return_value, br.Choice(['ripgrep'], []))
 
     async def test_nothing_is_selected_at_start(self):
         app = await self.run_keys('enter')
@@ -358,6 +506,7 @@ class TestReviewApp(unittest.IsolatedAsyncioTestCase):
         self.assertIn('2 minor', status)
         self.assertIn('2 selected', status)
         self.assertIn('1 to whitelist', status)
+        self.assertIn('0 to uninstall', status)
 
 
 class FakeBrewCase(unittest.TestCase):
@@ -394,13 +543,17 @@ class FakeBrewCase(unittest.TestCase):
         self.whitelist.write_text(''.join(f'{n}\n' for n in names))
 
     def actions(self):
-        """update/upgrade calls in order, without the read-only JSON queries."""
+        """update/upgrade/uninstall calls in order, without the read-only JSON queries."""
         log = self.state / 'calls.log'
         lines = log.read_text().splitlines() if log.exists() else []
-        return [line for line in lines if line.split()[0] in ('update', 'upgrade')]
+        return [line for line in lines if line.split()[0] in ('update', 'upgrade', 'uninstall')]
 
     def upgraded(self):
         return [line.split()[2] for line in self.actions() if line.startswith('upgrade')]
+
+    def changes(self):
+        """`upgrade name` / `uninstall name` in the order brew ran them."""
+        return [' '.join(line.split()[:3:2]) for line in self.actions() if line.split()[0] != 'update']
 
     def run_main(self, argv, env=None):
         out, err = io.StringIO(), io.StringIO()
@@ -600,8 +753,89 @@ class TestUpgradeCommand(FakeBrewCase):
         self.assertEqual(code, 0)
         self.assertIsNone(self.reviewed)
         self.assertEqual(self.upgraded(), ['gh', 'watch'])
+        self.assertIn('skipped: not a terminal', out)
         self.assertRegex(out, r'ripgrep\s+14\.1\.1\s+→ 15\.2\.0')
-        self.assertIn('3 not selected', out)
+        self.assertIn('3 left to review', out)
+
+    def test_no_review_upgrades_the_whitelist_and_only_lists_the_rest(self):
+        code, out, _ = self.run_upgrade('--no-review')
+        self.assertEqual(code, 0)
+        self.assertIsNone(self.reviewed)
+        self.assertEqual(self.changes(), ['upgrade gh', 'upgrade watch'])
+        self.assertIn('skipped: --no-review', out)
+        self.assertRegex(out, r'tmux\s+3\.5a\s+→ 3\.8')
+        self.assertEqual(section(out, 'Upgraded (whitelist)'), ['gh 2.101.0 → 2.103.3', 'watch 4.0.5 → 4.0.7'])
+        self.assertIn('3 left to review · 1 patch-only ignored', out)
+
+    def test_no_review_with_dry_run_changes_nothing(self):
+        code, out, _ = self.run_upgrade('--no-review', '--dry-run')
+        self.assertEqual(code, 0)
+        self.assertIsNone(self.reviewed)
+        self.assertEqual(self.changes(), [])
+        self.assertEqual(section(out, 'Would upgrade (whitelist)'), ['gh 2.101.0 → 2.103.3', 'watch 4.0.5 → 4.0.7'])
+
+    def test_uninstalls_before_upgrading_the_selected(self):
+        self.choice = br.Choice(['ripgrep'], [], ['tmux'])
+        code, out, _ = self.run_upgrade()
+        self.assertEqual(code, 0)
+        self.assertEqual(self.changes(), ['upgrade gh', 'upgrade watch', 'uninstall tmux', 'upgrade ripgrep'])
+        self.assertIn('To uninstall: tmux', out)
+        self.assertIn('Selected: ripgrep', out)
+
+    def test_summary_lists_uninstalled_and_keeps_them_out_of_also_upgraded(self):
+        self.choice = br.Choice(['ripgrep'], [], ['tmux'])
+        _, out, _ = self.run_upgrade()
+        self.assertEqual(section(out, 'Uninstalled'), ['tmux 3.5a'])
+        self.assertEqual(section(out, 'Also upgraded by Homebrew'), ['fd 10.2.0 → 10.5.0'])
+        self.assertEqual(section(out, 'Failed'), [])
+        # bat was neither upgraded nor uninstalled
+        self.assertIn('1 not selected · 1 patch-only ignored', out)
+
+    def test_dependents_are_uninstalled_before_what_they_need(self):
+        self.set_brew(
+            [
+                spec_('bat', '0.25.0', '0.26.1'),
+                spec_('tmux', '3.5a', '3.8', deps=['bat']),
+                spec_('ripgrep', '14.1.1', '15.2.0'),
+            ]
+        )
+        self.choice = br.Choice([], [], ['bat', 'tmux'])
+        code, out, _ = self.run_upgrade('--no-update')
+        self.assertEqual(code, 0)
+        self.assertEqual(self.changes(), ['uninstall tmux', 'uninstall bat'])
+        self.assertEqual(section(out, 'Uninstalled'), ['tmux 3.5a', 'bat 0.25.0'])
+
+    def test_refused_uninstall_keeps_going_and_exits_non_zero(self):
+        # tmux needs bat, but only bat is marked: brew refuses
+        self.set_brew(
+            [
+                spec_('bat', '0.25.0', '0.26.1'),
+                spec_('tmux', '3.5a', '3.8', deps=['bat']),
+                spec_('ripgrep', '14.1.1', '15.2.0'),
+            ]
+        )
+        self.choice = br.Choice(['ripgrep'], [], ['bat'])
+        code, out, _ = self.run_upgrade('--no-update')
+        self.assertEqual(code, 1)
+        self.assertEqual(self.changes(), ['uninstall bat', 'upgrade ripgrep'])
+        self.assertEqual(section(out, 'Failed'), ['bat (uninstall exit 1)'])
+        self.assertEqual(section(out, 'Upgraded (selected)'), ['ripgrep 14.1.1 → 15.2.0'])
+        self.assertEqual(section(out, 'Uninstalled'), [])
+
+    def test_ctrl_c_during_uninstall_stops_the_rest(self):
+        self.choice = br.Choice(['ripgrep'], [], ['tmux'])
+        code, out, _ = self.run_upgrade(env={'FAKE_INTERRUPT': 'tmux'})
+        self.assertEqual(code, 130)
+        self.assertEqual(self.changes(), ['upgrade gh', 'upgrade watch', 'uninstall tmux'])
+        self.assertEqual(section(out, 'Failed'), ['tmux (uninstall interrupted)'])
+
+    def test_dry_run_only_prints_the_uninstall(self):
+        self.choice = br.Choice([], [], ['tmux'])
+        code, out, _ = self.run_upgrade('--dry-run')
+        self.assertEqual(code, 0)
+        self.assertEqual(self.changes(), [])
+        self.assertIn('would run: brew uninstall --formula tmux', out)
+        self.assertEqual(section(out, 'Would uninstall'), ['tmux 3.5a'])
 
     def test_ctrl_c_stops_the_rest_but_keeps_whitelist_and_summary(self):
         self.choice = br.Choice(['ripgrep', 'bat', 'tmux'], ['bat'])

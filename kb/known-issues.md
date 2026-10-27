@@ -2,11 +2,11 @@
 
 > 当前 app 已知、待后续处理的问题：缺陷、简化实现、未验收项、待建流程。只反映最新状态——解决了就删掉条目，经过记到 `kb/sessions/`。
 
-## brewer：真实升级路径还没有在本机跑过
+## brewer：真实升级和卸载的结果判定只在假 brew 上验证过
 
-- 记录：2026-10-27（`kb/plans/2026-10-27-brewer.md`，验收报告 `tmp/2026-10-27-brewer/acceptance-report.md`）
-- 验收只用了 `--dry-run --no-update`。真实 `brew upgrade` 的实时输出、升级后重新扫描、连带升级识别、失败和 Ctrl-C 中断的汇总，以及回车时写入白名单，都只在假 brew 的单元测试里验证过。依据的假设是：brew 升级成功后，`brew outdated` 里不再有这一项。
-- 处理方向：用户第一次真实运行 `brewer upgrade` 时，对照汇总和 `brew outdated` 核对一遍；没问题就删掉这一条。
+- 记录：2026-10-27（`kb/plans/2026-10-27-brewer.md`，验收报告 `tmp/2026-10-27-brewer/acceptance-report.md`、`tmp/2026-10-27-brewer-v2/acceptance-report.md`）
+- 两轮验收都只用了 `--dry-run --no-update`。用户第一次真实运行时撞上了 brew 7 默认的 `[y/n]` 确认，已修，但那次的汇总没有核对过。升级后重新扫描、连带升级识别、失败和 Ctrl-C 的汇总、回车时写入白名单，以及真实 `brew uninstall`（被依赖时被拒绝、顺带删掉孤立依赖），都只在假 brew 的单元测试里验证过。依据的假设是：brew 升级成功后 `brew outdated` 里不再有这一项，卸载被拒绝时退出码非 0。
+- 处理方向：用户下一次真实运行 `brewer upgrade` 时，对照汇总、`brew outdated` 和 `brew list --formula` 核对一遍；没问题就删掉这一条。
 
 ## mole-review：同一次终端读取里，排在 `/` 前面的 Space 会丢失
 

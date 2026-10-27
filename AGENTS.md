@@ -59,7 +59,7 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 
 ## Homebrew upgrades
 
-- `brewer.py` (linked as `brewer`: `outdated`, `upgrade`, `whitelist`) looks only at formulae installed on request and levels each update by the first differing version segment (major / minor / patch, revision-only counts as patch). `upgrade` auto-upgrades `~/.config/brewer/whitelist`, reviews the remaining major/minor updates in a textual TUI, and runs one `brew upgrade --formula` per formula.
+- `brewer.py` (linked as `brewer`: `outdated`, `upgrade`, `whitelist`) looks only at formulae installed on request and levels each update by the first differing version segment (major / minor / patch, revision-only counts as patch). `upgrade` auto-upgrades `~/.config/brewer/whitelist`, reviews the remaining major/minor updates in a textual TUI (upgrade, whitelist or uninstall each, `i` for details; `--no-review` stops after the whitelist), and runs one `brew uninstall --formula` / `brew upgrade --formula` per formula, uninstalls first. brew subprocesses get `HOMEBREW_NO_ASK=1`: brew 7 otherwise stops at its own `[y/n]` prompt after the TUI already confirmed.
 - Outcomes, including formulae brew upgraded along the way, come from diffing `brew outdated` before and after, never from parsing brew's text output. Tests run against a fake `brew` first in PATH; run `uv run test_brewer.py` when changing it. PRD and design: `kb/plans/2026-10-27-brewer.md`.
 
 ## Documentation

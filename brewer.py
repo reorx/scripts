@@ -14,8 +14,9 @@ only the brew revision `_N`) is patch.
 
   brewer outdated     brew update, then list the major and minor updates
   brewer upgrade      brew update, upgrade whitelisted formulae, review the
-                      remaining major/minor updates in a TUI, upgrade the
-                      chosen ones, then print a summary
+                      remaining major/minor updates in a TUI (upgrade,
+                      whitelist or uninstall each), carry that out, then
+                      print a summary; --no-review stops after the whitelist
   brewer whitelist    show the whitelist, or add / rm formulae
 
 Whitelisted formulae (~/.config/brewer/whitelist, one name per line) are
@@ -36,9 +37,12 @@ from dataclasses import dataclass, field
 from itertools import zip_longest
 from pathlib import Path
 
+from rich.console import Group
+from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
+from textual.screen import ModalScreen
 from textual.widgets import DataTable, Footer, Static
 
 WHITELIST_PATH = Path.home() / '.config/brewer/whitelist'
@@ -108,6 +112,7 @@ class Formula:
     pinned: bool
     desc: str
     homepage: str
+    required_by: list[str] = field(default_factory=list)  # installed formulae depending on it, full names
 
 
 def brew_json(*args: str) -> dict:
@@ -128,8 +133,21 @@ def on_request_formulae(info: dict) -> dict[str, dict]:
     return {f['full_name']: f for f in info['formulae'] if any(k['installed_on_request'] for k in f['installed'])}
 
 
+def dependents(info: dict) -> dict[str, list[str]]:
+    """Installed formulae that depend on each formula, all by full name."""
+    users: dict[str, set[str]] = {}
+    for f in info['formulae']:
+        for keg in f['installed']:
+            # what the keg was built against, recursively: the same record brew checks before an uninstall;
+            # kegs from old brew versions may have none
+            for dep in keg.get('runtime_dependencies') or []:
+                users.setdefault(dep['full_name'], set()).add(f['full_name'])
+    return {name: sorted(names) for name, names in users.items()}
+
+
 def parse_scan(info: dict, outdated: dict) -> list[Formula]:
     wanted = on_request_formulae(info)
+    users = dependents(info)
     found = []
     for o in outdated['formulae']:
         f = wanted.get(o['name'])
@@ -138,7 +156,18 @@ def parse_scan(info: dict, outdated: dict) -> list[Formula]:
         # brew lists the installed versions oldest first
         installed, latest = o['installed_versions'][-1], o['current_version']
         level = version_level(installed, latest)
-        found.append(Formula(o['name'], installed, latest, level, o['pinned'], f['desc'] or '', f['homepage'] or ''))
+        found.append(
+            Formula(
+                o['name'],
+                installed,
+                latest,
+                level,
+                o['pinned'],
+                f['desc'] or '',
+                f['homepage'] or '',
+                users.get(o['name'], []),
+            )
+        )
     return found
 
 
@@ -153,9 +182,10 @@ def update_homebrew() -> None:
         warn('brew update failed, going on with the formula data already on disk')
 
 
-def brew_upgrade(name: str, dry_run: bool) -> int:
+def brew_change(command: str, name: str, dry_run: bool) -> int:
+    """`brew upgrade` or `brew uninstall` one formula."""
     # --formula keeps a same-named cask (docker) out of it
-    args = ['upgrade', '--formula', name]
+    args = [command, '--formula', name]
     if dry_run:
         print(f'would run: brew {shlex.join(args)}')
         return 0
@@ -245,6 +275,13 @@ def make_plan(formulae: list[Formula], whitelist: list[str]) -> Plan:
     return plan
 
 
+def removal_order(formulae: list[Formula]) -> list[Formula]:
+    """Dependents first: brew refuses to uninstall a formula another installed one still needs."""
+    names = {f.name for f in formulae}
+    # dependency lists are recursive, so whatever needs X also needs everything X needs and counts higher
+    return sorted(formulae, key=lambda f: len(names.intersection(f.required_by)))
+
+
 def formula_lines(formulae: list[Formula], whitelist: list[str] = ()) -> list[str]:
     """Aligned `name  installed  → latest  tags` lines."""
     w_name = max(len(f.name) for f in formulae)
@@ -269,6 +306,22 @@ def versions(f: Formula) -> str:
 class Choice:
     upgrade: list[str]
     whitelist: list[str]
+    uninstall: list[str] = field(default_factory=list)
+
+
+def name_list(names: list[str], limit: int = 3) -> str:
+    shown = ', '.join(names[:limit])
+    return shown if len(names) <= limit else f'{shown} and {len(names) - limit} more'
+
+
+def formula_info(f: Formula) -> Group:
+    facts = Table.grid(padding=(0, 2))
+    facts.add_column(style='bold')
+    facts.add_column()
+    facts.add_row('Homepage', f.homepage or 'none')
+    facts.add_row('Required by', ', '.join(f.required_by) or 'none')
+    level = Text.assemble((f.level.capitalize(), LEVEL_STYLE[f.level]), f'  {f.installed} {ARROW} {f.latest}')
+    return Group(level, Text(), Text(f.desc or 'No description.'), Text(), facts)
 
 
 class ReviewTable(DataTable):
@@ -278,8 +331,32 @@ class ReviewTable(DataTable):
     ]
 
 
+class InfoScreen(ModalScreen[None]):
+    """One formula in full, over the review list."""
+
+    CSS = """
+    InfoScreen { align: center middle; }
+    #info { width: 80%; max-width: 100; height: auto; padding: 1 2; border: round $accent; background: $surface; }
+    """
+    BINDINGS = [
+        # the cursor stays on this formula's row, so the app opens the right homepage
+        Binding('o', 'app.open_homepage', 'Homepage'),
+        Binding('i,escape,q', 'dismiss', 'Close'),
+    ]
+
+    def __init__(self, formula: Formula):
+        super().__init__()
+        self.formula = formula
+
+    def compose(self) -> ComposeResult:
+        info = Static(formula_info(self.formula), id='info')
+        info.border_title = self.formula.name
+        yield info
+        yield Footer()
+
+
 class ReviewApp(App[Choice | None]):
-    """Pick which updates to upgrade and which formulae to whitelist; exits with a Choice, or None when cancelled."""
+    """Pick which formulae to upgrade, whitelist or uninstall; exits with a Choice, or None when cancelled."""
 
     TITLE = 'brewer'
     CSS = """
@@ -289,6 +366,8 @@ class ReviewApp(App[Choice | None]):
     BINDINGS = [
         Binding('space', 'toggle_upgrade', 'Upgrade'),
         Binding('d', 'toggle_whitelist', 'Whitelist'),
+        Binding('x', 'toggle_uninstall', 'Uninstall'),
+        Binding('i', 'show_info', 'Info'),
         Binding('o', 'open_homepage', 'Homepage'),
         # DataTable binds enter itself
         Binding('enter', 'confirm', 'Confirm', priority=True),
@@ -301,6 +380,7 @@ class ReviewApp(App[Choice | None]):
         self.formulae = formulae
         self.to_upgrade: set[str] = set()
         self.to_whitelist: set[str] = set()
+        self.to_uninstall: set[str] = set()
 
     def compose(self) -> ComposeResult:
         yield Static(id='status')
@@ -312,6 +392,7 @@ class ReviewApp(App[Choice | None]):
         # fixed widths: the marks start out empty and update_cell does not widen a column
         table.add_column('Up', key='upgrade', width=2)
         table.add_column('WL', key='whitelist', width=2)
+        table.add_column('Rm', key='uninstall', width=2)
         for label in ('Level', 'Formula', 'Installed', 'Latest', 'Description'):
             table.add_column(label)
         for f in self.formulae:
@@ -320,10 +401,11 @@ class ReviewApp(App[Choice | None]):
             table.add_row(*self.marks(f), level, f.name, f.installed, f.latest, desc, key=f.name)
         self.update_status()
 
-    def marks(self, f: Formula) -> tuple[Text, Text]:
+    def marks(self, f: Formula) -> tuple[Text, Text, Text]:
         return (
             Text('✓' if f.name in self.to_upgrade else '', style='bold green'),
             Text('★' if f.name in self.to_whitelist else '', style='bold yellow'),
+            Text('✗' if f.name in self.to_uninstall else '', style='bold red'),
         )
 
     def status_text(self) -> str:
@@ -331,6 +413,7 @@ class ReviewApp(App[Choice | None]):
         return (
             f'{levels["major"]} major · {levels["minor"]} minor'
             f'    {len(self.to_upgrade)} selected · {len(self.to_whitelist)} to whitelist'
+            f' · {len(self.to_uninstall)} to uninstall'
         )
 
     def update_status(self) -> None:
@@ -341,9 +424,8 @@ class ReviewApp(App[Choice | None]):
 
     def redraw(self, f: Formula) -> None:
         table = self.query_one(ReviewTable)
-        upgrade, whitelist = self.marks(f)
-        table.update_cell(f.name, 'upgrade', upgrade)
-        table.update_cell(f.name, 'whitelist', whitelist)
+        for key, mark in zip(('upgrade', 'whitelist', 'uninstall'), self.marks(f)):
+            table.update_cell(f.name, key, mark)
         self.update_status()
 
     def action_toggle_upgrade(self) -> None:
@@ -354,6 +436,7 @@ class ReviewApp(App[Choice | None]):
             self.to_whitelist.discard(f.name)
         else:
             self.to_upgrade.add(f.name)
+            self.to_uninstall.discard(f.name)
         self.redraw(f)
 
     def action_toggle_whitelist(self) -> None:
@@ -363,7 +446,28 @@ class ReviewApp(App[Choice | None]):
         else:
             self.to_whitelist.add(f.name)
             self.to_upgrade.add(f.name)
+            self.to_uninstall.discard(f.name)
         self.redraw(f)
+
+    def action_toggle_uninstall(self) -> None:
+        f = self.current()
+        if f.name in self.to_uninstall:
+            self.to_uninstall.discard(f.name)
+        else:
+            self.to_uninstall.add(f.name)
+            self.to_upgrade.discard(f.name)
+            self.to_whitelist.discard(f.name)
+            # marking them too makes it work: dependents are uninstalled first
+            if needed_by := [n for n in f.required_by if n not in self.to_uninstall]:
+                self.notify(
+                    f'{f.name} is required by {name_list(needed_by)}: '
+                    'Homebrew refuses to uninstall it unless those go too',
+                    severity='warning',
+                )
+        self.redraw(f)
+
+    def action_show_info(self) -> None:
+        self.push_screen(InfoScreen(self.current()))
 
     def action_open_homepage(self) -> None:
         f = self.current()
@@ -373,9 +477,17 @@ class ReviewApp(App[Choice | None]):
         webbrowser.open(f.homepage)
         self.notify(f'Opened {f.homepage}')
 
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        # priority bindings reach through the info panel; enter there must not confirm the whole review
+        return not (action == 'confirm' and isinstance(self.screen, InfoScreen))
+
     def action_confirm(self) -> None:
         names = [f.name for f in self.formulae]
-        self.exit(Choice([n for n in names if n in self.to_upgrade], [n for n in names if n in self.to_whitelist]))
+
+        def picked(marked: set[str]) -> list[str]:
+            return [n for n in names if n in marked]
+
+        self.exit(Choice(picked(self.to_upgrade), picked(self.to_whitelist), picked(self.to_uninstall)))
 
     def action_cancel(self) -> None:
         self.exit(None)
@@ -384,10 +496,13 @@ class ReviewApp(App[Choice | None]):
 # --- upgrade -----------------------------------------------------------------
 
 
+PHASES = ('whitelist', 'selected', 'uninstall')
+
+
 @dataclass
 class Attempt:
     formula: Formula
-    phase: str  # 'whitelist' or 'selected'
+    phase: str  # one of PHASES: upgraded from the whitelist, upgraded as selected, or uninstalled
     code: int | None = None  # stays None when Ctrl-C hit before brew returned
 
 
@@ -401,7 +516,9 @@ class Report:
     attempts: list[Attempt] = field(default_factory=list)
     review: list[Formula] = field(default_factory=list)
     chosen: list[str] = field(default_factory=list)
+    uninstall: list[str] = field(default_factory=list)
     whitelisted: list[str] = field(default_factory=list)
+    skipped_review: bool = False
     after: list[Formula] = field(default_factory=list)
 
 
@@ -409,12 +526,18 @@ def is_interactive() -> bool:
     return sys.stdin.isatty() and sys.stdout.isatty()
 
 
-def upgrade_each(formulae: list[Formula], phase: str, report: Report) -> None:
+def subject(f: Formula, phase: str) -> str:
+    """The formula and the version an upgrade or an uninstall is about."""
+    return f'{f.name} {f.installed}' if phase == 'uninstall' else versions(f)
+
+
+def run_each(formulae: list[Formula], phase: str, report: Report) -> None:
+    command = 'uninstall' if phase == 'uninstall' else 'upgrade'
     for i, f in enumerate(formulae, 1):
-        print(paint(f'[{i}/{len(formulae)}] {versions(f)}', BOLD))
+        print(paint(f'[{i}/{len(formulae)}] {subject(f, phase)}', BOLD))
         attempt = Attempt(f, phase)
         report.attempts.append(attempt)
-        attempt.code = brew_upgrade(f.name, report.dry_run)
+        attempt.code = brew_change(command, f.name, report.dry_run)
 
 
 def still_to_review(report: Report) -> list[Formula]:
@@ -426,11 +549,11 @@ def still_to_review(report: Report) -> list[Formula]:
     return [f for f in report.plan.review if f.name in outdated]
 
 
-def run_stages(report: Report, whitelist_path: Path) -> None:
+def run_stages(report: Report, whitelist_path: Path, no_review: bool) -> None:
     auto = report.plan.auto
     if auto:
         stage(f'Upgrading whitelisted formulae ({len(auto)})')
-        upgrade_each(auto, 'whitelist', report)
+        run_each(auto, 'whitelist', report)
     else:
         print('No whitelisted formula to upgrade.')
 
@@ -438,8 +561,9 @@ def run_stages(report: Report, whitelist_path: Path) -> None:
     if not review:
         print('No major or minor update left to review.')
         return
-    if not is_interactive():
-        stage(f'Needs review ({len(review)}), skipped: not a terminal')
+    if no_review or not is_interactive():
+        report.skipped_review = True
+        stage(f'Needs review ({len(review)}), skipped: {"--no-review" if no_review else "not a terminal"}')
         print('\n'.join(formula_lines(review)))
         return
 
@@ -448,50 +572,64 @@ def run_stages(report: Report, whitelist_path: Path) -> None:
     if choice is None:
         print('Review cancelled, nothing selected.')
         return
-    report.chosen = choice.upgrade
+    carry_out(choice, report, whitelist_path)
+
+
+def carry_out(choice: Choice, report: Report, whitelist_path: Path) -> None:
+    report.chosen, report.uninstall = choice.upgrade, choice.uninstall
     if choice.whitelist:
         # saved right away, a long upgrade cut short by Ctrl-C keeps the marks
         report.whitelisted = choice.whitelist if report.dry_run else add_to_whitelist(whitelist_path, choice.whitelist)
         print(f'{"Would whitelist" if report.dry_run else "Whitelisted"}: {", ".join(choice.whitelist)}')
-    if not choice.upgrade:
+    if not choice.upgrade and not choice.uninstall:
         print('Nothing selected.')
         return
-    print(f'Selected: {", ".join(choice.upgrade)}')
+    if choice.uninstall:
+        print(f'To uninstall: {", ".join(choice.uninstall)}')
+    if choice.upgrade:
+        print(f'Selected: {", ".join(choice.upgrade)}')
 
-    stage(f'Upgrading selected formulae ({len(choice.upgrade)})')
-    by_name = {f.name: f for f in review}
-    upgrade_each([by_name[n] for n in choice.upgrade], 'selected', report)
+    by_name = {f.name: f for f in report.review}
+    if choice.uninstall:
+        # first: upgrading a formula also upgrades its outdated dependents, one of them may be on its way out
+        stage(f'Uninstalling ({len(choice.uninstall)})')
+        run_each(removal_order([by_name[n] for n in choice.uninstall]), 'uninstall', report)
+    if choice.upgrade:
+        stage(f'Upgrading selected formulae ({len(choice.upgrade)})')
+        run_each([by_name[n] for n in choice.upgrade], 'selected', report)
 
 
 def summary_groups(r: Report) -> list[tuple[str, list[str]]]:
     if r.dry_run:
-        planned = {
-            phase: [versions(a.formula) for a in r.attempts if a.phase == phase] for phase in ('whitelist', 'selected')
-        }
+        planned = {phase: [subject(a.formula, phase) for a in r.attempts if a.phase == phase] for phase in PHASES}
         return [
             ('Would upgrade (whitelist)', planned['whitelist']),
             ('Would upgrade (selected)', planned['selected']),
+            ('Would uninstall', planned['uninstall']),
             ('Would add to whitelist', r.whitelisted),
         ]
     outdated = {f.name for f in r.after}
-    upgraded = {'whitelist': [], 'selected': []}
+    done = {phase: [] for phase in PHASES}
     failed = []
     for a in r.attempts:
         name = a.formula.name
+        what = 'uninstall ' if a.phase == 'uninstall' else ''
         if a.code is None:
-            failed.append(f'{name} (interrupted)')
+            failed.append(f'{name} ({what}interrupted)')
         elif a.code != 0:
-            failed.append(f'{name} (exit {a.code})')
-        elif name in outdated:
+            failed.append(f'{name} ({what}exit {a.code})')
+        elif a.phase != 'uninstall' and name in outdated:
             failed.append(f'{name} (still outdated)')
         else:
-            upgraded[a.phase].append(versions(a.formula))
+            done[a.phase].append(subject(a.formula, a.phase))
+    # uninstalled formulae leave `brew outdated` too, being attempted keeps them out of this group
     attempted = {a.formula.name for a in r.attempts}
     also = [versions(f) for f in r.before if f.name not in outdated and f.name not in attempted]
     return [
-        ('Upgraded (whitelist)', upgraded['whitelist']),
-        ('Upgraded (selected)', upgraded['selected']),
+        ('Upgraded (whitelist)', done['whitelist']),
+        ('Upgraded (selected)', done['selected']),
         ('Also upgraded by Homebrew', also),
+        ('Uninstalled', done['uninstall']),
         ('Failed', failed),
         ('Added to whitelist', r.whitelisted),
     ]
@@ -504,8 +642,9 @@ def print_summary(r: Report, groups: list[tuple[str, list[str]]]) -> None:
         print(paint(f'{title}:', RED if title == 'Failed' else BOLD))
         for item in items:
             print(f'  {item}')
+    left = len(r.review) - len(r.chosen) - len(r.uninstall)
     counts = (
-        (len(r.review) - len(r.chosen), 'not selected'),
+        (left, 'left to review' if r.skipped_review else 'not selected'),
         (len(r.plan.ignored), 'patch-only ignored'),
         (len(r.plan.pinned), 'pinned'),
     )
@@ -551,7 +690,7 @@ def cmd_upgrade(args: argparse.Namespace) -> int:
     report = Report(before, make_plan(before, load_whitelist(args.whitelist)), args.dry_run)
     interrupted = False
     try:
-        run_stages(report, args.whitelist)
+        run_stages(report, args.whitelist, args.no_review)
     except KeyboardInterrupt:
         interrupted = True
         print()
@@ -604,7 +743,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog='brewer',
         description='Upgrade Homebrew formulae by how far behind they are, with a whitelist and a review TUI.',
-        epilog='review keys: up/down (j/k) move, space upgrade, d whitelist (+ upgrade), o homepage, enter confirm, q cancel',
+        epilog=(
+            'review keys: up/down (j/k) move, space upgrade, d whitelist (+ upgrade), x uninstall, '
+            'i details, o homepage, enter confirm, q cancel'
+        ),
     )
     sub = parser.add_subparsers(dest='command', required=True)
     p = sub.add_parser('outdated', parents=[common, no_update], help='brew update, then list major and minor updates')
@@ -615,7 +757,10 @@ def build_parser() -> argparse.ArgumentParser:
         help='upgrade whitelisted formulae, then review the remaining major/minor updates',
     )
     p.add_argument(
-        '--dry-run', action='store_true', help='go through every step but upgrade nothing, keep the whitelist'
+        '--dry-run', action='store_true', help='go through every step but change nothing, keep the whitelist'
+    )
+    p.add_argument(
+        '--no-review', action='store_true', help='upgrade the whitelist only, list what needs review without the TUI'
     )
     p.set_defaults(func=cmd_upgrade)
     p = sub.add_parser('whitelist', parents=[common], help='show the whitelist, or add / rm formulae')
