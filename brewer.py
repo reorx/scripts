@@ -117,8 +117,9 @@ def brew_json(*args: str) -> dict:
 def brew_run(*args: str) -> int:
     """Run brew on the terminal, its output shown live."""
     sys.stdout.flush()
-    # brewer runs `brew update` itself (or was told not to), upgrades must not trigger another one
-    env = {**os.environ, 'HOMEBREW_NO_AUTO_UPDATE': '1'}
+    # brewer runs `brew update` itself (or was told not to), upgrades must not trigger another one;
+    # the review TUI already is the confirmation, so brew 7's default "proceed? [y/n]" must not ask again
+    env = {**os.environ, 'HOMEBREW_NO_AUTO_UPDATE': '1', 'HOMEBREW_NO_ASK': '1'}
     return subprocess.run(['brew', *args], env=env).returncode
 
 

@@ -56,6 +56,10 @@ if args[:2] == ['outdated', '--json=v2']:
     sys.exit(0)
 if args[:2] == ['upgrade', '--formula']:
     name = args[2]
+    # brew 7 asks before upgrading unless told not to; nobody answers here, like an unattended run
+    if not os.environ.get('HOMEBREW_NO_ASK') and not {{'-y', '--yes', '--no-ask'}} & set(args):
+        print('==> Do you want to proceed with the upgrade? [y/n]')
+        sys.exit(1)
     if name == os.environ.get('FAKE_INTERRUPT'):
         os.kill(os.getppid(), signal.SIGINT)
         sys.exit(130)
@@ -518,6 +522,14 @@ class TestUpgradeCommand(FakeBrewCase):
     def test_upgrades_skip_brew_auto_update(self):
         self.run_upgrade()
         self.assertTrue(all(line.endswith('auto_update=1') for line in self.actions() if line.startswith('upgrade')))
+
+    def test_upgrades_never_ask_for_confirmation(self):
+        # the review TUI is the confirmation, brew's own prompt must not stop the run again
+        self.choice = br.Choice(['ripgrep'], [])
+        code, out, _ = self.run_upgrade()
+        self.assertEqual(code, 0)
+        self.assertNotIn('Do you want to proceed', out)
+        self.assertEqual(section(out, 'Upgraded (selected)'), ['ripgrep 14.1.1 → 15.2.0'])
 
     def test_selected_upgrade_after_whitelist_is_saved(self):
         self.choice = br.Choice(['ripgrep', 'tmux'], ['tmux'])
