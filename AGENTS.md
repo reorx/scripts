@@ -64,6 +64,7 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 
 ## Documentation
 
+- To clean the HONOR ALI-AN00 phone, use `honor-cleanup.py` (preview by default; `--apply` uninstalls). Its device identity and third-party app whitelist live at the top of the script. Run `uv run test_honor_cleanup.py` when changing it.
 - `kb/docs/skill-invocation.md` — Read before changing skill invocation policies or synchronizing installed skills; explicit-only skills need both Claude Code and Codex settings.
 - `kb/docs/app-defaults.md` — Read when inspecting or changing macOS application preferences or modifying `app-defaults.py`.
 - `kb/docs/cc-format-hook.md` — Read before changing `cc-format --hook` or the Claude Code / Codex PostToolUse hooks that call it; Codex needs different reporting from Claude. Run `./test-cc-format.sh` after changes.
