@@ -13,6 +13,25 @@ tags: [android, honor, cleanup]
 
 ## Tech Design
 
+### 2026-10-29 本次确认与结果
+
+用户重新选择本次范围，仅停用以下 4 项，覆盖此前「其余全部停用」的批量安排：
+
+| 项目 | 执行结果 |
+| --- | --- |
+| 剪辑 `com.hihonor.videoeditor` | 已停用，`installed=true enabled=3` |
+| 平行空间 `com.hihonor.parallelspace` | 已停用，`installed=true enabled=3` |
+| AI 通话 `com.hihonor.recordassistant` | 已停用，`installed=true enabled=3` |
+| 多屏协同 `com.hihonor.pcassistant` | 已停用，`installed=true enabled=3` |
+
+4 项变更前均为 `enabled=0`，未卸载、未清除数据。设备身份与用户 0 已核实；`dumpsys user` 仅见机主，没有额外用户或空间配置。多屏协同仅按包操作，没有操作系统共享 UID。
+
+智能提醒、动态壁纸、打印助手、默认打印服务本次未操作。它们及下列 5 个保留包的用户状态均已与基线对比一致。拨号界面可正常打开，截图已检查，没有发起通话。Windows 连接的 launcher 入口解析无结果，显式启动 `.StartUpSettingActivity` 返回 Activity 不存在；缺少操作前入口测试，无法归因于本次停用，也不能宣称连接功能通过验收。未修改其组件状态。
+
+真实通话、Windows 连接、荣耀云和智慧空间端到端使用，以及重启后状态仍待验证。如 Windows 连接出现影响，优先恢复多屏协同再对比。第一期完整体验验收尚未记录；本次依用户新确认执行此 4 项，不代表两期整体验收完成。第三期未执行。
+
+基线、逐项日志、回读结果及截图位于 `tmp/2026-10-29-honor-system-cleanup/batch2/`。恢复任一目标使用 `adb -s AB9UUT4510000125 shell pm default-state --user 0 <包名>` 后回读（4 项原状态均为 default）。
+
 ### 停用清单
 
 | 名称 | 包名 |
