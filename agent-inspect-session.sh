@@ -103,7 +103,7 @@ print_result() {
     else
         jq -r '
             "agent: \(.agent)\nsession_id: \(.session_id)\nmodel: \(.model // "unknown")\nthinking_effort: \(.thinking_effort // "unknown")\ncontext_used_percent: \(if .context_used_percent == null then "unknown" elif .context_source == "model-default" then "~\(.context_used_percent)%" else "\(.context_used_percent)%" end)",
-            "context_tokens: \(.context_tokens // "unknown")",
+            "context_used_tokens: \(.context_used_tokens // "unknown")",
             "context_window: \(.context_window // "unknown")",
             (if .assessment_basis == "bytes" then "context_bytes (approximate UTF-8): \(.context_bytes)" else empty end),
             (if .guidance != null then "guidance: \(.guidance)" else empty end)
@@ -256,14 +256,14 @@ main() {
              else null end),
          raw_context_used_percent: (if (.usage | nonnegative) and (.window | positive)
              then (.usage / .window * 100 | round) else null end),
-         context_tokens: (if (.usage | nonnegative) then .usage else null end),
+         context_used_tokens: (if (.usage | nonnegative) then .usage else null end),
          context_bytes: .bytes, context_window: .window,
          context_source: .source} |
         if .context_used_percent != null then
             . + {assessment_basis:"percent",context_high:null,warning_threshold:null,guidance:null}
         else
-            (if .context_tokens != null then
-                {basis:"tokens",value:.context_tokens,threshold:100000}
+            (if .context_used_tokens != null then
+                {basis:"tokens",value:.context_used_tokens,threshold:100000}
              elif .context_bytes != null then
                 {basis:"bytes",value:.context_bytes,threshold:400000}
              else {basis:"unavailable",value:null,threshold:null} end) as $fallback |

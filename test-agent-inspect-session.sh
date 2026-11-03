@@ -56,7 +56,7 @@ expect() {
     fi
 }
 
-fields='"\(.model) \(.context_tokens) \(.context_window) \(.context_used_percent) \(.context_source)"'
+fields='"\(.model) \(.context_used_tokens) \(.context_window) \(.context_used_percent) \(.context_source)"'
 
 # --- transcript lookup ---
 
@@ -136,9 +136,9 @@ expect "--context-window beats catalog and the 1M switch" "claude-opus-5-5 22002
 expect "JSON percent fields say they are used, not remaining" "2 2" \
     "$(inspect "$work/cc" | jq -r '"\(.context_used_percent) \(.raw_context_used_percent)"')"
 
-expect "text output labels the used percent" "context_used_percent: 2%" \
+expect "text output labels used percent and tokens" "context_used_percent: 2%|context_used_tokens: 22002" \
     "$(env -u CODEX_SESSION_ID -u CODEX_THREAD_ID CLAUDE_CONFIG_DIR="$work/cc" \
-        CLAUDE_CODE_SESSION_ID="$session_id" "$script" | grep '^context_used')"
+        CLAUDE_CODE_SESSION_ID="$session_id" "$script" | grep '^context_used' | paste -sd'|' -)"
 
 if (( failures )); then
     echo "$failures test(s) failed"
