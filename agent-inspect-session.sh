@@ -64,11 +64,12 @@ find_transcript() {
     [[ -d "$root" ]] || return 0
     # Session IDs are validated before becoming a find pattern. Newer resumed
     # rollouts win if an installation has more than one file for the same ID.
+    # -H: the root may be a symlink (e.g. projects synced via iCloud).
     while IFS= read -r -d '' file; do
         if [[ -z "$transcript" || "$file" -nt "$transcript" ]]; then
             transcript=$file
         fi
-    done < <(find "$root" -type f -name "$pattern" -print0)
+    done < <(find -H "$root" -type f -name "$pattern" -print0)
 }
 
 print_result() {
