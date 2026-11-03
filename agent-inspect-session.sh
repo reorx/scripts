@@ -10,7 +10,7 @@ usage() {
 Usage: agent-inspect-session.sh [--json] [--agent codex|claude]
                                 [--context-window TOKENS]
 
-Print agent, session_id, model, thinking_effort and context_percent (used).
+Print agent, session_id, model, thinking_effort and context_used_percent.
 Requires Bash and jq. Reads local JSONL transcripts only when invoked;
 no statusline integration, persistent cache, background work or network requests.
 
@@ -29,7 +29,7 @@ Data directories: CODEX_HOME (default ~/.codex) and CLAUDE_CONFIG_DIR
 
 Codex matches its native status line: subtract the fixed 12000-token baseline
 from usage and window, round remaining percent, then subtract it from 100.
-JSON raw_context_percent preserves the unadjusted token/window ratio.
+JSON raw_context_used_percent preserves the unadjusted token/window ratio.
 Source: github.com/openai/codex/blob/main/codex-rs/tui/src/token_usage.rs
 
 Claude uses the latest input_tokens + cache_creation_input_tokens +
@@ -102,7 +102,7 @@ print_result() {
         printf '%s\n' "$result"
     else
         jq -r '
-            "agent: \(.agent)\nsession_id: \(.session_id)\nmodel: \(.model // "unknown")\nthinking_effort: \(.thinking_effort // "unknown")\ncontext_percent: \(if .context_percent == null then "unknown" elif .context_source == "model-default" then "~\(.context_percent)%" else "\(.context_percent)%" end)",
+            "agent: \(.agent)\nsession_id: \(.session_id)\nmodel: \(.model // "unknown")\nthinking_effort: \(.thinking_effort // "unknown")\ncontext_used_percent: \(if .context_used_percent == null then "unknown" elif .context_source == "model-default" then "~\(.context_used_percent)%" else "\(.context_used_percent)%" end)",
             "context_tokens: \(.context_tokens // "unknown")",
             "context_window: \(.context_window // "unknown")",
             (if .assessment_basis == "bytes" then "context_bytes (approximate UTF-8): \(.context_bytes)" else empty end),
@@ -245,7 +245,7 @@ main() {
             then .window = 200000 else . end
         end |
         {agent: $agent, session_id: $id, model: .model, thinking_effort: .thinking_effort,
-         context_percent: (if (.usage | nonnegative) and (.window | positive)
+         context_used_percent: (if (.usage | nonnegative) and (.window | positive)
              then if $agent == "codex" then
                  if .window <= 12000 then 100 else
                      (.window - 12000) as $effective |
@@ -254,12 +254,12 @@ main() {
                  end
              else ([0, ([100, (.usage / .window * 100 | round)] | min)] | max) end
              else null end),
-         raw_context_percent: (if (.usage | nonnegative) and (.window | positive)
+         raw_context_used_percent: (if (.usage | nonnegative) and (.window | positive)
              then (.usage / .window * 100 | round) else null end),
          context_tokens: (if (.usage | nonnegative) then .usage else null end),
          context_bytes: .bytes, context_window: .window,
          context_source: .source} |
-        if .context_percent != null then
+        if .context_used_percent != null then
             . + {assessment_basis:"percent",context_high:null,warning_threshold:null,guidance:null}
         else
             (if .context_tokens != null then
