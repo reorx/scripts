@@ -47,6 +47,11 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 
 - `claude_session_search.py` is the behavior baseline of `~/Code/agent-session-manager`: its `make parity` diffs the app's `asm` CLI against this script line by line, so a change to what the script prints or in what order has to land in `asm` too. Sessions list newest first prompt first, ties by last update, then by session ID (`newest_first`). Run `python3 test_claude_session_search.py` when changing it.
 
+## Claude Code request probe
+
+- `cc-probe.py` (linked as `cc-probe`) runs `claude -p` against a fake API on 127.0.0.1 that answers every request with 400, then reports what the first request carries: items by kind (system sections, tools, deferred tool names, skills by source, agents, CLAUDE.md files, MCP instructions), runtime state (version, model, effort, fast, permission mode, Artifact, claude.ai skills, git snapshot, MCP servers) and the settings keys that switch them. `--via <zsh command>` goes through a function from `~/.zshrc_fn` (`cl` and friends); `--save` plus `diff` compares two setups; `--expect-absent`/`--expect-present`/`--max-tokens` exit 1 when unmet.
+- The parser follows the request layout of Claude Code 2.1.311: listings sit in a `role: system` message, MCP instructions between the agent and skill listings, loose paragraphs after the skill listing. When a release moves things, first update the fake claude in `test_cc_probe.py` to the new layout. Captured credentials go only to count_tokens and only when they are Anthropic's (`sk-ant-`); `--save` drops `metadata` (device and account ids). Run `uv run test_cc_probe.py` when changing it.
+
 ## Hacker News threads
 
 - `skills/hnread/scripts/hn_flat.py` fetches with curl, falling back to requests and then the Algolia API (`--fetcher auto`); a 200 page without `table.fatitem` counts as a failure. Never give python-requests a browser User-Agent: HN answers that with HTTP 419, while curl (any UA) and requests' own UA pass.
