@@ -34,9 +34,13 @@ Source: github.com/openai/codex/blob/main/codex-rs/tui/src/token_usage.rs
 
 Claude uses the latest input_tokens + cache_creation_input_tokens +
 cache_read_input_tokens, excluding output tokens, as its status line does.
-Claude window priority: --context-window, recorded session window, explicit
-[1m] model marker, 200k default for recognized older Claude models.
-Model defaults are estimates: extended-context/provider overrides may differ.
+Claude window priority: --context-window, recorded session window, the model
+catalog Claude Code caches in CLAUDE_CONFIG_DIR/cache/model-catalog
+(runtime.max_input_tokens; account *-cc.json first, then published-*.json),
+explicit [1m] model marker, 200k default for recognized older Claude models.
+CLAUDE_CODE_DISABLE_1M_CONTEXT caps catalog and [1m] windows at 200k.
+Catalog windows are model maximums: a model that needs the 1M beta may run
+with 200k. Model defaults are estimates: provider overrides may differ.
 Use --context-window to supply the effective window for those configurations
 or for an unrecognized model. JSON includes context_source for this reason.
 
@@ -72,6 +76,27 @@ find_transcript() {
     done < <(find -H "$root" -type f -name "$pattern" -print0)
 }
 
+# Context windows from Claude Code's cached model catalog: {model id: tokens}.
+# Account catalogs (*-cc.json) beat the published one, newer fetches beat older;
+# only the published document's cc surface applies. Half-written files are skipped.
+claude_catalog() {
+    local dir="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/cache/model-catalog" file
+    [[ -d "$dir" ]] || { echo '{}'; return 0; }
+    # One jq per file: the cache files lack a trailing newline, so a multi-file
+    # raw stream would glue the end of one file onto the start of the next.
+    while IFS= read -r -d '' file; do
+        jq -Rsc --arg file "$file" '
+            fromjson? | select(type == "object") |
+            {rank: [($file | endswith("-cc.json")), (.fetchedAt // 0)],
+             models: [(.catalog // .document.surfaces.cc // empty) | .. | objects |
+                 select((.id | type) == "string"
+                        and (.runtime.max_input_tokens? | type == "number" and . > 0)) |
+                 {(.id): .runtime.max_input_tokens}] | add}
+        ' "$file"
+    done < <(find -H "$dir" -maxdepth 1 -type f -name '*.json' -print0) |
+        jq -sc 'sort_by(.rank) | map(.models // {}) | add // {}'
+}
+
 print_result() {
     if "$json"; then
         printf '%s\n' "$result"
@@ -87,7 +112,7 @@ print_result() {
 }
 
 main() {
-    local agent='' session_id='' window='' json=false transcript='' result
+    local agent='' session_id='' window='' json=false transcript='' catalog='{}' result
     local codex_id=${CODEX_SESSION_ID:-${CODEX_THREAD_ID:-}}
     local claude_id=${CLAUDE_CODE_SESSION_ID:-}
     while (( $# )); do
@@ -131,11 +156,13 @@ main() {
         find_transcript "${CODEX_HOME:-$HOME/.codex}/sessions" "*-${session_id}.jsonl"
     else
         find_transcript "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects" "${session_id}.jsonl"
+        catalog=$(claude_catalog)
     fi
 
     # Parse line-by-line: bounded memory, tolerate a concurrently written final
     # JSON fragment. A malformed line must not discard the last valid reading.
-    result=$(jq -Rn --arg agent "$agent" --arg id "$session_id" --arg override "$window" '
+    result=$(jq -Rn --arg agent "$agent" --arg id "$session_id" --arg override "$window" \
+        --argjson catalog "$catalog" --arg no1m "${CLAUDE_CODE_DISABLE_1M_CONTEXT:-}" '
         def positive: type == "number" and . > 0;
         def nonnegative: type == "number" and . >= 0;
         # Select text-bearing fields explicitly: never count base64 images or
@@ -205,12 +232,17 @@ main() {
                 .window = .models[$model].contextWindow | .source = "session"
             elif ($matches | length) == 1 and ($matches[0].value.contextWindow | positive) then
                 .window = $matches[0].value.contextWindow | .source = "session"
+            elif ($catalog[$model | sub("\\[1m\\]$"; "")] | positive) then
+                .window = $catalog[$model | sub("\\[1m\\]$"; "")] | .source = "catalog"
             elif (($model // "") | endswith("[1m]")) or
                  (($matches | length) == 1 and ($matches[0].key | endswith("[1m]"))) then
                 .window = 1000000 | .source = "model-1m"
             elif (($model // "") | test("^claude-(3([.-]|$)|sonnet-4(-[0-9]{8})?$|opus-4(-[0-9]{8})?$|opus-4-1(-[0-9]{8})?$|sonnet-4-5(-[0-9]{8})?$|opus-4-5(-[0-9]{8})?$|haiku-4-5(-[0-9]{8})?$)")) then
                 .window = 200000 | .source = "model-default"
-            else .window = null | .source = "unknown" end
+            else .window = null | .source = "unknown" end |
+            if ($no1m | ascii_downcase | IN("1", "true", "yes", "on"))
+               and (.source == "catalog" or .source == "model-1m") and .window > 200000
+            then .window = 200000 else . end
         end |
         {agent: $agent, session_id: $id, model: .model, thinking_effort: .thinking_effort,
          context_percent: (if (.usage | nonnegative) and (.window | positive)
