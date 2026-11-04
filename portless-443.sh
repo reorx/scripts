@@ -65,15 +65,24 @@ EOF
 
 listeners_443() { lsof -nP -iTCP:443 -sTCP:LISTEN -t 2>/dev/null | sort -u; }
 
-# A proxy someone started by hand with sudo holds 443; the daemon cannot bind until it is gone.
-stop_manual_proxy() {
+# Only a Portless proxy may hold 443 (one started by hand with sudo); checked before anything is written.
+check_443_holders() {
   local pid cmd
   for pid in $(listeners_443); do
     cmd=$(ps -o command= -p "$pid" || true)
     case "$cmd" in
-      *portless*"proxy start"*) echo "stopping hand-started proxy $pid: $cmd"; kill "$pid" ;;
+      *portless*"proxy start"*) ;;
       *) die "port 443 is held by something other than Portless (pid $pid: $cmd)" ;;
     esac
+  done
+}
+
+# The hand-started proxy holds 443; the daemon cannot bind until it is gone.
+stop_manual_proxy() {
+  local pid
+  for pid in $(listeners_443); do
+    echo "stopping hand-started proxy $pid: $(ps -o command= -p "$pid" || true)"
+    kill "$pid"
   done
   for _ in $(seq 1 20); do
     [ -z "$(listeners_443)" ] && return 0
@@ -90,9 +99,10 @@ wait_for_443() {
   die "the daemon did not start listening on 443; see $LOG"
 }
 
-install() {
+cmd_install() {
   require_root
   [ -x "$PORTLESS" ] || die "$PORTLESS not found; install Portless first"
+  check_443_holders
   local tmp
   tmp=$(mktemp)
   write_plist "$SUDO_USER" >"$tmp"
@@ -105,17 +115,17 @@ install() {
   stop_manual_proxy
   launchctl bootstrap system "$PLIST"
   wait_for_443
-  status
+  cmd_status
 }
 
-uninstall() {
+cmd_uninstall() {
   require_root
   launchctl bootout "system/$LABEL" 2>/dev/null || true
   rm -f "$PLIST"
   echo "removed $LABEL; proxies on other ports keep working"
 }
 
-status() {
+cmd_status() {
   if launchctl print "system/$LABEL" >/dev/null 2>&1; then
     launchctl print "system/$LABEL" | grep -E '^[[:space:]]+(state|pid|last exit code) =' | sed -E 's/^[[:space:]]+/launchd: /'
   else
@@ -129,9 +139,9 @@ status() {
 }
 
 case "${1:-}" in
-  install) install ;;
-  uninstall) uninstall ;;
-  status) status ;;
+  install) cmd_install ;;
+  uninstall) cmd_uninstall ;;
+  status) cmd_status ;;
   plist) write_plist "${SUDO_USER:-$(id -un)}" ;;
   *) echo "usage: $0 install|uninstall|status|plist" >&2; exit 64 ;;
 esac
