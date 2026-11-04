@@ -67,6 +67,11 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 - `brewer.py` (linked as `brewer`: `outdated`, `upgrade`, `whitelist`) looks only at formulae installed on request and levels each update by the first differing version segment (major / minor / patch, revision-only counts as patch). `upgrade` auto-upgrades `~/.config/brewer/whitelist`, reviews the remaining major/minor updates in a textual TUI (upgrade, whitelist or uninstall each, `i` for details; `--no-review` stops after the whitelist), and runs one `brew uninstall --formula` / `brew upgrade --formula` per formula, uninstalls first. brew subprocesses get `HOMEBREW_NO_ASK=1`: brew 7 otherwise stops at its own `[y/n]` prompt after the TUI already confirmed.
 - Outcomes, including formulae brew upgraded along the way, come from diffing `brew outdated` before and after, never from parsing brew's text output. Tests run against a fake `brew` first in PATH; run `uv run test_brewer.py` when changing it. PRD and design: `kb/plans/2026-10-27-brewer.md`.
 
+## Portless on 443
+
+- `portless-443.sh` (linked as `portless-443.sh`; `install`/`uninstall` need `sudo ~/.local/bin/portless-443.sh …`, sudo's PATH lacks `~/.local/bin`) keeps the machine-wide Portless proxy on 443 as the LaunchDaemon `local.portless.proxy-443`, so every project's `https://<name>.localhost` works without a port after reboots. The no-sudo proxy on 1355 keeps running beside it; both read the same routes in `~/.portless`.
+- The daemon is root but must act like `sudo portless proxy start --port 443`: Portless locates `~/.portless` through `SUDO_USER`/`HOME` and chowns what it writes to `SUDO_UID`/`SUDO_GID`, so the plist sets all four. Without them it would leave root-owned files in `~/.portless`. `install` stops a hand-started 443 Portless first and refuses if anything else holds 443. After upgrading Portless run `sudo launchctl kickstart -k system/local.portless.proxy-443`. Run `./test-portless-443.sh` when changing it (no root, never touches launchd).
+
 ## Documentation
 
 - To clean the HONOR ALI-AN00 phone, use `honor-cleanup.py` (preview by default; `--apply` uninstalls). Its device identity and third-party app whitelist live at the top of the script. Run `uv run test_honor_cleanup.py` when changing it.
