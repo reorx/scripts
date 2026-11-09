@@ -62,6 +62,10 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 
 - `skills/squash-docs/scripts/squash-docs.ts` folds linear runs of commits whose subject matches `--pattern` (default `docs:`) into one, reusing original trees and keeping merges; preview by default, `--apply` updates only the current branch behind a `refs/squash-docs-backup/` ref. It is the repo's only TypeScript script: Node >= 22.18, no dependencies, run `node test-squash-docs.ts` when changing it.
 
+## Mole cleanup review
+
+- `mole-review.py` uses `~/.config/mole-review/ignore-list` (`--ignore-list` to override) to hide paths from review. Space marks paths for deletion; `x` toggles ignoring only the current row, and `w` shows/hides ignored rows. Run `uv run test_mole_review.py` when changing it.
+
 ## Homebrew upgrades
 
 - `brewer.py` (linked as `brewer`: `outdated`, `upgrade`, `whitelist`) looks only at formulae installed on request and levels each update by the first differing version segment (major / minor / patch, revision-only counts as patch). `upgrade` auto-upgrades `~/.config/brewer/whitelist`, reviews the remaining major/minor updates in a textual TUI (upgrade, whitelist or uninstall each, `i` for details; `--no-review` stops after the whitelist), and runs one `brew uninstall --formula` / `brew upgrade --formula` per formula, uninstalls first. brew subprocesses get `HOMEBREW_NO_ASK=1`: brew 7 otherwise stops at its own `[y/n]` prompt after the TUI already confirmed.

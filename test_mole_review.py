@@ -137,51 +137,51 @@ class TestParseCleanList(unittest.TestCase):
         self.assertTrue(all(i.counted_under in paths for i in cl.items if i.counted_under))
 
 
-class TestWhitelist(unittest.TestCase):
+class TestIgnoreList(unittest.TestCase):
     def test_load_skips_comments_blanks_and_expands_home(self):
         with tempfile.TemporaryDirectory() as d:
-            f = Path(d) / 'whitelist'
+            f = Path(d) / 'ignore-list'
             f.write_text('# comment\n\n  ~/Library/Caches/pip  \n/abs/path\n')
-            patterns = mr.load_whitelist(f)
+            patterns = mr.load_ignore_list(f)
         self.assertEqual(patterns, [os.path.expanduser('~/Library/Caches/pip'), '/abs/path'])
 
     def test_load_missing_file_is_empty(self):
-        self.assertEqual(mr.load_whitelist(Path('/nonexistent/whitelist')), [])
+        self.assertEqual(mr.load_ignore_list(Path('/nonexistent/ignore-list')), [])
 
     def test_exact_match(self):
-        self.assertTrue(mr.is_whitelisted('/a/b', ['/a/b']))
-        self.assertTrue(mr.is_whitelisted('/a/b/', ['/a/b/']))
-        self.assertFalse(mr.is_whitelisted('/a/bc', ['/a/b']))
+        self.assertTrue(mr.is_ignored('/a/b', ['/a/b']))
+        self.assertTrue(mr.is_ignored('/a/b/', ['/a/b/']))
+        self.assertFalse(mr.is_ignored('/a/bc', ['/a/b']))
 
     def test_glob_star_crosses_slashes_like_bash(self):
-        self.assertTrue(mr.is_whitelisted('/Users/x/Library/Caches/foo', ['/Users/*/Library/Caches/foo']))
-        self.assertTrue(mr.is_whitelisted('/a/b/c/d', ['/a/*/d']))
+        self.assertTrue(mr.is_ignored('/Users/x/Library/Caches/foo', ['/Users/*/Library/Caches/foo']))
+        self.assertTrue(mr.is_ignored('/a/b/c/d', ['/a/*/d']))
 
     def test_child_of_plain_directory_pattern(self):
-        self.assertTrue(mr.is_whitelisted('/a/b/c', ['/a/b']))
+        self.assertTrue(mr.is_ignored('/a/b/c', ['/a/b']))
 
-    def test_child_of_glob_pattern_is_not_whitelisted(self):
-        self.assertFalse(mr.is_whitelisted('/a/bx/c', ['/a/b?']))
+    def test_child_of_glob_pattern_is_not_ignored(self):
+        self.assertFalse(mr.is_ignored('/a/bx/c', ['/a/b?']))
 
-    def test_parent_of_whitelisted_path_is_protected(self):
+    def test_parent_of_ignored_path_is_protected(self):
         # deleting the parent would take the protected child with it
-        self.assertTrue(mr.is_whitelisted('/a', ['/a/b/c']))
+        self.assertTrue(mr.is_ignored('/a', ['/a/b/c']))
 
     def test_matching_patterns_reports_which_lines_hit(self):
         self.assertEqual(mr.matching_patterns('/a/b/c', ['/x', '/a/b', '/a/*/c']), ['/a/b', '/a/*/c'])
 
     def test_add_creates_file_and_skips_duplicates(self):
         with tempfile.TemporaryDirectory() as d:
-            f = Path(d) / 'sub' / 'whitelist'
-            mr.add_to_whitelist(f, ['/a/b', '/c'])
-            mr.add_to_whitelist(f, ['/a/b'])
-            self.assertEqual(mr.load_whitelist(f), ['/a/b', '/c'])
+            f = Path(d) / 'sub' / 'ignore-list'
+            mr.add_to_ignore_list(f, ['/a/b', '/c'])
+            mr.add_to_ignore_list(f, ['/a/b'])
+            self.assertEqual(mr.load_ignore_list(f), ['/a/b', '/c'])
 
     def test_remove_only_drops_exact_lines(self):
         with tempfile.TemporaryDirectory() as d:
-            f = Path(d) / 'whitelist'
+            f = Path(d) / 'ignore-list'
             f.write_text('# keep me\n/a/b\n/a/*\n')
-            mr.remove_from_whitelist(f, ['/a/b'])
+            mr.remove_from_ignore_list(f, ['/a/b'])
             self.assertEqual(f.read_text(), '# keep me\n/a/*\n')
 
 
@@ -203,7 +203,7 @@ class TestView(unittest.TestCase):
         self.all_cats = set(self.cl.categories)
 
     def view(self, **kw):
-        args = dict(categories=self.all_cats, patterns=[], show_whitelisted=False, query='', sort_mode='size_desc')
+        args = dict(categories=self.all_cats, patterns=[], show_ignored=False, query='', sort_mode='size_desc')
         args.update(kw)
         return mr.filter_items(self.cl.items, **args)
 
@@ -222,10 +222,10 @@ class TestView(unittest.TestCase):
         got = {i.category for i in self.view(categories={'Browsers', 'Developer tools'})}
         self.assertEqual(got, {'Browsers', 'Developer tools'})
 
-    def test_whitelisted_hidden_by_default_and_shown_on_request(self):
+    def test_ignored_hidden_by_default_and_shown_on_request(self):
         patterns = ['/r/npm']
         self.assertFalse(any('/npm/' in i.path for i in self.view(patterns=patterns)))
-        shown = self.view(patterns=patterns, show_whitelisted=True)
+        shown = self.view(patterns=patterns, show_ignored=True)
         self.assertEqual(sum('/npm/' in i.path for i in shown), 3)
 
     def test_query_is_case_insensitive_substring(self):
@@ -506,13 +506,13 @@ class AppTestCase(unittest.IsolatedAsyncioTestCase):
             (p / 'data').write_text('x')
         self.list_path = self.root / 'clean-list.txt'
         self.list_path.write_text(text)
-        self.wl_path = self.root / 'config' / 'whitelist'
+        self.ignore_list_path = self.root / 'config' / 'ignore-list'
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def make_app(self):
-        return mr.MoleReviewApp(list_path=self.list_path, whitelist_path=self.wl_path)
+        return mr.MoleReviewApp(list_path=self.list_path, ignore_list_path=self.ignore_list_path)
 
     def p(self, rel):
         return str(self.root / rel)
@@ -568,9 +568,9 @@ class TestAppBrowse(AppTestCase):
             await pilot.pause()
             self.assertEqual(app.query_one(mr.SearchInput).value, 'dwsx')
             self.assertFalse(isinstance(app.screen, mr.ConfirmDelete))
-            self.assertFalse(app.show_whitelisted)
+            self.assertFalse(app.show_ignored)
             self.assertEqual(app.sort_mode, 'size_desc')
-            self.assertFalse(self.wl_path.exists())
+            self.assertFalse(self.ignore_list_path.exists())
 
     async def test_keys_right_after_slash_go_to_filter_even_when_batched(self):
         # a terminal can deliver '/' and the next keys in one read, before a deferred focus lands
@@ -584,7 +584,7 @@ class TestAppBrowse(AppTestCase):
             await pilot.pause()
             self.assertEqual(app.query_one(mr.SearchInput).value, 'dx')
             self.assertFalse(isinstance(app.screen, mr.ConfirmDelete))
-            self.assertFalse(self.wl_path.exists())
+            self.assertFalse(self.ignore_list_path.exists())
 
     async def test_slash_inside_filter_types_a_slash(self):
         app = self.make_app()
@@ -767,8 +767,8 @@ class TestAppDetailPanel(AppTestCase):
             self.assertEqual(lines[0], mr.display_path(child))
             self.assertIn(f'Counted under: {mr.display_path(self.p("Caches/Google"))}', lines[1])
 
-    async def test_whitelisted_by_is_a_labeled_value(self):
-        mr.add_to_whitelist(self.wl_path, [self.p('npm')])
+    async def test_ignored_by_is_a_labeled_value(self):
+        mr.add_to_ignore_list(self.ignore_list_path, [self.p('npm')])
         app = self.make_app()
         async with app.run_test(size=(160, 40)) as pilot:
             await pilot.press('w')
@@ -776,7 +776,7 @@ class TestAppDetailPanel(AppTestCase):
             target = self.p('npm/_cacache/content-v2')
             app.query_one(mr.ItemTable).move_cursor(row=[i.path for i in app.shown].index(target))
             await pilot.pause()
-            self.assertIn(f'Whitelisted by: {mr.display_path(self.p("npm"))}', self.lines(app)[1])
+            self.assertIn(f'Ignored by: {mr.display_path(self.p("npm"))}', self.lines(app)[1])
 
 
 class TestAppCopyPath(AppTestCase):
@@ -820,9 +820,9 @@ class TestAppCopyPath(AppTestCase):
                     osc52.assert_called_once_with(app.shown[0].path)
 
 
-class TestAppWhitelist(AppTestCase):
-    async def test_whitelisted_rows_hidden_then_shown_dimmed(self):
-        mr.add_to_whitelist(self.wl_path, [self.p('npm')])
+class TestAppIgnoreList(AppTestCase):
+    async def test_ignored_rows_hidden_then_shown_dimmed(self):
+        mr.add_to_ignore_list(self.ignore_list_path, [self.p('npm')])
         app = self.make_app()
         async with app.run_test(size=(160, 40)) as pilot:
             self.assertEqual(len(app.shown), 4)
@@ -835,32 +835,69 @@ class TestAppWhitelist(AppTestCase):
             normal = table.get_row(self.p('Caches/pip'))
             self.assertNotIn('dim', str(normal[-1].style))
 
-    async def test_x_adds_current_row_to_whitelist_and_hides_it(self):
+    async def test_x_adds_current_row_to_ignore_list_and_hides_it(self):
         app = self.make_app()
         async with app.run_test(size=(160, 40)) as pilot:
             top = app.shown[0].path
             await pilot.press('x')
             await pilot.pause()
-            self.assertEqual(mr.load_whitelist(self.wl_path), [top])
+            self.assertEqual(mr.load_ignore_list(self.ignore_list_path), [top])
             self.assertNotIn(top, [i.path for i in app.shown])
 
-    async def test_x_on_whitelisted_row_removes_it_from_whitelist(self):
+    async def test_x_only_ignores_current_row_with_multiple_delete_marks(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            table = app.query_one(mr.ItemTable)
+            # Use independent paths so ignore pattern ancestry cannot clear marks.
+            marked = {self.p('npm/empty'), self.p('Caches/pip')}
+            for path in marked:
+                table.move_cursor(row=next(n for n, i in enumerate(app.shown) if i.path == path))
+                await pilot.press('space')
+            target = self.p('npm/_cacache/content-v2')
+            table.move_cursor(row=next(n for n, i in enumerate(app.shown) if i.path == target))
+            await pilot.press('x')
+            self.assertEqual(mr.load_ignore_list(self.ignore_list_path), [target])
+            self.assertEqual(app.marked, marked)
+
+    async def test_x_on_ignored_row_removes_it_from_ignore_list(self):
         target = self.p('npm/_cacache/content-v2')
-        mr.add_to_whitelist(self.wl_path, [target])
+        mr.add_to_ignore_list(self.ignore_list_path, [target])
         app = self.make_app()
         async with app.run_test(size=(160, 40)) as pilot:
             await pilot.press('w')
             await pilot.pause()
-            # cursor stays on the previously focused row, move to the whitelisted one
+            # cursor stays on the previously focused row, move to the ignored one
             self.assertEqual(app.shown[0].path, target)
             app.query_one(mr.ItemTable).move_cursor(row=0)
             await pilot.press('x')
             await pilot.pause()
-            self.assertEqual(mr.load_whitelist(self.wl_path), [])
+            self.assertEqual(mr.load_ignore_list(self.ignore_list_path), [])
 
-    async def test_whitelisted_rows_cannot_be_marked(self):
+    async def test_x_unignores_current_row_while_preserving_delete_marks(self):
         target = self.p('npm/_cacache/content-v2')
-        mr.add_to_whitelist(self.wl_path, [target])
+        mr.add_to_ignore_list(self.ignore_list_path, [target])
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            table = app.query_one(mr.ItemTable)
+            marked = self.p('Caches/pip')
+            table.move_cursor(row=next(n for n, i in enumerate(app.shown) if i.path == marked))
+            await pilot.press('space', 'w')
+            table.move_cursor(row=next(n for n, i in enumerate(app.shown) if i.path == target))
+            await pilot.press('x')
+            self.assertEqual(mr.load_ignore_list(self.ignore_list_path), [])
+            self.assertEqual(app.marked, {marked})
+
+    async def test_ignoring_marked_current_row_clears_its_delete_mark(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            target = app.current_item().path
+            await pilot.press('space', 'up', 'x')
+            self.assertEqual(mr.load_ignore_list(self.ignore_list_path), [target])
+            self.assertNotIn(target, app.marked)
+
+    async def test_ignored_rows_cannot_be_marked(self):
+        target = self.p('npm/_cacache/content-v2')
+        mr.add_to_ignore_list(self.ignore_list_path, [target])
         app = self.make_app()
         async with app.run_test(size=(160, 40)) as pilot:
             await pilot.press('w')

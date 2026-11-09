@@ -10,7 +10,7 @@ mole-review - review Mole's cleanup preview (clean-list.txt) in a TUI
 Reads the list written by `mo clean --dry-run`, shows it by category sorted
 by size, and lets you mark entries and delete them in one go.
 
-A separate whitelist (~/.config/mole-review/whitelist) hides entries you have
+A separate ignore list (~/.config/mole-review/ignore-list) hides entries you have
 already reviewed and decided to keep. mole never reads it; the syntax and
 matching rules are the same as ~/.config/mole/whitelist, so lines can be
 copied over when you want mole itself to skip them too.
@@ -52,25 +52,25 @@ from textual.widgets.option_list import Option
 
 HOME = os.path.expanduser('~')
 DEFAULT_LIST = Path(HOME, '.config/mole/clean-list.txt')
-DEFAULT_WHITELIST = Path(HOME, '.config/mole-review/whitelist')
+DEFAULT_IGNORE_LIST = Path(HOME, '.config/mole-review/ignore-list')
 # mo always writes its preview to DEFAULT_LIST
 RESCAN_CMD = ['mo', 'clean', '--dry-run']
 
-WHITELIST_HEADER = (
-    '# mole-review whitelist: entries matching these patterns are hidden from review.\n'
+IGNORE_LIST_HEADER = (
+    '# mole-review ignore list: entries matching these patterns are hidden from review.\n'
     '# Same syntax as ~/.config/mole/whitelist (one path or glob per line), but mole never reads this file.\n'
 )
 
 KEYS_HELP = """\
 keys:
-  space   mark / unmark row             a      mark / unmark all shown rows
-  d       delete marked (or current)    x      whitelist current/marked, or un-whitelist
-  w       show / hide whitelisted       s      cycle sort: size desc, size asc, path
+  space   mark / unmark for deletion    a      mark / unmark all shown rows
+  d       delete marked (or current)    x      ignore / unignore current row
+  w       show / hide ignored           s      cycle sort: size desc, size asc, path
   1-9     show one category             0      show all categories
   enter   (in sidebar) show category    tab    switch sidebar / table
   /       filter by path                esc    clear filter
-  o       reveal in Finder              e      edit whitelist in $EDITOR
-  c       copy full path                r      reload list and whitelist
+  o       reveal in Finder              e      edit ignore list in $EDITOR
+  c       copy full path                r      reload list and ignore list
   q       quit
 """
 
@@ -174,7 +174,7 @@ def parse_clean_list(text: str) -> CleanList:
     return cl
 
 
-# --- whitelist ---------------------------------------------------------------
+# --- ignore list ---------------------------------------------------------------
 
 
 def expand_pattern(line: str) -> str:
@@ -187,7 +187,7 @@ def normalize_path(p: str) -> str:
     return p.rstrip('/') or '/'
 
 
-def load_whitelist(path: Path) -> list[str]:
+def load_ignore_list(path: Path) -> list[str]:
     if not path.exists():
         return []
     patterns = []
@@ -217,23 +217,23 @@ def matching_patterns(path: str, patterns: list[str]) -> list[str]:
     return [p for p in patterns if pattern_hits(path, p)]
 
 
-def is_whitelisted(path: str, patterns: list[str]) -> bool:
+def is_ignored(path: str, patterns: list[str]) -> bool:
     return any(pattern_hits(path, p) for p in patterns)
 
 
-def add_to_whitelist(path: Path, entries: list[str]) -> None:
-    existing = set(load_whitelist(path))
+def add_to_ignore_list(path: Path, entries: list[str]) -> None:
+    existing = set(load_ignore_list(path))
     new = [e for e in dict.fromkeys(entries) if e not in existing]
     if not new:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    text = path.read_text() if path.exists() else WHITELIST_HEADER
+    text = path.read_text() if path.exists() else IGNORE_LIST_HEADER
     if text and not text.endswith('\n'):
         text += '\n'
     path.write_text(text + ''.join(f'{e}\n' for e in new))
 
 
-def remove_from_whitelist(path: Path, entries: list[str]) -> None:
+def remove_from_ignore_list(path: Path, entries: list[str]) -> None:
     targets = set(entries)
     lines = path.read_text().splitlines(keepends=True)
     path.write_text(''.join(line for line in lines if expand_pattern(line.strip()) not in targets))
@@ -265,7 +265,7 @@ def filter_items(
     items: list[Item],
     categories: set[str],
     patterns: list[str],
-    show_whitelisted: bool,
+    show_ignored: bool,
     query: str,
     sort_mode: str,
 ) -> list[Item]:
@@ -275,7 +275,7 @@ def filter_items(
         for i in items
         if i.category in categories
         and (not q or q in i.path.lower())
-        and (show_whitelisted or not is_whitelisted(i.path, patterns))
+        and (show_ignored or not is_ignored(i.path, patterns))
     ]
     if sort_mode == 'path':
         shown.sort(key=lambda i: i.path)
@@ -501,12 +501,12 @@ class ConfirmDelete(ModalScreen[bool]):
 
 # actions defined here, disabled while a modal is open so keys don't leak through it
 APP_ACTIONS = {
-    'toggle_mark', 'mark_all', 'delete', 'toggle_whitelist', 'toggle_show_whitelisted',
+    'toggle_mark', 'mark_all', 'delete', 'toggle_ignore_list', 'toggle_show_ignored',
     'cycle_sort', 'select_category', 'all_categories', 'focus_search',
-    'clear_search', 'reveal', 'copy_path', 'edit_whitelist', 'reload',
+    'clear_search', 'reveal', 'copy_path', 'edit_ignore_list', 'reload',
 }  # fmt: skip
 # quitting mid-batch would leave the delete thread without an app to report to
-BUSY_ACTIONS = {'delete', 'toggle_whitelist', 'edit_whitelist', 'reload', 'quit'}
+BUSY_ACTIONS = {'delete', 'toggle_ignore_list', 'edit_ignore_list', 'reload', 'quit'}
 
 
 class MoleReviewApp(App):
@@ -543,33 +543,33 @@ class MoleReviewApp(App):
     BINDINGS = [
         Binding('d', 'delete', 'Delete'),
         Binding('a', 'mark_all', 'Mark all'),
-        Binding('x', 'toggle_whitelist', 'Whitelist ±'),
-        Binding('w', 'toggle_show_whitelisted', 'Show WL'),
+        Binding('x', 'toggle_ignore_list', 'Ignore ±'),
+        Binding('w', 'toggle_show_ignored', 'Show ignored'),
         Binding('s', 'cycle_sort', 'Sort'),
         # priority: handled in the app's queue so the keys right after it already reach the filter
         Binding('slash', 'focus_search', 'Filter', priority=True),
         Binding('o', 'reveal', 'Finder'),
         Binding('c', 'copy_path', 'Copy path', show=False),
-        Binding('e', 'edit_whitelist', 'Edit WL'),
+        Binding('e', 'edit_ignore_list', 'Edit ignores'),
         Binding('r', 'reload', 'Reload'),
         Binding('q', 'quit', 'Quit'),
         Binding('0', 'all_categories', 'All cats', show=False),
         *[Binding(str(n), f'select_category({n - 1})', show=False) for n in range(1, 10)],
     ]
 
-    def __init__(self, list_path: Path, whitelist_path: Path):
+    def __init__(self, list_path: Path, ignore_list_path: Path):
         super().__init__()
         self.list_path = list_path
-        self.whitelist_path = whitelist_path
-        self.log_path = whitelist_path.parent / 'deleted.log'
+        self.ignore_list_path = ignore_list_path
+        self.log_path = ignore_list_path.parent / 'deleted.log'
         self.clean_list = CleanList()
         self.items: list[Item] = []
         self.gone = 0
         self.patterns: list[str] = []
-        self.wl_paths: set[str] = set()
+        self.ignored_paths: set[str] = set()
         self.marked: set[str] = set()
         self.shown: list[Item] = []
-        self.show_whitelisted = False
+        self.show_ignored = False
         self.sort_mode = 'size_desc'
         self.category: str | None = None  # None shows all categories
         self.deleting = False
@@ -621,10 +621,10 @@ class MoleReviewApp(App):
         self.load_patterns()
 
     def load_patterns(self) -> None:
-        self.patterns = load_whitelist(self.whitelist_path)
-        self.wl_paths = {i.path for i in self.items if is_whitelisted(i.path, self.patterns)}
+        self.patterns = load_ignore_list(self.ignore_list_path)
+        self.ignored_paths = {i.path for i in self.items if is_ignored(i.path, self.patterns)}
         paths = {i.path for i in self.items}
-        self.marked = {p for p in self.marked if p in paths and p not in self.wl_paths}
+        self.marked = {p for p in self.marked if p in paths and p not in self.ignored_paths}
         self.rebuild_categories()
         self.refresh_table()
 
@@ -663,7 +663,7 @@ class MoleReviewApp(App):
         cats = self.clean_list.categories
         if self.category not in cats:
             self.category = None
-        groups = {c: filter_items(self.items, {c}, self.patterns, self.show_whitelisted, '', 'path') for c in cats}
+        groups = {c: filter_items(self.items, {c}, self.patterns, self.show_ignored, '', 'path') for c in cats}
         sizes = {c: total_size(items) for c, items in groups.items()}
         grand = sum(sizes.values())
         summary = self.summary_text()
@@ -710,7 +710,7 @@ class MoleReviewApp(App):
         self.focus_now(table)
 
     def render_row(self, item: Item) -> list[Text]:
-        if item.path in self.wl_paths:
+        if item.path in self.ignored_paths:
             return [
                 Text('◦', style='dim'),
                 Text(item.size_text, style='dim', justify='right'),
@@ -736,7 +736,7 @@ class MoleReviewApp(App):
             self.items,
             self.selected_categories(),
             self.patterns,
-            self.show_whitelisted,
+            self.show_ignored,
             self.query_one(SearchInput).value,
             self.sort_mode,
         )
@@ -756,18 +756,18 @@ class MoleReviewApp(App):
             table.update_cell(item.path, key, value)
 
     def summary_text(self) -> Text:
-        wl_items = [i for i in self.items if i.path in self.wl_paths]
+        ignored_items = [i for i in self.items if i.path in self.ignored_paths]
         rows = [
             ('mole says', self.clean_list.potential.replace('At least ', '≥')),
             ('dedup', format_size(total_size(self.items))),  # nested paths counted once
             ('entries', str(len(self.items))),
             ('gone', str(self.gone)),  # listed but no longer on disk
-            ('whitelist', f'{len(wl_items)} · {format_size(total_size(wl_items))}'),
+            ('ignore list', f'{len(ignored_items)} · {format_size(total_size(ignored_items))}'),
             ('patterns', str(len(self.patterns))),
         ]
         text = Text()
         for n, (label, value) in enumerate(rows):
-            text.append(('\n' if n else '') + f'{label:<10}', style='bold')
+            text.append(('\n' if n else '') + f'{label:<12}', style='bold')
             text.append(value)
         return text
 
@@ -783,7 +783,7 @@ class MoleReviewApp(App):
         text.append('  │  ', style='dim')
         text.append(f'sort {SORT_LABELS[self.sort_mode]}')
         text.append('  │  ', style='dim')
-        text.append(f'whitelisted {"shown (dim)" if self.show_whitelisted else "hidden"}')
+        text.append(f'ignored {"shown (dim)" if self.show_ignored else "hidden"}')
         self.query_one('#status', Static).update(text)
 
     def update_detail(self) -> None:
@@ -794,9 +794,9 @@ class MoleReviewApp(App):
             fields = [('Category', item.category, 'cyan'), ('Size', item.size_text, 'yellow')]
             if item.count > 1:
                 fields.append(('Items', str(item.count), ''))
-            hits = matching_patterns(item.path, self.patterns) if item.path in self.wl_paths else []
+            hits = matching_patterns(item.path, self.patterns) if item.path in self.ignored_paths else []
             if hits:
-                fields.append(('Whitelisted by', ', '.join(display_path(h) for h in hits), 'yellow'))
+                fields.append(('Ignored by', ', '.join(display_path(h) for h in hits), 'yellow'))
             parent = item.counted_under or listed_ancestor(item.path, {i.path for i in self.items})
             if parent:
                 fields.append(('Counted under', display_path(parent), 'cyan'))
@@ -836,8 +836,8 @@ class MoleReviewApp(App):
         item = self.current_item()
         if item is None:
             return
-        if item.path in self.wl_paths:
-            self.notify('Whitelisted entries cannot be marked, press x to un-whitelist first', severity='warning')
+        if item.path in self.ignored_paths:
+            self.notify('Ignored entries cannot be marked, press x to unignore first', severity='warning')
             return
         self.marked ^= {item.path}
         self.update_row(item)
@@ -845,7 +845,7 @@ class MoleReviewApp(App):
         self.query_one(ItemTable).action_cursor_down()
 
     def action_mark_all(self) -> None:
-        markable = {i.path for i in self.shown if i.path not in self.wl_paths}
+        markable = {i.path for i in self.shown if i.path not in self.ignored_paths}
         if markable and markable <= self.marked:
             self.marked -= markable
         else:
@@ -880,38 +880,35 @@ class MoleReviewApp(App):
         self.query_one(SearchInput).value = ''
         self.focus_now(self.query_one(ItemTable))
 
-    def action_toggle_show_whitelisted(self) -> None:
-        self.show_whitelisted = not self.show_whitelisted
+    def action_toggle_show_ignored(self) -> None:
+        self.show_ignored = not self.show_ignored
         self.rebuild_categories()
         self.refresh_table()
 
-    def action_toggle_whitelist(self) -> None:
+    def action_toggle_ignore_list(self) -> None:
         item = self.current_item()
-        if self.marked:
-            add_to_whitelist(self.whitelist_path, sorted(self.marked))
-            self.notify(f'Whitelisted {len(self.marked)} marked entries')
-        elif item is None:
+        if item is None:
             return
-        elif item.path in self.wl_paths:
-            self.unwhitelist(item)
+        elif item.path in self.ignored_paths:
+            self.unignore(item)
         else:
-            add_to_whitelist(self.whitelist_path, [item.path])
-            self.notify(f'Whitelisted {display_path(item.path)}')
+            add_to_ignore_list(self.ignore_list_path, [item.path])
+            self.notify(f'Ignored {display_path(item.path)}')
         self.load_patterns()
 
-    def unwhitelist(self, item: Item) -> None:
+    def unignore(self, item: Item) -> None:
         hits = matching_patterns(item.path, self.patterns)
         exact = [h for h in hits if normalize_path(h) == normalize_path(item.path)]
         if exact:
-            remove_from_whitelist(self.whitelist_path, exact)
+            remove_from_ignore_list(self.ignore_list_path, exact)
         rest = [h for h in hits if h not in exact]
         if rest:
             self.notify(
-                f'Still whitelisted by: {", ".join(display_path(h) for h in rest)} (press e to edit)',
+                f'Still ignored by: {", ".join(display_path(h) for h in rest)} (press e to edit)',
                 severity='warning',
             )
         else:
-            self.notify(f'Removed {display_path(item.path)} from whitelist')
+            self.notify(f'Removed {display_path(item.path)} from ignore list')
 
     def action_reveal(self) -> None:
         item = self.current_item()
@@ -931,13 +928,13 @@ class MoleReviewApp(App):
             self.copy_to_clipboard(item.path)  # OSC 52, needs terminal support
         self.notify(f'Copied {item.path}')
 
-    def action_edit_whitelist(self) -> None:
-        if not self.whitelist_path.exists():
-            self.whitelist_path.parent.mkdir(parents=True, exist_ok=True)
-            self.whitelist_path.write_text(WHITELIST_HEADER)
+    def action_edit_ignore_list(self) -> None:
+        if not self.ignore_list_path.exists():
+            self.ignore_list_path.parent.mkdir(parents=True, exist_ok=True)
+            self.ignore_list_path.write_text(IGNORE_LIST_HEADER)
         editor = os.environ.get('VISUAL') or os.environ.get('EDITOR') or 'vi'
         with self.suspend():
-            subprocess.run([*shlex.split(editor), str(self.whitelist_path)], check=False)
+            subprocess.run([*shlex.split(editor), str(self.ignore_list_path)], check=False)
         self.load_patterns()
 
     def action_reload(self) -> None:
@@ -948,7 +945,7 @@ class MoleReviewApp(App):
         targets = [i for i in self.items if i.path in self.marked]
         if not targets:
             item = self.current_item()
-            if item is None or item.path in self.wl_paths:
+            if item is None or item.path in self.ignored_paths:
                 return
             targets = [item]
         self.push_screen(ConfirmDelete(targets), lambda ok: self.start_delete(targets) if ok else None)
@@ -1016,7 +1013,7 @@ def main() -> None:
         'list', nargs='?', type=Path, default=DEFAULT_LIST, help=f'clean list file (default: {DEFAULT_LIST})'
     )
     parser.add_argument(
-        '--whitelist', type=Path, default=DEFAULT_WHITELIST, help=f'review whitelist (default: {DEFAULT_WHITELIST})'
+        '--ignore-list', type=Path, default=DEFAULT_IGNORE_LIST, help=f'review ignore list (default: {DEFAULT_IGNORE_LIST})'
     )
     parser.add_argument(
         '--rescan', action='store_true', help=f'run `{shlex.join(RESCAN_CMD)}` first to regenerate the list'
@@ -1038,7 +1035,7 @@ def main() -> None:
             sys.exit(code if code > 0 else 128 - code)
     if not args.list.exists():
         sys.exit(f'{args.list} not found, generate it with: mo clean --dry-run')
-    MoleReviewApp(args.list, args.whitelist).run()
+    MoleReviewApp(args.list, args.ignore_list).run()
 
 
 if __name__ == '__main__':
