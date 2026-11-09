@@ -64,7 +64,7 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 
 ## Mole cleanup review
 
-- `mole-review.py` uses `~/.config/mole-review/ignore-list` (`--ignore-list` to override) to hide paths from review. Space marks paths for deletion; `x` toggles ignoring only the current row, and `w` shows/hides ignored rows. Run `uv run test_mole_review.py` when changing it.
+- `mole-review.py` shares `~/.config/mole/whitelist` with Mole (`--whitelist` overrides it): edits also affect `mo clean`. Initialize missing shared config with `mo clean --whitelist` and save before review, preserving Mole's optional defaults. Space marks deletion; `x` toggles only the current row's protection; `w` shows/hides protected rows. The default deletion log stays at `~/.config/mole-review/deleted.log`. Run `uv run test_mole_review.py` when changing it.
 
 ## Homebrew upgrades
 
