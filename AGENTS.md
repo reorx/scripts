@@ -76,6 +76,11 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 - `portless-443.sh` (linked as `portless-443.sh`; `install`/`uninstall` need `sudo ~/.local/bin/portless-443.sh …`, sudo's PATH lacks `~/.local/bin`) keeps the machine-wide Portless proxy on 443 as the LaunchDaemon `local.portless.proxy-443`, so every project's `https://<name>.localhost` works without a port after reboots. The no-sudo proxy on 1355 keeps running beside it; both read the same routes in `~/.portless`.
 - The daemon is root but must act like `sudo portless proxy start --port 443`: Portless locates `~/.portless` through `SUDO_USER`/`HOME` and chowns what it writes to `SUDO_UID`/`SUDO_GID`, so the plist sets all four. Without them it would leave root-owned files in `~/.portless`. `install` refuses before writing anything if something other than Portless holds 443, then stops the hand-started 443 Portless. Subcommands are `cmd_*` functions: one named `install` shadowed install(1) and recursed forever. After upgrading Portless run `sudo launchctl kickstart -k system/local.portless.proxy-443`. Run `./test-portless-443.sh` when changing it: no root, never touches launchd; `install` runs end to end against fakes in PATH with a 20 s watchdog.
 
+## Repo charts
+
+- `repocharts.py [path] -b day|week|month` prints two bar charts on one time axis: non-merge commits per bucket by author date, then lines of code at the end of each bucket. The line count is the running numstat sum along HEAD's first-parent chain, with merges diffed against their first parent, by committer date, so the last total equals the text lines at HEAD. Binary files and lockfiles are left out (`--with-lockfiles`, `-x GLOB`).
+- The numstat walk runs with `GIT_NO_LAZY_FETCH=1`. In a partial clone git would otherwise fetch missing blobs one commit at a time (minutes, and it fills the clone), so there the line chart is replaced by a `git backfill` hint. Run `uv run test_repocharts.py` when changing it.
+
 ## Documentation
 
 - To clean the HONOR ALI-AN00 phone, use `honor-cleanup.py` (preview by default; `--apply` uninstalls). Its device identity and third-party app whitelist live at the top of the script. Run `uv run test_honor_cleanup.py` when changing it.

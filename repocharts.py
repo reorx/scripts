@@ -1,0 +1,386 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.12"
+# dependencies = []
+# ///
+"""Bar charts of a git repo in the terminal: commits and lines of code per day, week or month.
+
+Two charts share one time axis, so their columns line up:
+
+  1. commits per bucket: non-merge commits reachable from HEAD, by author date
+  2. lines of code at the end of each bucket: the running sum of added minus
+     deleted lines along the first-parent chain of HEAD, by committer date.
+     Merges count with their diff against the first parent, so a merged
+     branch's lines land on the day of the merge and the final total equals
+     the text lines at HEAD. Binary files and lockfiles are left out.
+
+    repocharts.py                   # this repo, by week, as much history as fits
+    repocharts.py -b day -n 30      # the last 30 days
+    repocharts.py ~/Code/x -b month # another repo, by month
+    repocharts.py -x 'vendor/*'     # leave more files out of the line count
+"""
+
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+from collections import Counter
+from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from fnmatch import fnmatchcase
+from pathlib import Path
+
+GRANULARITIES = ('day', 'week', 'month')
+# Generated dependency pins, not code; matched against file names.
+LOCKFILES = (
+    '*.lock',
+    'package-lock.json',
+    'npm-shrinkwrap.json',
+    'pnpm-lock.yaml',
+    'go.sum',
+    'Package.resolved',
+)
+BLOCKS = ' ▁▂▃▄▅▆▇█'
+GUTTER = 4  # width of the y-axis labels; compact() never needs more
+MAX_COL = 3  # widest column per bucket: a 2-cell bar plus a 1-cell gap
+BOLD, DIM, GREEN, CYAN = '1', '2', '32', '36'
+
+
+class RepoError(Exception):
+    pass
+
+
+@dataclass
+class Series:
+    starts: list[date]
+    commits: list[int]
+    loc: list[int]
+    loc_before: int  # lines of code just before the first bucket
+
+
+class Paint:
+    def __init__(self, enabled):
+        self.enabled = enabled
+
+    def __call__(self, text, code):
+        return f'\033[{code}m{text}\033[0m' if self.enabled and text else text
+
+
+# Buckets ---------------------------------------------------------------------
+
+
+def bucket_start(day: date, by: str) -> date:
+    if by == 'week':
+        return day - timedelta(days=day.weekday())
+    if by == 'month':
+        return day.replace(day=1)
+    return day
+
+
+def shift(start: date, by: str, k: int) -> date:
+    """Move a bucket start by k buckets (k may be negative)."""
+    if by == 'day':
+        return start + timedelta(days=k)
+    if by == 'week':
+        return start + timedelta(weeks=k)
+    months = start.year * 12 + start.month - 1 + k
+    return date(months // 12, months % 12 + 1, 1)
+
+
+def count_periods(first: date, last: date, by: str) -> int:
+    """Number of buckets from first to last bucket start, both included."""
+    if by == 'day':
+        return (last - first).days + 1
+    if by == 'week':
+        return (last - first).days // 7 + 1
+    return (last.year - first.year) * 12 + last.month - first.month + 1
+
+
+# Git -------------------------------------------------------------------------
+
+
+def git(repo: Path, *args: str, env=None) -> str:
+    result = subprocess.run(
+        ['git', '-C', str(repo), *args],
+        env={**os.environ, **(env or {})},
+        capture_output=True,
+        text=True,
+        encoding='utf-8',
+        errors='replace',
+        check=True,
+    )
+    return result.stdout
+
+
+def has_commits(repo: Path) -> bool:
+    result = subprocess.run(['git', '-C', str(repo), 'rev-parse', '--verify', '-q', 'HEAD'], capture_output=True)
+    return result.returncode == 0
+
+
+def is_partial_clone(repo: Path) -> bool:
+    result = subprocess.run(
+        ['git', '-C', str(repo), 'config', '--get-regexp', r'^remote\..*\.promisor$'], capture_output=True, text=True
+    )
+    return any(line.split()[-1] == 'true' for line in result.stdout.splitlines())
+
+
+def local_day(timestamp: str) -> date:
+    return datetime.fromtimestamp(int(timestamp)).date()
+
+
+def read_commit_days(repo: Path) -> list[date]:
+    """Author day of every non-merge commit reachable from HEAD."""
+    out = git(repo, 'log', '--no-merges', '--format=%at', 'HEAD')
+    return [local_day(ts) for ts in out.split()]
+
+
+def is_excluded(path: str, patterns) -> bool:
+    name = path.rsplit('/', 1)[-1]
+    return any(fnmatchcase(path, p) or fnmatchcase(name, p) for p in patterns)
+
+
+def read_loc_changes(repo: Path, excludes) -> list[tuple[date, int]]:
+    """(committer day, added - deleted lines) for each first-parent commit of HEAD, newest first.
+
+    Lazy fetching is off: in a partial clone git would otherwise download missing
+    blobs one commit at a time, so a missing blob fails the call instead.
+    """
+    out = git(
+        repo,
+        '-c',
+        'core.quotePath=false',
+        'log',
+        '--first-parent',
+        '--diff-merges=first-parent',
+        '--root',
+        '--no-renames',
+        '--no-relative',
+        '--no-color',
+        '--numstat',
+        '--format=@%ct',
+        'HEAD',
+        env={'GIT_NO_LAZY_FETCH': '1'},
+    )
+    changes = []
+    for line in out.splitlines():
+        if line.startswith('@'):
+            changes.append([local_day(line[1:]), 0])
+            continue
+        if '\t' not in line:
+            continue
+        added, deleted, path = line.split('\t', 2)
+        if added == '-' or is_excluded(path.strip('"'), excludes):  # '-' marks a binary file
+            continue
+        changes[-1][1] += int(added) - int(deleted)
+    return [(day, delta) for day, delta in changes]
+
+
+# Series ----------------------------------------------------------------------
+
+
+def build_series(commit_days, loc_changes, by: str, end: date, n: int) -> Series:
+    """The n buckets ending with the one that starts at `end`."""
+    starts = [shift(end, by, i - n + 1) for i in range(n)]
+    commits = Counter(bucket_start(day, by) for day in commit_days)
+    deltas = Counter()
+    for day, delta in loc_changes:
+        deltas[bucket_start(day, by)] += delta
+    loc_before = sum(delta for start, delta in deltas.items() if start < starts[0])
+    loc, total = [], loc_before
+    for start in starts:
+        total += deltas[start]
+        loc.append(total)
+    return Series(starts, [commits[start] for start in starts], loc, loc_before)
+
+
+# Rendering -------------------------------------------------------------------
+
+
+def compact(n: int) -> str:
+    value, unit = float(n), ''
+    for next_unit in ('k', 'M', 'G'):
+        if round(value) < 1000:
+            break
+        value, unit = value / 1000, next_unit
+    if not unit:
+        return str(n)
+    return f'{value:.1f}{unit}' if value < 9.95 else f'{value:.0f}{unit}'
+
+
+def bar_rows(values, height: int, col: int) -> list[str]:
+    """Rows top to bottom; each bucket takes `col` cells, the last one a gap when col > 1."""
+    bar, gap = (col - 1, 1) if col > 1 else (1, 0)
+    top = max(values, default=0)
+    # Bar heights in eighths of a row; any nonzero value gets at least one.
+    levels = [max(1, round(v * height * 8 / top)) if v > 0 and top > 0 else 0 for v in values]
+    rows = []
+    for r in reversed(range(height)):
+        cells = (BLOCKS[min(8, max(0, level - r * 8))] * bar + ' ' * gap for level in levels)
+        rows.append(''.join(cells).rstrip())
+    return rows
+
+
+def x_axis(starts: list[date], by: str, col: int) -> tuple[str, str]:
+    """The axis line with a tick under each label, and the label line.
+
+    Labels are placed left to right wherever they fit two cells after the previous one.
+    Day and week labels are MM-DD, with the year on the first one and wherever it changes.
+    """
+    width = len(starts) * col
+    ticks = ['─'] * width
+    labels = ''
+    year = None
+    for i, start in enumerate(starts):
+        offset = i * col
+        if labels and offset < len(labels) + 2:
+            continue
+        if by == 'month':
+            text = start.strftime('%Y-%m')
+        else:
+            text = start.strftime('%m-%d' if start.year == year else '%Y-%m-%d')
+        if labels and offset + len(text) > width:
+            break
+        labels = labels.ljust(offset) + text
+        ticks[offset] = '┬'
+        year = start.year
+    return ''.join(ticks), labels
+
+
+def render_chart(title: str, values, starts, by: str, height: int, col: int, color: str, paint: Paint) -> list[str]:
+    top = max(max(values, default=0), 0)
+    lines = [title]
+    for i, row in enumerate(bar_rows(values, height, col)):
+        label, edge = (compact(top), '┤') if i == 0 else ('', '│')
+        lines.append(paint(f'{label:>{GUTTER}} {edge}', DIM) + paint(row, color))
+    ticks, labels = x_axis(starts, by, col)
+    lines.append(paint(f'{"0":>{GUTTER}} └{ticks}', DIM))
+    lines.append(paint(f'{"":>{GUTTER}}  {labels}', DIM))
+    return lines
+
+
+def plural(n: int, unit: str) -> str:
+    return f'{n} {unit}' if n == 1 else f'{n} {unit}s'
+
+
+def commits_title(series: Series, by: str, paint: Paint) -> str:
+    return (
+        paint(f'Commits per {by}', BOLD)
+        + f' · {sum(series.commits):,} in {plural(len(series.starts), by)} · peak {max(series.commits):,}'
+    )
+
+
+def loc_title(series: Series, excluded: list[str], paint: Paint) -> str:
+    after = series.loc[-1]
+    title = paint('Lines of code', BOLD) + f' · {series.loc_before:,} → {after:,} ({after - series.loc_before:+,})'
+    if excluded:
+        title += paint(f' · excluding {", ".join(excluded)}', DIM)
+    return title
+
+
+# Main ------------------------------------------------------------------------
+
+
+def positive_int(text: str) -> int:
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError(f'must be at least 1: {text}')
+    return value
+
+
+def parse_args(argv):
+    parser = argparse.ArgumentParser(
+        prog='repocharts',
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument('path', nargs='?', default='.', help='any directory inside the repo (default: .)')
+    parser.add_argument('-b', '--by', choices=GRANULARITIES, default='week', help='bucket size (default: week)')
+    parser.add_argument(
+        '-n',
+        '--last',
+        type=positive_int,
+        metavar='N',
+        help='show the last N buckets (default: the whole history, or as much as fits the terminal)',
+    )
+    parser.add_argument('--height', type=positive_int, default=8, help='rows per chart (default: 8; 1 is a sparkline)')
+    parser.add_argument(
+        '-x',
+        '--exclude',
+        action='append',
+        default=[],
+        metavar='GLOB',
+        help='leave matching files out of the line count; matched against the path and the file name; repeatable',
+    )
+    parser.add_argument(
+        '--with-lockfiles',
+        action='store_true',
+        help=f'count lockfiles as code ({", ".join(LOCKFILES)})',
+    )
+    parser.add_argument('--no-color', action='store_true', help='plain output (also when NO_COLOR is set)')
+    return parser.parse_args(argv)
+
+
+def run(args) -> None:
+    repo = Path(args.path).expanduser()
+    top = Path(git(repo, 'rev-parse', '--show-toplevel').strip())
+    if not has_commits(repo):
+        raise RepoError(f'{top}: no commits yet')
+    by = args.by
+    excludes = [*([] if args.with_lockfiles else LOCKFILES), *args.exclude]
+    commit_days = read_commit_days(repo)
+    try:
+        loc_changes = read_loc_changes(repo, excludes)
+    except subprocess.CalledProcessError:
+        if not is_partial_clone(repo):
+            raise
+        loc_changes = None
+
+    days = [*commit_days, *(day for day, _ in loc_changes or [])]
+    last_day = max(date.today(), *days)
+    end = bucket_start(last_day, by)
+    avail = max(10, shutil.get_terminal_size().columns - GUTTER - 3)
+    n = args.last or count_periods(bucket_start(min(days), by), end, by)
+    if n > avail:
+        if args.last:
+            print(f'repocharts: the terminal fits {plural(avail, by)}; showing the last {avail}', file=sys.stderr)
+        n = avail
+    col = max(1, min(MAX_COL, avail // n))
+    series = build_series(commit_days, loc_changes or [], by, end, n)
+
+    paint = Paint(not args.no_color and not os.environ.get('NO_COLOR') and sys.stdout.isatty())
+    excluded = [*([] if args.with_lockfiles else ['lockfiles']), *args.exclude]
+    if loc_changes is None:
+        loc_block = [
+            paint('Lines of code', BOLD) + ' · skipped: this is a partial clone, past file versions are not local',
+            paint(f'{"":>{GUTTER}}  `git -C {top} backfill` downloads them in batches (can be large); then rerun', DIM),
+        ]
+    else:
+        loc_block = render_chart(
+            loc_title(series, excluded, paint), series.loc, series.starts, by, args.height, col, CYAN, paint
+        )
+    blocks = [
+        [paint(top.name, BOLD) + f' · by {by} · {series.starts[0]} → {last_day}'],
+        render_chart(
+            commits_title(series, by, paint), series.commits, series.starts, by, args.height, col, GREEN, paint
+        ),
+        loc_block,
+    ]
+    print('\n\n'.join('\n'.join(block) for block in blocks))
+
+
+def main(argv=None) -> int:
+    args = parse_args(argv)
+    try:
+        run(args)
+    except subprocess.CalledProcessError as e:
+        print(e.stderr.strip() or str(e), file=sys.stderr)
+        return 1
+    except RepoError as e:
+        print(f'repocharts: {e}', file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
