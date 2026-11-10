@@ -32,18 +32,79 @@ spec.loader.exec_module(cp)
 # A stand-in for claude: logs its argv and a few env vars, builds a request shaped like
 # Claude Code 2.1.311's first request from its flags and env, and POSTs it to
 # $ANTHROPIC_BASE_URL. Like the real CLI, only the last --settings counts.
+#
+# Without -p it acts like the TUI of 2.1.321: it needs a tty, drops what is typed before
+# its prompt is drawn, takes text arriving together with Enter as a paste (a newline, not
+# a submit), sends a quota check (no system) at startup and, after a submit, the first
+# request with deferred tools, then a fallback request with every tool in full. It keeps
+# running, with a child process standing in for an MCP server, until it is killed.
 FAKE_CLAUDE = """\
 #!{python}
-import json, os, sys, urllib.error, urllib.request
+import json, os, subprocess, sys, time, urllib.error, urllib.request
 
 args = sys.argv[1:]
 env = os.environ
-watched = ['ANTHROPIC_BASE_URL', 'CLAUDE_CODE_ARTIFACT', 'CLAUDE_CODE_DISABLE_ARTIFACT', 'HERDR_PANE_ID', 'FOO_VIA']
-with open(env['FAKE_CLAUDE_LOG'], 'a') as f:
-    f.write(json.dumps({{'args': args, 'cwd': os.getcwd(), 'env': {{k: env.get(k) for k in watched}}}}) + '\\n')
+interactive = '-p' not in args
+watched = [
+    'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_ARTIFACT', 'CLAUDE_CODE_DISABLE_ARTIFACT', 'HERDR_PANE_ID', 'FOO_VIA',
+    'CLAUDECODE', 'CLAUDE_CODE_CHILD_SESSION', 'CLAUDE_CODE_SKIP_PROMPT_HISTORY',
+]
+call = {{
+    'args': args, 'cwd': os.getcwd(), 'env': {{k: env.get(k) for k in watched}},
+    'tty': os.isatty(0) and os.isatty(1), 'pid': os.getpid(),
+}}
+
+def log(entry):
+    with open(env['FAKE_CLAUDE_LOG'], 'a') as f:
+        f.write(json.dumps(entry) + '\\n')
+
+log(call)
 if env.get('FAKE_NO_REQUEST'):
     print('Not logged in · Please run /login', file=sys.stderr)
     sys.exit(1)
+
+def post(body, entrypoint):
+    headers = {{
+        'content-type': 'application/json',
+        'authorization': env.get('FAKE_AUTH', 'Bearer sk-ant-oat01-fake'),
+        'anthropic-version': '2023-06-01',
+        'user-agent': f'claude-cli/9.9.9 (external, {{entrypoint}})',
+    }}
+    url = env['ANTHROPIC_BASE_URL'] + '/v1/messages?beta=true'
+    try:
+        urllib.request.urlopen(urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers))
+    except urllib.error.HTTPError:
+        pass
+
+if interactive:
+    import termios, tty
+    if not call['tty']:
+        sys.exit('fake claude: interactive mode needs a tty')
+    if env.get('FAKE_HANG'):
+        time.sleep(300)
+    time.sleep(0.3)
+    termios.tcflush(0, termios.TCIFLUSH)
+    tty.setraw(0)
+    if env.get('FAKE_TRUST_DIALOG'):
+        os.write(1, b'Quick safety check: Is this a project you created or one you trust?\\r\\n'
+                    b'\\x1b[2G\\x1b[1mYes,\\x1b[7GI\\x1b[9Gtrust\\x1b[15Gthis\\x1b[20Gfolder\\x1b[22m\\r\\n2. No, exit\\r\\n')
+        log({{'dialog_input': os.read(0, 1024).decode()}})
+        sys.exit(0)
+    os.write(1, b'\\x1b[2J\\x1b[HFake Claude Code\\r\\n\\x1b[1m> \\x1b[0m')
+    post({{'model': 'claude-haiku-5-5', 'max_tokens': 1, 'messages': [{{'role': 'user', 'content': 'quota'}}]}}, 'cli')
+    typed = ''
+    while True:
+        chunk = os.read(0, 1024).decode()
+        if chunk == '\\r' and typed:
+            break
+        typed += chunk.replace('\\r', '\\n')
+        os.write(1, chunk.encode())
+    log({{'typed': typed}})
+    mcp = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(300)'])
+    log({{'child_pid': mcp.pid}})
+    if env.get('FAKE_IGNORE_TERM'):
+        import signal
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
 
 settings = {{}}
 for i, a in enumerate(args):
@@ -58,6 +119,8 @@ def tool(name, desc='A tool.'):
     return {{'name': name, 'description': desc, 'input_schema': {{'type': 'object', 'properties': {{}}}}}}
 
 tools = [tool('Agent'), tool('Bash', 'Run shell commands. ' * 20), tool('Read'), tool('Skill'), tool('ToolSearch')]
+if interactive:
+    tools.append(tool('AskUserQuestion', 'Ask the user. ' * 50))
 if artifact:
     tools.append(tool('Artifact', 'Publish a page. ' * 200))
 if not strict:
@@ -75,9 +138,11 @@ context += '</system-reminder>'
 blocks = [instructions, context]
 if git:
     blocks.append('<system-reminder>\\nAttribution for git commits you create:\\n- End git commit messages with:\\nCo-Authored-By: Claude\\n</system-reminder>')
-blocks.append('say ok')
+blocks.append(typed if interactive else args[-1])
 
 deferred = ['CronCreate', 'WebFetch'] + ([] if strict else ['mcp__ctx__resolve'])
+tools.append({{'name': 'DeferredToolPlaceholder', 'description': 'Stands in for deferred tools.', 'defer_loading': True,
+               'input_schema': {{'type': 'object', 'properties': {{}}}}}})
 skills = ['- loop: Run a prompt on an interval.', '- kb: Manage the kb.', '- feature-dev:feature-dev: Guided feature dev.']
 if ai_skills:
     skills.append('- anthropic-skills:docx: Word documents. ' + 'x' * 300)
@@ -93,16 +158,17 @@ if not strict:
 listing += 'The following skills are available for use with the Skill tool:\\n\\n' + '\\n'.join(skills) + '\\n\\n'
 listing += 'While bypass permissions mode is active:\\n\\nYou can do work through Bash.\\n\\nToday is 2026-11-03.'
 
+entrypoint = 'cli' if interactive else 'sdk-cli'
 req = {{
     'model': 'claude-opus-5-5',
     'max_tokens': 128000,
     'thinking': {{'type': 'adaptive', 'display': 'omitted'}},
     'output_config': {{'effort': 'xhigh'}},
-    'metadata': {{'user_id': json.dumps({{'device_id': 'dev-123', 'account_uuid': 'acct-456'}})}},
+    'metadata': {{'user_id': json.dumps({{'device_id': 'dev-123', 'account_uuid': 'acct-456', 'session_id': 'sess-789'}})}},
     # bypass mode sends no permission_mode; only the "While ... mode is active" paragraph tells
     'safeguards': [] if '--dangerously-skip-permissions' in args else [{{'type': 'dangerous_tool_use', 'classifier_context': {{'permission_mode': 'auto'}}}}],
     'system': [
-        {{'type': 'text', 'text': 'x-anthropic-billing-header: cc_version=9.9.9.abc; cc_entrypoint=sdk-cli;'}},
+        {{'type': 'text', 'text': f'x-anthropic-billing-header: cc_version=9.9.9.abc; cc_entrypoint={{entrypoint}};'}},
         {{'type': 'text', 'text': 'You are a Claude agent.'}},
         {{'type': 'text', 'text': '# Harness\\nFollow the rules.\\n\\n# Context management\\nSummaries happen.'}},
     ],
@@ -115,34 +181,43 @@ req = {{
 }}
 if settings.get('fastMode'):
     req['speed'] = 'fast'
-headers = {{
-    'content-type': 'application/json',
-    'authorization': env.get('FAKE_AUTH', 'Bearer sk-ant-oat01-fake'),
-    'anthropic-version': '2023-06-01',
-    'user-agent': 'claude-cli/9.9.9 (external, sdk-cli)',
-}}
-url = env['ANTHROPIC_BASE_URL'] + '/v1/messages?beta=true'
-try:
-    urllib.request.urlopen(urllib.request.Request(url, data=json.dumps(req).encode(), headers=headers))
-except urllib.error.HTTPError:
-    pass
-print('API Error: 400 probe', file=sys.stderr)
-sys.exit(1)
+post(req, entrypoint)
+if not interactive:
+    print('API Error: 400 probe', file=sys.stderr)
+    sys.exit(1)
+# After 400s the real CLI turns tool search off and resends every tool in full
+fallback = dict(req, tools=[t for t in tools if not t.get('defer_loading')] + [tool(n, 'Full. ' * 100) for n in deferred])
+post(fallback, entrypoint)
+os.write(1, b'\\r\\nAPI Error: 400 probe\\r\\n')
+while True:
+    time.sleep(1)
 """
 
 
 class CountServer:
-    """Fake count_tokens endpoint: one token per 4 characters of the request body."""
+    """Fake count_tokens endpoint: one token per 4 characters of the request body, plus
+    TOOL_PREAMBLE tokens when the request has tools (the API's tool use system prompt).
+    Answers 400 to the bodies `reject` returns true for."""
+
+    TOOL_PREAMBLE = 300
 
     def __init__(self):
         self.calls = []
+        self.reject = lambda body: False
         server = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def do_POST(self):
                 body = self.rfile.read(int(self.headers['content-length']))
                 server.calls.append({'path': self.path, 'headers': {k.lower(): v for k, v in self.headers.items()}})
-                out = json.dumps({'input_tokens': len(body) // 4}).encode()
+                req = json.loads(body)
+                if server.reject(req):
+                    self.send_response(400)
+                    self.end_headers()
+                    self.wfile.write(b'{"type":"error","error":{"message":"rejected"}}')
+                    return
+                tokens = len(body) // 4 + (server.TOOL_PREAMBLE if req.get('tools') else 0)
+                out = json.dumps({'input_tokens': tokens}).encode()
                 self.send_response(200)
                 self.send_header('content-type', 'application/json')
                 self.end_headers()
@@ -192,7 +267,16 @@ class ProbeTestCase(unittest.TestCase):
         patcher = mock.patch.dict(os.environ, env)
         patcher.start()
         self.addCleanup(patcher.stop)
-        for k in ('CLAUDE_CODE_DISABLE_ARTIFACT', 'CLAUDE_CODE_ARTIFACT', 'FAKE_AUTH', 'FAKE_NO_REQUEST'):
+        for k in (
+            'CLAUDE_CODE_DISABLE_ARTIFACT',
+            'CLAUDE_CODE_ARTIFACT',
+            'CLAUDE_CODE_SKIP_PROMPT_HISTORY',
+            'FAKE_AUTH',
+            'FAKE_NO_REQUEST',
+            'FAKE_HANG',
+            'FAKE_TRUST_DIALOG',
+            'FAKE_IGNORE_TERM',
+        ):
             os.environ.pop(k, None)
         self.addCleanup(self.count.close)
 
@@ -210,6 +294,9 @@ class ProbeTestCase(unittest.TestCase):
         return json.loads(out)
 
     def claude_calls(self):
+        return [entry for entry in self.log_entries() if 'args' in entry]
+
+    def log_entries(self):
         return [json.loads(line) for line in self.log.read_text().splitlines()]
 
     def item(self, report, kind, name):
@@ -372,6 +459,24 @@ class TestCounting(ProbeTestCase):
         artifact = self.item(report, 'tool', 'Artifact')
         self.assertGreater(artifact['tokens'], 700)
 
+    def test_exact_mode_counts_the_tool_use_system_prompt_as_its_own_item(self):
+        # removing one tool leaves the preamble the API adds for any tools, so it gets an item
+        preamble = self.item(self.report('--count', 'exact'), 'tool-preamble', '(tool use system prompt)')
+        self.assertGreaterEqual(preamble['tokens'], CountServer.TOOL_PREAMBLE)
+        self.assertLess(preamble['tokens'], CountServer.TOOL_PREAMBLE + 30)
+        offline = self.report('--count', 'offline')
+        self.assertNotIn('tool-preamble', {i['kind'] for i in offline['items']})
+
+    def test_an_item_count_tokens_rejects_is_estimated_and_the_rest_stay_exact(self):
+        # like the API, refuse deferred tools without the tool search tool
+        self.count.reject = lambda req: any(t.get('defer_loading') for t in req.get('tools') or []) and not any(
+            t['name'] == 'ToolSearch' for t in req['tools']
+        )
+        report = self.report('--count', 'exact')
+        self.assertTrue(report['totals']['counting'].startswith('count_tokens (per item; 1 estimated'))
+        self.assertGreater(self.item(report, 'tool', 'ToolSearch')['tokens'], 0)
+        self.assertGreater(self.item(report, 'tool', 'Bash')['tokens'], 100)
+
     def test_never_sends_a_non_anthropic_credential(self):
         os.environ['FAKE_AUTH'] = 'Bearer glm-secret'
         report = self.report()
@@ -436,6 +541,112 @@ class TestHumanReport(ProbeTestCase):
         self.assertEqual(code, 0, err)
         for text in ('Claude Code 9.9.9', 'claude-opus-5-5', 'Artifact', 'By kind', 'Largest items', 'skill/claude.ai'):
             self.assertIn(text, out)
+        self.assertNotIn('interactive', out.splitlines()[0])
+
+
+class TestInteractive(ProbeTestCase):
+    def setUp(self):
+        super().setUp()
+        # shorter waits keep the suite quick; the fake still draws later than QUIET after its start
+        for name, value in (('QUIET', 0.4), ('ENTER_DELAY', 0.3), ('TERM_GRACE', 1.0)):
+            patcher = mock.patch.object(cp, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def entries(self, key):
+        return [e[key] for e in self.log_entries() if key in e]
+
+    def assertGone(self, pid):
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_types_the_prompt_into_a_tty_and_keeps_the_first_request(self):
+        report = self.report('--interactive', '--count', 'offline')
+        call = self.claude_calls()[0]
+        self.assertTrue(call['tty'])
+        for arg in ('-p', '--no-session-persistence', cp.PROMPT):
+            self.assertNotIn(arg, call['args'])
+        # typed only once the prompt was drawn, and Enter sent on its own
+        self.assertEqual(self.entries('typed'), [cp.PROMPT])
+        self.assertEqual(report['state']['entrypoint'], 'cli')
+        self.item(report, 'tool', 'AskUserQuestion')
+        self.item(report, 'prompt', 'prompt')
+        # the fallback request after the 400s carries the deferred tools in full; the first does not
+        self.assertNotIn('CronCreate', [i['name'] for i in report['items'] if i['kind'] == 'tool'])
+        self.assertIn('CronCreate', report['deferred'])
+        self.assertTrue(report['meta']['interactive'])
+
+    def test_stops_claude_and_the_processes_it_started(self):
+        self.report('--interactive', '--count', 'offline')
+        self.assertGone(self.claude_calls()[0]['pid'])
+        self.assertGone(self.entries('child_pid')[0])
+
+    def test_kills_a_claude_that_ignores_sigterm(self):
+        os.environ['FAKE_IGNORE_TERM'] = '1'
+        self.report('--interactive', '--count', 'offline')
+        self.assertGone(self.claude_calls()[0]['pid'])
+        self.assertGone(self.entries('child_pid')[0])
+
+    def test_runs_as_a_top_level_session_without_saving_history_or_artifact_override(self):
+        os.environ.update(CLAUDECODE='1', CLAUDE_CODE_CHILD_SESSION='1')
+        self.report('--interactive', '--count', 'offline')
+        env = self.claude_calls()[0]['env']
+        self.assertTrue(env['ANTHROPIC_BASE_URL'].startswith('http://127.0.0.1:'))
+        self.assertIsNone(env['HERDR_PANE_ID'])
+        self.assertIsNone(env['CLAUDECODE'])
+        self.assertIsNone(env['CLAUDE_CODE_CHILD_SESSION'])
+        self.assertIsNone(env['CLAUDE_CODE_ARTIFACT'])
+        self.assertEqual(env['CLAUDE_CODE_SKIP_PROMPT_HISTORY'], '1')
+
+    def test_shares_via_settings_and_mcp_options_with_print_mode(self):
+        rc = self.tmp / 'rc.zsh'
+        rc.write_text('mycl() { FOO_VIA=1 claude "$@" }\n')
+        report = self.report(
+            '--interactive', '--count', 'offline', '--via', 'mycl', '--rc', str(rc), '--no-mcp', '--no-hooks'
+        )
+        call = self.claude_calls()[0]
+        self.assertEqual(call['env']['FOO_VIA'], '1')
+        self.assertIn('--strict-mcp-config', call['args'])
+        self.assertEqual(json.loads(call['args'][call['args'].index('--settings') + 1]), {'disableAllHooks': True})
+        self.assertEqual(report['state']['mcp_servers'], [])
+        self.assertEqual(report['meta']['via'], 'mycl')
+        self.assertGone(call['pid'])
+
+    def test_report_header_and_expectations(self):
+        code, out, err = self.run_probe(
+            '--interactive',
+            '--count',
+            'offline',
+            '--expect-present',
+            'AskUserQuestion',
+            '--expect-absent',
+            'SendFeedback',
+        )
+        self.assertEqual(code, 0, err)
+        self.assertIn('interactive', out.splitlines()[0])
+        code, out, err = self.run_probe('--interactive', '--count', 'offline', '--expect-absent', 'CronCreate')
+        self.assertEqual(code, 1)
+        self.assertIn('CronCreate', err)
+
+    def test_reports_why_claude_sent_nothing(self):
+        os.environ['FAKE_NO_REQUEST'] = '1'
+        code, out, err = self.run_probe('--interactive', '--count', 'offline')
+        self.assertEqual(code, 2)
+        self.assertIn('Not logged in', err)
+
+    def test_gives_up_after_the_timeout(self):
+        os.environ['FAKE_HANG'] = '1'
+        code, out, err = self.run_probe('--interactive', '--count', 'offline', '--timeout', '1.5')
+        self.assertEqual(code, 2)
+        self.assertIn('1.5', err)
+        self.assertGone(self.claude_calls()[0]['pid'])
+
+    def test_never_answers_a_trust_dialog(self):
+        os.environ['FAKE_TRUST_DIALOG'] = '1'
+        code, out, err = self.run_probe('--interactive', '--count', 'offline')
+        self.assertEqual(code, 2)
+        self.assertIn('trust', err)
+        self.assertEqual(self.entries('dialog_input'), [])
 
 
 if __name__ == '__main__':

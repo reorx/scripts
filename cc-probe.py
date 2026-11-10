@@ -27,23 +27,37 @@ characters per token and makes no call.
     cc-probe.py --save a.json && ... && cc-probe.py diff a.json b.json
     cc-probe.py --via cl --expect-absent Artifact --max-tokens 40000   # exit 1 when not met
     cc-probe.py -- --model sonnet                 # anything after -- goes to claude
+    cc-probe.py --interactive --via cl            # the interactive TUI instead of -p
 
 HERDR_* variables are dropped so the herdr SessionStart hook leaves the current pane alone.
 CLAUDE_CODE_ARTIFACT=1 is set because headless runs leave Artifact out while interactive
 sessions load it (`--headless` skips this). MCP servers that connect after the first request
 is sent are missing from it, as they would be from an interactive session's first turn.
+
+--interactive runs the TUI on a pty, types the prompt once it has drawn, keeps the first
+request that carries a system prompt and kills claude's process group right away (after the
+400s it would resend every tool in full). Some tools (AskUserQuestion, SendFeedback) exist
+only there. It sets CLAUDE_CODE_SKIP_PROMPT_HISTORY=1 instead of -p's --no-session-persistence,
+and drops the variables Claude Code gives its child processes, so a probe started from inside
+Claude Code still runs as a top-level session.
 """
 
 import argparse
 import copy
+import fcntl
 import fnmatch
 import http.server
 import json
 import os
+import pty
 import re
+import select
 import shlex
+import signal
+import struct
 import subprocess
 import sys
+import termios
 import threading
 import time
 import urllib.error
@@ -97,6 +111,27 @@ SWITCH_ENV = [
     'ENABLE_TOOL_SEARCH',
 ]
 FORWARD_HEADERS = ('authorization', 'x-api-key', 'anthropic-beta', 'anthropic-version', 'user-agent', 'x-app')
+# Set by Claude Code for its child processes (Bash tool, hooks). With them a probe started from
+# inside Claude Code would be a nested session talking to the parent's messaging socket.
+CLAUDE_CHILD_ENV = {
+    'CLAUDECODE',
+    'CLAUDE_CODE_CHILD_SESSION',
+    'CLAUDE_CODE_SESSION_ID',
+    'CLAUDE_CODE_SESSION_ATTENDED',
+    'CLAUDE_CODE_ENTRYPOINT',
+    'CLAUDE_CODE_EXECPATH',
+    'CLAUDE_CODE_MESSAGING_SOCKET',
+    'CLAUDE_CODE_MESSAGING_TOKEN',
+    'CLAUDE_PID',
+    'CLAUDE_EFFORT',
+}
+TTY_SIZE = (50, 160)  # rows, columns
+QUIET = 1.0  # seconds without output after which the TUI counts as drawn
+STARTUP_MAX = 20.0  # type anyway after this long, for a TUI that never goes quiet
+ENTER_DELAY = 1.0  # text and Enter in one write read as a paste, so Enter follows on its own
+TERM_GRACE = 3.0  # seconds between SIGTERM and SIGKILL
+TRUST_DIALOG = 'trust this folder'
+ESCAPES = re.compile(r'\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-_]')
 
 
 class ProbeError(Exception):
@@ -185,7 +220,7 @@ class FakeApi:
 
 
 def claude_args(opts):
-    args = ['-p', '--no-session-persistence']
+    args = [] if opts.interactive else ['-p', '--no-session-persistence']
     if opts.no_mcp:
         args.append('--strict-mcp-config')
     settings = json.loads(opts.settings) if opts.settings else {}
@@ -193,7 +228,7 @@ def claude_args(opts):
         settings['disableAllHooks'] = True
     if settings:
         args += ['--settings', json.dumps(settings)]
-    return args + opts.claude_args + [PROMPT]
+    return args + opts.claude_args + ([] if opts.interactive else [PROMPT])
 
 
 def launch_command(opts, args):
@@ -204,31 +239,142 @@ def launch_command(opts, args):
 
 
 def child_env(opts, base_url):
-    env = {k: v for k, v in os.environ.items() if not k.startswith('HERDR_') and k not in opts.unset}
-    if not opts.headless and 'CLAUDE_CODE_ARTIFACT' not in opts.unset:
+    dropped = lambda k: k.startswith('HERDR_') or k in opts.unset or (opts.interactive and k in CLAUDE_CHILD_ENV)
+    env = {k: v for k, v in os.environ.items() if not dropped(k)}
+    if opts.interactive:
+        # what --no-session-persistence is to -p: no transcript and no prompt history row
+        if 'CLAUDE_CODE_SKIP_PROMPT_HISTORY' not in opts.unset:
+            env['CLAUDE_CODE_SKIP_PROMPT_HISTORY'] = '1'
+        env.setdefault('TERM', 'xterm-256color')
+    elif not opts.headless and 'CLAUDE_CODE_ARTIFACT' not in opts.unset:
         env.setdefault('CLAUDE_CODE_ARTIFACT', '1')
     env.update(dict(kv.split('=', 1) for kv in opts.env))
     env['ANTHROPIC_BASE_URL'] = base_url
     return env
 
 
+class Terminal:
+    """A command in a new session on a pty, with its output collected as it is read."""
+
+    def __init__(self, cmd, env, cwd):
+        self.master, slave = pty.openpty()
+        fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', *TTY_SIZE, 0, 0))
+        try:
+            self.proc = subprocess.Popen(
+                cmd, stdin=slave, stdout=slave, stderr=slave, env=env, cwd=cwd, start_new_session=True
+            )
+        except BaseException:
+            os.close(self.master)
+            raise
+        finally:
+            os.close(slave)
+        self.output = b''
+        self.closed = False
+
+    def read(self, seconds):
+        """Collect output for this long. True if any arrived."""
+        got, end = False, time.monotonic() + seconds
+        while (left := end - time.monotonic()) > 0:
+            if self.closed:
+                time.sleep(left)
+                break
+            if not select.select([self.master], [], [], left)[0]:
+                break
+            try:
+                chunk = os.read(self.master, 65536)
+            except OSError:  # EIO: no process holds the tty any more
+                chunk = b''
+            self.closed = not chunk
+            self.output += chunk
+            got = got or bool(chunk)
+        return got
+
+    def write(self, data):
+        os.write(self.master, data)
+
+    def alive(self):
+        return self.proc.poll() is None
+
+    def text(self):
+        """The output as one line of plain text. The TUI places words with cursor moves
+        (`ESC[<column>G` between the words of a line), so those count as spaces."""
+        text = re.sub(r'\x1b\[[\d;]*[CGHf]', ' ', self.output.decode(errors='replace'))
+        return ' '.join(ESCAPES.sub('', text).split())
+
+    def signal_group(self, sig):
+        """Send sig (0 to just check) to the process group. False once nothing in it can take a
+        signal: macOS answers EPERM, not ESRCH, for a group left with only zombies."""
+        self.proc.poll()  # reap the leader, or its zombie keeps the group around
+        try:
+            os.killpg(self.proc.pid, sig)
+        except (ProcessLookupError, PermissionError):
+            return False
+        return True
+
+    def stop(self):
+        """End the command and everything it started (MCP servers, hooks, the claude under a
+        zsh function): SIGTERM to the process group, SIGKILL to what is left after TERM_GRACE."""
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            if not self.signal_group(sig):
+                break
+            end = time.monotonic() + TERM_GRACE
+            while self.signal_group(0) and time.monotonic() < end:
+                self.read(0.05)  # keep reading, so nothing blocks writing to the tty
+        self.proc.wait()
+        os.close(self.master)
+
+
+def wait_for_prompt(term, deadline):
+    """Until the TUI has drawn and then gone QUIET, or STARTUP_MAX has passed."""
+    end = min(deadline, time.monotonic() + STARTUP_MAX)
+    while term.alive() and time.monotonic() < end:
+        if not term.read(min(QUIET, max(0, end - time.monotonic()))) and term.output:
+            return
+
+
+def run_interactive(opts, api):
+    """Start the TUI on a pty, type the prompt once it has drawn and stop claude as soon as the
+    first request is in. Returns why nothing came, for when nothing did."""
+    deadline = time.monotonic() + opts.timeout
+    term = Terminal(launch_command(opts, claude_args(opts)), child_env(opts, api.url), opts.cwd)
+    try:
+        wait_for_prompt(term, deadline)
+        if TRUST_DIALOG in term.text().lower():
+            raise ProbeError(f'claude asks whether to trust {opts.cwd}; answer it in a claude session there first')
+        if term.alive() and time.monotonic() < deadline:
+            term.write(PROMPT.encode())
+            term.read(ENTER_DELAY)
+            term.write(b'\r')
+        while api.first_request()[0] is None and term.alive() and time.monotonic() < deadline:
+            term.read(0.1)
+        exited = None if term.alive() else term.proc.returncode
+    finally:
+        term.stop()
+    status = f'nothing within --timeout {opts.timeout:g}s' if exited is None else f'exit {exited}'
+    return f'({status})\n{term.text()[-2000:]}'
+
+
 def capture(opts):
     api = FakeApi()
     try:
-        proc = subprocess.run(
-            launch_command(opts, claude_args(opts)),
-            env=child_env(opts, api.url),
-            cwd=opts.cwd,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=opts.timeout,
-        )
+        if opts.interactive:
+            failure = run_interactive(opts, api)
+        else:
+            proc = subprocess.run(
+                launch_command(opts, claude_args(opts)),
+                env=child_env(opts, api.url),
+                cwd=opts.cwd,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=opts.timeout,
+            )
+            failure = f'(exit {proc.returncode})\n{proc.stderr.strip()[-2000:]}'
     finally:
         api.close()
     req, headers = api.first_request()
     if req is None:
-        raise ProbeError(f'claude sent no request (exit {proc.returncode})\n{proc.stderr.strip()[-2000:]}')
+        raise ProbeError(f'claude sent no request {failure}')
     return req, headers
 
 
@@ -445,6 +591,37 @@ class Counter:
         raise CountError('count_tokens kept failing (429/5xx)')
 
 
+def count_or_error(counter, req):
+    try:
+        return counter.count(req)
+    except CountError as e:
+        return e
+
+
+def count_each(counter, req, items, total):
+    """Count each item by taking it out of the request; an item count_tokens refuses is estimated.
+    The tool use system prompt the API adds for any tools stays when one tool is taken out, so it
+    is appended as an item of its own. Returns the counting label."""
+    variants = [without(req, i) for i in items]
+    if req.get('tools'):
+        variants.append({**req, 'tools': []})
+    with ThreadPoolExecutor(6) as pool:
+        counts = list(pool.map(lambda r: count_or_error(counter, r), variants))
+    ratio = total / sum(i.chars for i in items)
+    failed = []
+    for item, n in zip(items, counts):
+        if isinstance(n, CountError):
+            failed.append(n)
+            item.tokens = round(item.chars * ratio)
+        else:
+            item.tokens = max(0, total - n)
+    if req.get('tools') and not isinstance(counts[-1], CountError):
+        tools = sum(i.tokens for i in items if i.loc[0] == 'tool')
+        preamble = max(0, total - counts[-1] - tools)
+        items.append(Item('tool-preamble', '(tool use system prompt)', ('tools',), tokens=preamble))
+    return f'count_tokens (per item; {len(failed)} estimated: {failed[0]})' if failed else 'count_tokens (per item)'
+
+
 def measure(req, headers, items, mode):
     """Fill item tokens and return (total, counting label). Falls back to estimates."""
     chars = sum(i.chars for i in items)
@@ -459,11 +636,7 @@ def measure(req, headers, items, mode):
             total = counter.count(req)
             label = 'count_tokens'
             if mode == 'exact':
-                with ThreadPoolExecutor(6) as pool:
-                    counts = list(pool.map(lambda i: counter.count(without(req, i)), items))
-                for item, n in zip(items, counts):
-                    item.tokens = max(0, total - n)
-                return total, 'count_tokens (per item)'
+                return total, count_each(counter, req, items, total)
         except (CountError, urllib.error.URLError, TimeoutError) as e:
             label = f'estimate ({e})' if total is None else f'count_tokens (total only; items estimated: {e})'
     ratio = total / chars if total else 1 / CHARS_PER_TOKEN
@@ -577,6 +750,7 @@ def render(report, opts):
     s, t, m = report['state'], report['totals'], report['meta']
     out = [
         f'cc-probe · Claude Code {fmt(s["version"])} ({fmt(s["entrypoint"])}) · '
+        f'{"interactive · " if m.get("interactive") else ""}'
         f'{"via `" + m["via"] + "`" if m["via"] else "claude"} · {tilde(m["cwd"])}',
         f'model {s["model"]} · effort {fmt(s["effort"])} · thinking {fmt(s["thinking"])} · fast {fmt(s["fast"])} · '
         f'permission {fmt(s["permission_mode"])} · max_tokens {fmt(s["max_tokens"])}',
@@ -692,6 +866,9 @@ def parse_capture_args(argv):
     p.add_argument('--env', action='append', default=[], metavar='K=V', help='set an env var for claude')
     p.add_argument('--unset', action='append', default=[], metavar='K', help='remove an env var for claude')
     p.add_argument('--headless', action='store_true', help='do not set CLAUDE_CODE_ARTIFACT=1')
+    p.add_argument(
+        '--interactive', action='store_true', help='capture the interactive TUI on a pty instead of claude -p'
+    )
     p.add_argument('--count', choices=['auto', 'exact', 'offline'], default='auto', help='how to count tokens')
     p.add_argument('--all', action='store_true', help='list every item')
     p.add_argument('--kind', help='only list items of this kind (glob), e.g. "skill*", "tool"')
@@ -727,6 +904,7 @@ def run_capture(argv):
     total, counting = measure(req, headers, items, opts.count)
     meta = {
         'via': opts.via,
+        'interactive': opts.interactive,
         'cwd': str(Path(opts.cwd).resolve()),
         'captured_at': datetime.now().isoformat(timespec='seconds'),
         'mcp': not opts.no_mcp,
