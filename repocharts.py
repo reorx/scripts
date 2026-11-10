@@ -14,8 +14,8 @@ Two charts share one time axis, so their columns line up:
      branch's lines land on the day of the merge and the final total equals
      the text lines at HEAD. Binary files and lockfiles are left out.
 
-The y axis is linear with round ticks and a gridline along each labelled row's
-top edge, where its value lies; the chart top is rounded up to the next tick.
+The y axis is linear with round ticks and a dotted gridline near each labelled
+row's top edge, where its value lies; the chart top is rounded up to the next tick.
 --log switches both charts to a 1-2-5 ladder, one step per row, which spreads
 out many small values sitting under a few spikes (bar heights then stop being
 proportional). With --values each bar gets its exact number underneath: the
@@ -67,7 +67,8 @@ NICE = tuple(Fraction(c) for c in ('1', '1.5', '2', '2.5', '3', '4', '5', '6', '
 MAX_TICKS = 6  # labels per chart before they thin out to every 2nd, 4th, ... row
 MIN_FILL = Fraction(3, 5)  # fewer labels are fine when more would leave the tallest bar below this
 LADDERS = ((1, 2, 5), (1, 3), (1,))  # --log steps per decade, densest first
-GRID = '▔'  # drawn along the top edge of a labelled row, where its tick value lies; even rows only,
+GRID = '˙'  # a tick's value lies on its row's top edge; this dot sits about 1/5 row below it in
+# common monospace fonts, where a centred '·' would read half a row low. Even labelled rows only,
 # so labels on every row get a line on every other one, and a 1-row chart gets none
 
 
