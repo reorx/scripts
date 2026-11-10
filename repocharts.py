@@ -14,26 +14,35 @@ Two charts share one time axis, so their columns line up:
      branch's lines land on the day of the merge and the final total equals
      the text lines at HEAD. Binary files and lockfiles are left out.
 
-With --values each bar gets its exact number underneath: the commit count, and
-for lines of code the change in that bucket (+120, -35) rather than the total,
-which the bar and the title already show.
+The y axis is linear with round ticks and a gridline along each labelled row's
+top edge, where its value lies; the chart top is rounded up to the next tick.
+--log switches both charts to a 1-2-5 ladder, one step per row, which spreads
+out many small values sitting under a few spikes (bar heights then stop being
+proportional). With --values each bar gets its exact number underneath: the
+commit count, and for lines of code the change in that bucket (+120, -35)
+rather than the total, which the bar and the title already show.
 
     repocharts.py                   # this repo, by day, as much history as fits
     repocharts.py -n 30 -v          # the last 30 days, numbers under the bars
     repocharts.py -b week -H 4      # by week, 4 rows high
+    repocharts.py -b week --log     # by week, small weeks readable next to spikes
     repocharts.py ~/Code/x -b month # another repo, by month
     repocharts.py -x 'vendor/*'     # leave more files out of the line count
 """
 
 import argparse
+import itertools
+import math
 import os
 import shutil
 import subprocess
 import sys
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from fnmatch import fnmatchcase
+from fractions import Fraction
 from pathlib import Path
 
 GRANULARITIES = ('day', 'week', 'month')
@@ -51,7 +60,15 @@ GUTTER = 4  # width of the y-axis labels; compact() never needs more
 MAX_COL = 3  # widest column per bucket without --values: a 2-cell bar plus a 1-cell gap
 MAX_BAR = MAX_COL - 1
 EXACT_BELOW = 10_000  # --values prints smaller numbers in full, larger ones like compact()
+UNITS = {'k': 10**3, 'M': 10**6, 'G': 10**9}
 BOLD, DIM, RED, GREEN, CYAN = '1', '2', '31', '32', '36'
+# Y axis
+NICE = tuple(Fraction(c) for c in ('1', '1.5', '2', '2.5', '3', '4', '5', '6', '8'))  # tick intervals x 10^e
+MAX_TICKS = 6  # labels per chart before they thin out to every 2nd, 4th, ... row
+MIN_FILL = Fraction(3, 5)  # fewer labels are fine when more would leave the tallest bar below this
+LADDERS = ((1, 2, 5), (1, 3), (1,))  # --log steps per decade, densest first
+GRID = '▔'  # drawn along the top edge of a labelled row, where its tick value lies; even rows only,
+# so labels on every row get a line on every other one, and a 1-row chart gets none
 
 
 class RepoError(Exception):
@@ -68,6 +85,16 @@ class Series:
     @property
     def loc_deltas(self) -> list[int]:
         return [after - before for before, after in zip([self.loc_before, *self.loc], self.loc)]
+
+
+@dataclass
+class Scale:
+    """How values map onto chart rows; rows count from the bottom, 1 being the lowest."""
+
+    height: int
+    ticks: dict[int, int]  # row -> the value at its top edge, labelled on the y axis
+    grid: set[int]  # rows whose top edge gets a gridline
+    to_rows: Callable[[int], float]  # value -> bar height in rows
 
 
 class Paint:
@@ -205,27 +232,130 @@ def build_series(commit_days, loc_changes, by: str, end: date, n: int) -> Series
     return Series(starts, [commits[start] for start in starts], loc, loc_before)
 
 
-# Rendering -------------------------------------------------------------------
+# Scales ----------------------------------------------------------------------
 
 
 def compact(n: int) -> str:
     value, unit = float(n), ''
-    for next_unit in ('k', 'M', 'G'):
+    for next_unit in UNITS:
         if round(value) < 1000:
             break
         value, unit = value / 1000, next_unit
     if not unit:
         return str(n)
-    return f'{value:.1f}{unit}' if value < 9.95 else f'{value:.0f}{unit}'
+    return f'{value:.1f}'.removesuffix('.0') + unit if value < 9.95 else f'{value:.0f}{unit}'
 
 
-def bar_rows(values, height: int, col: int) -> list[str]:
+def prints_exactly(value: Fraction) -> bool:
+    """Whether compact() shows this value without rounding, within the y-axis gutter."""
+    if value.denominator != 1:
+        return False
+    label = compact(int(value))
+    unit = UNITS.get(label[-1])
+    shown = Fraction(label[:-1]) * unit if unit else Fraction(label)
+    return shown == value and len(label) <= GUTTER
+
+
+def nice_interval(minimum: Fraction, count: int) -> Fraction:
+    """The smallest NICE x 10^e >= minimum whose first `count` multiples all print exactly."""
+    exp = math.floor(math.log10(minimum))
+    for e in (exp, exp + 1, exp + 2):
+        for c in NICE:
+            interval = c * Fraction(10) ** e
+            if interval >= minimum and all(prints_exactly(interval * k) for k in range(1, count + 1)):
+                return interval
+    raise ValueError(f'no tick interval fits {minimum} in {GUTTER} characters')
+
+
+def label_spacings(height: int) -> list[int]:
+    """Rows between labels to try, most labels first: powers of 2 from MAX_TICKS labels, then the full height."""
+    every = 1
+    while height / every > MAX_TICKS:
+        every *= 2
+    spacings = []
+    while every < height:
+        spacings.append(every)
+        every *= 2
+    return [*spacings, height]
+
+
+def linear_scale(values, height: int) -> Scale:
+    """A round tick every few rows, the chart top rounded up so the tallest bar fits.
+
+    Takes the most labels that still let the tallest bar reach MIN_FILL of the chart,
+    else the spacing that lets it reach highest.
+    """
+    top = max(values, default=0)
+    if top <= 0:
+        return Scale(height, {}, set(), lambda v: 0.0)
+    best = None
+    for every in label_spacings(height):
+        interval = nice_interval(Fraction(top * every, height), height // every)
+        step = interval / every  # value per row
+        fill = top / (step * height)
+        if best is None or fill > best[0]:
+            best = (fill, step, every)
+        if fill >= MIN_FILL:
+            break
+    _, step, every = best
+    ticks = {row: int(step * row) for row in range(every, height + 1, every)}
+    return Scale(height, ticks, {row for row in ticks if row % 2 == 0}, lambda v: float(v / step))
+
+
+def ladder(mults, low: int, top: int) -> list[int]:
+    """Ladder values (mults x 10^e) from the largest one <= low up to the first one >= top."""
+    steps = []
+    for exp in itertools.count(len(str(low)) - 1):
+        for m in mults:
+            value = m * 10**exp
+            steps = [value] if value <= low else [*steps, value]
+            if value >= top:
+                return steps
+
+
+def log_scale(values, height: int) -> Scale:
+    """A ladder step per row (or per few rows), starting just below the smallest value.
+
+    Uses the densest ladder whose steps fit the chart. When even decades do not fit,
+    the lowest ones are dropped and their values share the bottom row.
+    """
+    positive = [v for v in values if v > 0]
+    if not positive:
+        return Scale(height, {}, set(), lambda v: 0.0)
+    low, top = min(positive), max(positive)
+    for mults in LADDERS:
+        steps = ladder(mults, low, top)
+        if len(steps) <= height:
+            break
+    else:
+        steps = steps[-height:]
+    per_step = height // len(steps)
+    bounds = [0, *steps]
+
+    def to_rows(v):
+        if v <= 0:
+            return 0.0
+        for i, (lo, hi) in enumerate(zip(bounds, bounds[1:])):
+            if v <= hi:
+                part = v / hi if lo == 0 else math.log(v / lo) / math.log(hi / lo)
+                return (i + part) * per_step
+        return float(len(steps) * per_step)
+
+    ticks = {(i + 1) * per_step: step for i, step in enumerate(steps)}
+    grid = {row for row, step in ticks.items() if str(step).rstrip('0') == '1' and height > 1}  # decades
+    return Scale(height, ticks, grid, to_rows)
+
+
+# Rendering -------------------------------------------------------------------
+
+
+def bar_rows(values, scale: Scale, col: int) -> list[str]:
     """Rows top to bottom; each bucket takes `col` cells, the last one a gap when col > 1."""
     bar = min(col - 1, MAX_BAR) if col > 1 else 1
     gap = col - bar
-    top = max(values, default=0)
+    height = scale.height
     # Bar heights in eighths of a row; any nonzero value gets at least one.
-    levels = [max(1, round(v * height * 8 / top)) if v > 0 and top > 0 else 0 for v in values]
+    levels = [min(height * 8, max(1, round(scale.to_rows(v) * 8))) if v > 0 else 0 for v in values]
     rows = []
     for r in reversed(range(height)):
         cells = (BLOCKS[min(8, max(0, level - r * 8))] * bar + ' ' * gap for level in levels)
@@ -244,6 +374,17 @@ def value_label(n: int, signed: bool = False) -> str:
 def value_labels(series: Series) -> tuple[list[str], list[str]]:
     """Labels for --values: commit counts, and signed changes in lines of code."""
     return [value_label(c) for c in series.commits], [value_label(d, signed=True) for d in series.loc_deltas]
+
+
+def paint_row(row: str, grid_width: int, color: str, paint: Paint) -> str:
+    """Bars in color; with a grid width, the blank cells up to it become a dim gridline."""
+    if not grid_width:
+        return paint(row, color)
+    out = []
+    for blank, run in itertools.groupby(row.ljust(grid_width), key=lambda ch: ch == ' '):
+        text = ''.join(run)
+        out.append(paint(GRID * len(text), DIM) if blank else paint(text, color))
+    return ''.join(out)
 
 
 def value_row(labels: list[str], col: int, color: str, paint: Paint) -> str:
@@ -278,14 +419,17 @@ def x_axis(starts: list[date], by: str, col: int) -> tuple[str, str]:
 
 
 def render_chart(
-    title: str, values, starts, by: str, height: int, col: int, color: str, paint: Paint, labels=None
+    title: str, values, scale: Scale, starts, by: str, col: int, color: str, paint: Paint, labels=None
 ) -> list[str]:
     """Title, bar rows, the --values row when labels are given, the axis and its dates."""
-    top = max(max(values, default=0), 0)
+    width = len(starts) * col
     lines = [title]
-    for i, row in enumerate(bar_rows(values, height, col)):
-        label, edge = (compact(top), '┤') if i == 0 else ('', '│')
-        lines.append(paint(f'{label:>{GUTTER}} {edge}', DIM) + paint(row, color))
+    for i, row in enumerate(bar_rows(values, scale, col)):
+        row_number = scale.height - i
+        tick = scale.ticks.get(row_number)
+        label, edge = ('', '│') if tick is None else (compact(tick), '┤')
+        grid_width = width if row_number in scale.grid else 0
+        lines.append(paint(f'{label:>{GUTTER}} {edge}', DIM) + paint_row(row, grid_width, color, paint))
     if labels is not None:
         lines.append(paint(f'{"":>{GUTTER}} │', DIM) + value_row(labels, col, color, paint))
     ticks, dates = x_axis(starts, by, col)
@@ -340,6 +484,11 @@ def parse_args(argv):
     )
     parser.add_argument(
         '-H', '--height', type=positive_int, default=8, help='rows per chart (default: 8; 1 is a sparkline)'
+    )
+    parser.add_argument(
+        '--log',
+        action='store_true',
+        help='logarithmic y axis, one 1-2-5 step per row: spreads out small values under a few spikes',
     )
     parser.add_argument(
         '-v',
@@ -398,6 +547,7 @@ def run(args) -> None:
 
     paint = Paint(not args.no_color and not os.environ.get('NO_COLOR') and sys.stdout.isatty())
     counts, changes = value_labels(series) if args.values else (None, None)
+    scale_for = log_scale if args.log else linear_scale
     excluded = [*([] if args.with_lockfiles else ['lockfiles']), *args.exclude]
     if loc_changes is None:
         loc_block = [
@@ -405,13 +555,15 @@ def run(args) -> None:
             paint(f'{"":>{GUTTER}}  `git -C {top} backfill` downloads them in batches (can be large); then rerun', DIM),
         ]
     else:
-        loc_block = render_chart(
-            loc_title(series, excluded, paint), series.loc, series.starts, by, args.height, col, CYAN, paint, changes
-        )
+        loc_title_text = loc_title(series, excluded, paint)
+        loc_scale = scale_for(series.loc, args.height)
+        loc_block = render_chart(loc_title_text, series.loc, loc_scale, series.starts, by, col, CYAN, paint, changes)
+    commit_scale = scale_for(series.commits, args.height)
+    log_note = ' · log scale' if args.log else ''
     blocks = [
-        [paint(top.name, BOLD) + f' · by {by} · {series.starts[0]} → {last_day}'],
+        [paint(top.name, BOLD) + f' · by {by}{log_note} · {series.starts[0]} → {last_day}'],
         render_chart(
-            commits_title(series, by, paint), series.commits, series.starts, by, args.height, col, GREEN, paint, counts
+            commits_title(series, by, paint), series.commits, commit_scale, series.starts, by, col, GREEN, paint, counts
         ),
         loc_block,
     ]

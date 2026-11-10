@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from datetime import date, datetime, timedelta
+from fractions import Fraction
 from pathlib import Path
 from unittest.mock import patch
 
@@ -92,6 +93,20 @@ def run_main(*argv, columns=100):
     ):
         code = app.main(list(argv))
     return code, out.getvalue(), err.getvalue()
+
+
+def parse_label(label):
+    units = {'k': 1_000, 'M': 1_000_000, 'G': 1_000_000_000}
+    return Fraction(label[:-1]) * units[label[-1]] if label[-1] in units else Fraction(label)
+
+
+def bar_cells(row):
+    """(offset, run) of each bar in a chart row; the y axis and gridlines are left out."""
+    return [(m.start(), m.group()) for m in re.finditer(f'[{app.BLOCKS[1:]}]+', row[app.GUTTER + 2:])]
+
+
+def bars(values, height, col):
+    return app.bar_rows(values, app.linear_scale(values, height), col)
 
 
 def chart_blocks(output):
@@ -222,26 +237,101 @@ class Series(unittest.TestCase):
 
 class Bars(unittest.TestCase):
     def test_the_tallest_bar_fills_every_row(self):
-        rows = app.bar_rows([4, 2], height=2, col=1)
+        rows = bars([4, 2], height=2, col=1)
         self.assertEqual(rows, ['█', '██'])
 
     def test_a_small_nonzero_value_stays_visible(self):
-        rows = app.bar_rows([1000, 1], height=3, col=1)
+        rows = bars([1000, 1], height=3, col=1)
         self.assertEqual(rows[-1][1], '▁')
 
     def test_zero_draws_nothing(self):
-        rows = app.bar_rows([0, 5, 0], height=1, col=1)
+        rows = bars([0, 5, 0], height=1, col=1)
         self.assertEqual(rows, [' █'])
 
     def test_wide_columns_leave_a_gap_after_each_bar(self):
-        rows = app.bar_rows([1, 1], height=1, col=3)
+        rows = bars([1, 1], height=1, col=3)
         self.assertEqual(rows, ['██ ██'])
 
     def test_all_zero_draws_an_empty_chart(self):
-        self.assertEqual(app.bar_rows([0, 0], height=2, col=1), ['', ''])
+        self.assertEqual(bars([0, 0], height=2, col=1), ['', ''])
 
     def test_bars_stay_two_cells_wide_in_wider_columns(self):
-        self.assertEqual(app.bar_rows([1, 1], height=1, col=5), ['██   ██'])
+        self.assertEqual(bars([1, 1], height=1, col=5), ['██   ██'])
+
+    def test_log_bars_grow_one_row_per_step(self):
+        values = [1, 10, 100]
+        self.assertEqual(app.bar_rows(values, app.log_scale(values, 3), col=1), ['  █', ' ██', '███'])
+
+
+class LinearScale(unittest.TestCase):
+    def test_ticks_are_round_and_the_top_is_rounded_up(self):
+        scale = app.linear_scale([169, 20], 8)
+        self.assertEqual(scale.ticks, {2: 50, 4: 100, 6: 150, 8: 200})
+        self.assertEqual(scale.grid, {2, 4, 6, 8})
+        self.assertEqual(scale.to_rows(100), 4)
+
+    def test_small_counts_get_one_commit_per_row(self):
+        self.assertEqual(app.linear_scale([6], 8).ticks, {2: 2, 4: 4, 6: 6, 8: 8})
+
+    def test_rows_may_be_half_a_commit_when_that_fills_the_chart_better(self):
+        self.assertEqual(app.linear_scale([3], 8).ticks, {2: 1, 4: 2, 6: 3, 8: 4})
+
+    def test_fewer_ticks_rather_than_a_mostly_empty_chart(self):
+        self.assertEqual(app.linear_scale([1], 8).ticks, {8: 1})
+        self.assertEqual(app.linear_scale([2], 8).ticks, {4: 1, 8: 2})
+
+    def test_short_charts_label_every_row_but_draw_gridlines_on_every_other(self):
+        scale = app.linear_scale([40], 4)
+        self.assertEqual(scale.ticks, {1: 10, 2: 20, 3: 30, 4: 40})
+        self.assertEqual(scale.grid, {2, 4})
+
+    def test_a_one_row_chart_has_no_gridline(self):
+        self.assertEqual(app.linear_scale([6], 1).grid, set())
+        self.assertEqual(app.log_scale([1, 10], 1).grid, set())
+
+    def test_ticks_print_exactly_and_the_chart_stays_at_least_half_full(self):
+        for top in (1, 2, 3, 7, 13, 101, 169, 999, 1001, 12_345, 30_366, 196_850, 2_000_001):
+            for height in range(1, 13):
+                with self.subTest(top=top, height=height):
+                    scale = app.linear_scale([top], height)
+                    self.assertTrue(scale.ticks)
+                    for value in scale.ticks.values():
+                        label = app.compact(value)
+                        self.assertLessEqual(len(label), app.GUTTER)
+                        self.assertEqual(parse_label(label), value)
+                    self.assertLessEqual(scale.to_rows(top), height)
+                    self.assertGreaterEqual(scale.to_rows(top), height / 2)
+
+    def test_an_all_zero_window_has_no_ticks(self):
+        scale = app.linear_scale([0, 0], 8)
+        self.assertEqual(scale.ticks, {})
+        self.assertEqual(scale.to_rows(0), 0)
+
+
+class LogScale(unittest.TestCase):
+    def test_one_1_2_5_step_per_row_with_gridlines_on_decades(self):
+        scale = app.log_scale([1, 169], 8)
+        self.assertEqual(scale.ticks, {1: 1, 2: 2, 3: 5, 4: 10, 5: 20, 6: 50, 7: 100, 8: 200})
+        self.assertEqual(scale.grid, {1, 4, 7})
+        self.assertEqual(scale.to_rows(10), 4)
+        self.assertEqual(scale.to_rows(0), 0)
+
+    def test_a_small_range_spreads_each_step_over_several_rows(self):
+        self.assertEqual(app.log_scale([1, 6], 8).ticks, {2: 1, 4: 2, 6: 5, 8: 10})
+
+    def test_short_charts_use_coarser_steps(self):
+        self.assertEqual(app.log_scale([1, 169], 6).ticks, {1: 1, 2: 3, 3: 10, 4: 30, 5: 100, 6: 300})
+        self.assertEqual(app.log_scale([1, 169], 4).ticks, {1: 1, 2: 10, 3: 100, 4: 1000})
+
+    def test_the_ladder_starts_just_below_the_smallest_value(self):
+        scale = app.log_scale([40_000, 196_850], 8)
+        self.assertEqual(scale.ticks, {2: 20_000, 4: 50_000, 6: 100_000, 8: 200_000})
+
+    def test_a_range_too_wide_for_the_chart_squeezes_the_smallest_values_into_the_bottom_row(self):
+        scale = app.log_scale([1, 10**6], 3)
+        self.assertEqual(scale.ticks, {1: 10_000, 2: 100_000, 3: 1_000_000})
+        self.assertGreater(scale.to_rows(1), 0)
+
 
 
 class ValueLabels(unittest.TestCase):
@@ -319,12 +409,8 @@ class Cli(unittest.TestCase):
         _, out, _ = run_main(str(repo.root), '--by', 'day', '--last', '21', '--height', '3')
         commits, loc = chart_blocks(out)
 
-        def first_bar(row):
-            body = row.split('│', 1)[1]
-            return row.index('│') + 1 + len(body) - len(body.lstrip())
-
         # Both bottom rows start drawing on the day of the first commit, 20 days ago.
-        self.assertEqual(first_bar(commits[3]), first_bar(loc[3]))
+        self.assertEqual(bar_cells(commits[3])[0][0], bar_cells(loc[3])[0][0])
         self.assertEqual(commits[-2:], loc[-2:])
 
     def test_default_window_spans_the_history_when_it_fits(self):
@@ -363,7 +449,7 @@ class Cli(unittest.TestCase):
             self.assertTrue(row.startswith(' ' * app.GUTTER + ' │'), row)
             return [(m.start(), m.group()) for m in re.finditer(r'\S+', row[app.GUTTER + 2:])]
 
-        count_row, change_row, bottom_bars = tokens(commits[4]), tokens(loc[4]), tokens(commits[3])
+        count_row, change_row, bottom_bars = tokens(commits[4]), tokens(loc[4]), bar_cells(commits[3])
         self.assertEqual([text for _, text in count_row], ['1', '2', '1'])
         self.assertEqual([text for _, text in change_row], ['+30', '+15', '-20'])
         # Each number starts where its bar starts, in both charts.
@@ -378,6 +464,26 @@ class Cli(unittest.TestCase):
         self.assertIn('terminal', err)
         chart_rows = [line for line in out.splitlines() if any(ch in line for ch in '│┤└')]
         self.assertTrue(all(len(line) <= 40 for line in chart_rows), chart_rows)
+
+    def y_labels(self, block, height=8):
+        return [line[: app.GUTTER].strip() for line in block[1 : 1 + height]]
+
+    def test_the_y_axis_has_round_ticks_with_gridlines(self):
+        repo = self.recent_repo()
+        _, out, _ = run_main(str(repo.root), '--last', '21')
+        commits, loc = chart_blocks(out)
+        self.assertEqual(self.y_labels(commits), ['2', '', '', '', '1', '', '', ''])
+        self.assertEqual(self.y_labels(loc), ['60', '', '45', '', '30', '', '15', ''])
+        for block in (commits, loc):
+            labelled = [bool(label) for label in self.y_labels(block)]
+            self.assertEqual([app.GRID in line for line in block[1:9]], labelled)
+
+    def test_log_puts_the_y_axis_on_a_1_2_5_ladder(self):
+        repo = self.recent_repo()
+        _, out, _ = run_main(str(repo.root), '--last', '21', '--log')
+        self.assertIn('log scale', out.splitlines()[0])
+        _, loc = chart_blocks(out)
+        self.assertEqual(self.y_labels(loc), ['50', '', '', '', '20', '', '', ''])
 
     def test_runs_from_a_subdirectory(self):
         repo = self.recent_repo()
