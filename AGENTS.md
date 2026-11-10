@@ -79,6 +79,7 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 ## Repo charts
 
 - `repocharts.py [path] -b day|week|month` prints two bar charts on one time axis: non-merge commits per bucket by author date, then lines of code at the end of each bucket. The line count is the running numstat sum along HEAD's first-parent chain, with merges diffed against their first parent, by committer date, so the last total equals the text lines at HEAD. Binary files and lockfiles are left out (`--with-lockfiles`, `-x GLOB`).
+- `-v/--values` prints a number under each bar: the commit count, and for lines of code the change in that bucket (signed, exact below 10,000), not the total. Columns widen to fit the widest number, so fewer buckets fit the terminal; both charts always share one column width.
 - The numstat walk runs with `GIT_NO_LAZY_FETCH=1`. In a partial clone git would otherwise fetch missing blobs one commit at a time (minutes, and it fills the clone), so there the line chart is replaced by a `git backfill` hint. Run `uv run test_repocharts.py` when changing it.
 
 ## Documentation

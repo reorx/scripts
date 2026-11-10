@@ -14,8 +14,13 @@ Two charts share one time axis, so their columns line up:
      branch's lines land on the day of the merge and the final total equals
      the text lines at HEAD. Binary files and lockfiles are left out.
 
-    repocharts.py                   # this repo, by week, as much history as fits
-    repocharts.py -b day -n 30      # the last 30 days
+With --values each bar gets its exact number underneath: the commit count, and
+for lines of code the change in that bucket (+120, -35) rather than the total,
+which the bar and the title already show.
+
+    repocharts.py                   # this repo, by day, as much history as fits
+    repocharts.py -n 30 -v          # the last 30 days, numbers under the bars
+    repocharts.py -b week -H 4      # by week, 4 rows high
     repocharts.py ~/Code/x -b month # another repo, by month
     repocharts.py -x 'vendor/*'     # leave more files out of the line count
 """
@@ -43,8 +48,10 @@ LOCKFILES = (
 )
 BLOCKS = ' ▁▂▃▄▅▆▇█'
 GUTTER = 4  # width of the y-axis labels; compact() never needs more
-MAX_COL = 3  # widest column per bucket: a 2-cell bar plus a 1-cell gap
-BOLD, DIM, GREEN, CYAN = '1', '2', '32', '36'
+MAX_COL = 3  # widest column per bucket without --values: a 2-cell bar plus a 1-cell gap
+MAX_BAR = MAX_COL - 1
+EXACT_BELOW = 10_000  # --values prints smaller numbers in full, larger ones like compact()
+BOLD, DIM, RED, GREEN, CYAN = '1', '2', '31', '32', '36'
 
 
 class RepoError(Exception):
@@ -57,6 +64,10 @@ class Series:
     commits: list[int]
     loc: list[int]
     loc_before: int  # lines of code just before the first bucket
+
+    @property
+    def loc_deltas(self) -> list[int]:
+        return [after - before for before, after in zip([self.loc_before, *self.loc], self.loc)]
 
 
 class Paint:
@@ -210,7 +221,8 @@ def compact(n: int) -> str:
 
 def bar_rows(values, height: int, col: int) -> list[str]:
     """Rows top to bottom; each bucket takes `col` cells, the last one a gap when col > 1."""
-    bar, gap = (col - 1, 1) if col > 1 else (1, 0)
+    bar = min(col - 1, MAX_BAR) if col > 1 else 1
+    gap = col - bar
     top = max(values, default=0)
     # Bar heights in eighths of a row; any nonzero value gets at least one.
     levels = [max(1, round(v * height * 8 / top)) if v > 0 and top > 0 else 0 for v in values]
@@ -219,6 +231,24 @@ def bar_rows(values, height: int, col: int) -> list[str]:
         cells = (BLOCKS[min(8, max(0, level - r * 8))] * bar + ' ' * gap for level in levels)
         rows.append(''.join(cells).rstrip())
     return rows
+
+
+def value_label(n: int, signed: bool = False) -> str:
+    """The number printed under a bar: empty for 0, exact below EXACT_BELOW."""
+    if n == 0:
+        return ''
+    sign = '-' if n < 0 else '+' if signed else ''
+    return sign + (str(abs(n)) if abs(n) < EXACT_BELOW else compact(abs(n)))
+
+
+def value_labels(series: Series) -> tuple[list[str], list[str]]:
+    """Labels for --values: commit counts, and signed changes in lines of code."""
+    return [value_label(c) for c in series.commits], [value_label(d, signed=True) for d in series.loc_deltas]
+
+
+def value_row(labels: list[str], col: int, color: str, paint: Paint) -> str:
+    cells = (paint(label, RED if label.startswith('-') else color) + ' ' * (col - len(label)) for label in labels)
+    return ''.join(cells).rstrip()
 
 
 def x_axis(starts: list[date], by: str, col: int) -> tuple[str, str]:
@@ -247,15 +277,20 @@ def x_axis(starts: list[date], by: str, col: int) -> tuple[str, str]:
     return ''.join(ticks), labels
 
 
-def render_chart(title: str, values, starts, by: str, height: int, col: int, color: str, paint: Paint) -> list[str]:
+def render_chart(
+    title: str, values, starts, by: str, height: int, col: int, color: str, paint: Paint, labels=None
+) -> list[str]:
+    """Title, bar rows, the --values row when labels are given, the axis and its dates."""
     top = max(max(values, default=0), 0)
     lines = [title]
     for i, row in enumerate(bar_rows(values, height, col)):
         label, edge = (compact(top), '┤') if i == 0 else ('', '│')
         lines.append(paint(f'{label:>{GUTTER}} {edge}', DIM) + paint(row, color))
-    ticks, labels = x_axis(starts, by, col)
+    if labels is not None:
+        lines.append(paint(f'{"":>{GUTTER}} │', DIM) + value_row(labels, col, color, paint))
+    ticks, dates = x_axis(starts, by, col)
     lines.append(paint(f'{"0":>{GUTTER}} └{ticks}', DIM))
-    lines.append(paint(f'{"":>{GUTTER}}  {labels}', DIM))
+    lines.append(paint(f'{"":>{GUTTER}}  {dates}', DIM))
     return lines
 
 
@@ -295,7 +330,7 @@ def parse_args(argv):
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument('path', nargs='?', default='.', help='any directory inside the repo (default: .)')
-    parser.add_argument('-b', '--by', choices=GRANULARITIES, default='week', help='bucket size (default: week)')
+    parser.add_argument('-b', '--by', choices=GRANULARITIES, default='day', help='bucket size (default: day)')
     parser.add_argument(
         '-n',
         '--last',
@@ -303,7 +338,16 @@ def parse_args(argv):
         metavar='N',
         help='show the last N buckets (default: the whole history, or as much as fits the terminal)',
     )
-    parser.add_argument('--height', type=positive_int, default=8, help='rows per chart (default: 8; 1 is a sparkline)')
+    parser.add_argument(
+        '-H', '--height', type=positive_int, default=8, help='rows per chart (default: 8; 1 is a sparkline)'
+    )
+    parser.add_argument(
+        '-v',
+        '--values',
+        action='store_true',
+        help='print the exact number under each bar: commits, and the change in lines of code; '
+        'columns widen to fit them, so fewer buckets fit the terminal',
+    )
     parser.add_argument(
         '-x',
         '--exclude',
@@ -340,15 +384,20 @@ def run(args) -> None:
     last_day = max(date.today(), *days)
     end = bucket_start(last_day, by)
     avail = max(10, shutil.get_terminal_size().columns - GUTTER - 3)
-    n = args.last or count_periods(bucket_start(min(days), by), end, by)
-    if n > avail:
-        if args.last:
-            print(f'repocharts: the terminal fits {plural(avail, by)}; showing the last {avail}', file=sys.stderr)
-        n = avail
-    col = max(1, min(MAX_COL, avail // n))
+    wanted = args.last or count_periods(bucket_start(min(days), by), end, by)
+    n = min(wanted, avail)
     series = build_series(commit_days, loc_changes or [], by, end, n)
+    # With --values every bucket needs room for its widest number plus a gap.
+    need = max(map(len, sum(value_labels(series), [])), default=0) + 1 if args.values else 1
+    if n * need > avail:
+        n = avail // need
+        series = build_series(commit_days, loc_changes or [], by, end, n)
+    if args.last and n < args.last:
+        print(f'repocharts: the terminal fits {plural(n, by)}; showing the last {n}', file=sys.stderr)
+    col = max(need, min(MAX_COL, avail // n))
 
     paint = Paint(not args.no_color and not os.environ.get('NO_COLOR') and sys.stdout.isatty())
+    counts, changes = value_labels(series) if args.values else (None, None)
     excluded = [*([] if args.with_lockfiles else ['lockfiles']), *args.exclude]
     if loc_changes is None:
         loc_block = [
@@ -357,12 +406,12 @@ def run(args) -> None:
         ]
     else:
         loc_block = render_chart(
-            loc_title(series, excluded, paint), series.loc, series.starts, by, args.height, col, CYAN, paint
+            loc_title(series, excluded, paint), series.loc, series.starts, by, args.height, col, CYAN, paint, changes
         )
     blocks = [
         [paint(top.name, BOLD) + f' · by {by} · {series.starts[0]} → {last_day}'],
         render_chart(
-            commits_title(series, by, paint), series.commits, series.starts, by, args.height, col, GREEN, paint
+            commits_title(series, by, paint), series.commits, series.starts, by, args.height, col, GREEN, paint, counts
         ),
         loc_block,
     ]

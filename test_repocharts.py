@@ -212,6 +212,7 @@ class Series(unittest.TestCase):
         series = app.build_series([], changes, 'week', end=date(2026, 1, 26), n=4)
         self.assertEqual(series.loc_before, 50)
         self.assertEqual(series.loc, [60, 60, 57, 57])
+        self.assertEqual(series.loc_deltas, [10, 0, -3, 0])
 
     def test_window_reaches_back_before_the_first_commit(self):
         series = app.build_series([date(2026, 3, 2)], [], 'month', end=date(2026, 3, 1), n=3)
@@ -238,6 +239,27 @@ class Bars(unittest.TestCase):
 
     def test_all_zero_draws_an_empty_chart(self):
         self.assertEqual(app.bar_rows([0, 0], height=2, col=1), ['', ''])
+
+    def test_bars_stay_two_cells_wide_in_wider_columns(self):
+        self.assertEqual(app.bar_rows([1, 1], height=1, col=5), ['██   ██'])
+
+
+class ValueLabels(unittest.TestCase):
+    def test_zero_has_no_label(self):
+        self.assertEqual(app.value_label(0), '')
+        self.assertEqual(app.value_label(0, signed=True), '')
+
+    def test_counts_are_exact_below_ten_thousand(self):
+        self.assertEqual(app.value_label(7), '7')
+        self.assertEqual(app.value_label(9999), '9999')
+
+    def test_changes_carry_their_sign(self):
+        self.assertEqual(app.value_label(30, signed=True), '+30')
+        self.assertEqual(app.value_label(-20, signed=True), '-20')
+
+    def test_ten_thousand_and_up_are_abbreviated(self):
+        self.assertEqual(app.value_label(12345, signed=True), '+12k')
+        self.assertEqual(app.value_label(-1_500_000, signed=True), '-1.5M')
 
 
 class Axis(unittest.TestCase):
@@ -317,6 +339,45 @@ class Cli(unittest.TestCase):
         bars = chart_blocks(out)[0][1]
         self.assertLessEqual(len(bars), 60)
         self.assertIn('terminal', err)
+
+    def test_the_default_bucket_is_a_day(self):
+        repo = self.recent_repo()
+        _, out, _ = run_main(str(repo.root))
+        self.assertTrue(out.startswith('proj · by day'), out)
+        self.assertIn('Commits per day · 4 in 21 days', out)
+
+    def test_H_is_short_for_height(self):
+        repo = self.recent_repo()
+        _, out, _ = run_main(str(repo.root), '-H', '3')
+        commits, loc = chart_blocks(out)
+        self.assertEqual(len(commits), 1 + 3 + 2)
+
+    def test_values_put_the_count_under_each_bar_and_the_change_under_each_loc_bar(self):
+        repo = self.recent_repo()
+        _, out, _ = run_main(str(repo.root), '--last', '21', '-H', '3', '--values')
+        commits, loc = chart_blocks(out)
+        self.assertEqual(len(commits), 1 + 3 + 1 + 2)
+        self.assertEqual(len(loc), 1 + 3 + 1 + 2)
+
+        def tokens(row):
+            self.assertTrue(row.startswith(' ' * app.GUTTER + ' │'), row)
+            return [(m.start(), m.group()) for m in re.finditer(r'\S+', row[app.GUTTER + 2:])]
+
+        count_row, change_row, bottom_bars = tokens(commits[4]), tokens(loc[4]), tokens(commits[3])
+        self.assertEqual([text for _, text in count_row], ['1', '2', '1'])
+        self.assertEqual([text for _, text in change_row], ['+30', '+15', '-20'])
+        # Each number starts where its bar starts, in both charts.
+        self.assertEqual([pos for pos, _ in count_row], [pos for pos, _ in bottom_bars])
+        self.assertEqual([pos for pos, _ in change_row], [pos for pos, _ in bottom_bars])
+
+    def test_values_widen_the_columns_and_shrink_the_window_to_fit(self):
+        repo = self.recent_repo()
+        code, out, err = run_main(str(repo.root), '--last', '21', '--values', columns=40)
+        self.assertEqual(code, 0)
+        self.assertIn('Commits per day · 1 in 8 days', out)
+        self.assertIn('terminal', err)
+        chart_rows = [line for line in out.splitlines() if any(ch in line for ch in '│┤└')]
+        self.assertTrue(all(len(line) <= 40 for line in chart_rows), chart_rows)
 
     def test_runs_from_a_subdirectory(self):
         repo = self.recent_repo()
