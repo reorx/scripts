@@ -102,17 +102,32 @@ def parse_label(label):
 
 def bar_cells(row):
     """(offset, run) of each bar in a chart row; the y axis and gridlines are left out."""
-    return [(m.start(), m.group()) for m in re.finditer(f'[{app.BLOCKS[1:]}]+', row[app.GUTTER + 2:])]
+    return [(m.start(), m.group()) for m in re.finditer(f'[{app.BLOCKS[1:]}{app.SHADES}]+', row[app.GUTTER + 2 :])]
+
+
+def text(rows):
+    """Bar rows as plain strings, trailing blanks dropped."""
+    return [''.join(cell.char for cell in row).rstrip() for row in rows]
 
 
 def bars(values, height, col):
-    return app.bar_rows(values, app.linear_scale(values, height), col)
+    return text(app.bar_rows([(v,) for v in values], app.linear_scale(values, height), col))
+
+
+def eighths(height):
+    """A scale where every unit is an eighth of a row."""
+    return app.Scale(height, {}, set(), lambda v: v / 8)
 
 
 def chart_blocks(output):
     """Split the output into charts: each is the list of lines from its title to its label line."""
     blocks = output.strip('\n').split('\n\n')
     return [block.split('\n') for block in blocks[1:]]
+
+
+def chart_body(block):
+    """The bar rows of a chart drawn without --values, top to bottom: the lines whose y axis is '│' or '┤'."""
+    return [line for line in block if line[app.GUTTER + 1 : app.GUTTER + 2] in ('│', '┤')]
 
 
 class Buckets(unittest.TestCase):
@@ -138,6 +153,95 @@ class Buckets(unittest.TestCase):
         self.assertEqual(app.count_periods(date(2026, 1, 5), date(2026, 1, 5), 'day'), 1)
 
 
+class Kinds(unittest.TestCase):
+    """Every file counts as src, tests or docs; the first matching rule decides."""
+
+    def kind(self, path, *overrides, excludes=()):
+        return app.classify(path, app.kind_rules(excludes, overrides))
+
+    def assertKind(self, kind, paths):
+        for path in paths:
+            with self.subTest(path=path):
+                self.assertEqual(self.kind(path), kind)
+
+    def test_markdown_and_files_under_kb_or_docs_are_docs(self):
+        self.assertKind(
+            'docs',
+            (
+                'README.md',
+                'src/guide.mdx',
+                'a/doc/api.adoc',
+                'docs/index.rst',
+                'docs/conf.py',
+                'kb/plans/2026-11-11-x.md',
+                'kb/data.json',
+            ),
+        )
+
+    def test_test_directories_and_test_file_names_are_tests(self):
+        self.assertKind(
+            'tests',
+            (
+                'tests/helpers.py',
+                'test/fixtures/a.json',
+                'pkg/tests/x.py',
+                'src/__tests__/App.tsx',
+                'src/__mocks__/fs.js',
+                'src/App.test.tsx',
+                'src/api.spec.ts',
+                'test_repocharts.py',
+                'conftest.py',
+                'pkg/util_test.go',
+                'test-tsfwd.sh',
+                'spec/models/user_spec.rb',
+                'e2e/login.ts',
+                'cypress/support/commands.js',
+                'MyAppTests/FooTests.swift',
+                'testdata/a.txt',
+            ),
+        )
+
+    def test_everything_else_is_src(self):
+        self.assertKind(
+            'src',
+            (
+                'repocharts.py',
+                'src/App.tsx',
+                'latest.py',
+                'protests.py',
+                'contest/rank.py',
+                'src/testing.ts',
+                'Makefile',
+            ),
+        )
+
+    def test_docs_rules_win_over_tests_rules(self):
+        self.assertKind('docs', ('tests/README.md', 'kb/test-plan.md', 'docs/test_example.py'))
+
+    def test_rules_from_the_command_line_come_first_in_their_order(self):
+        self.assertEqual(self.kind('tests/fixtures/a.md', ('tests', 'tests/')), 'tests')
+        self.assertEqual(self.kind('notes.txt', ('docs', '*.txt')), 'docs')
+        self.assertEqual(self.kind('docs/conf.py', ('src', 'docs/conf.py')), 'src')
+        self.assertEqual(self.kind('test_a.py', ('src', '*.py'), ('tests', 'test_*')), 'src')
+
+    def test_excluded_files_are_left_out_whatever_their_kind(self):
+        self.assertIsNone(self.kind('uv.lock', excludes=app.LOCKFILES))
+        self.assertIsNone(self.kind('vendor/lib/README.md', ('docs', '*.md'), excludes=['vendor/']))
+
+    def test_a_directory_rule_matches_a_bare_name_at_any_depth_and_a_path_from_the_root(self):
+        self.assertTrue(app.matches('a/b/vendor/x.js', 'vendor/'))
+        self.assertFalse(app.matches('vendor.js', 'vendor/'))
+        self.assertFalse(app.matches('a/vendor', 'vendor/'))
+        self.assertTrue(app.matches('site/content/a.html', 'site/content/'))
+        self.assertFalse(app.matches('x/site/content/a.html', 'site/content/'))
+        self.assertTrue(app.matches('x/site/content/a.html', '*/content/'))
+
+
+def per_commit(changes):
+    """(day, change over all kinds) of each commit, oldest first."""
+    return sorted((day, sum(by_kind.values())) for day, by_kind in changes)
+
+
 class GitHistory(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -152,20 +256,33 @@ class GitHistory(unittest.TestCase):
 
     def test_loc_changes_follow_the_first_parent_so_a_merged_branch_counts_once(self):
         d1, d2, _, d4, d5 = self.days
-        changes = sorted(app.read_loc_changes(self.repo.root, app.LOCKFILES))
-        self.assertEqual(changes, [(d1, 10), (d2, -3), (d4, 1), (d5, 4)])
+        changes = app.read_loc_changes(self.repo.root, app.kind_rules(app.LOCKFILES))
+        self.assertEqual(per_commit(changes), [(d1, 10), (d2, -3), (d4, 1), (d5, 4)])
 
     def test_loc_changes_sum_to_the_text_lines_at_head(self):
-        changes = app.read_loc_changes(self.repo.root, app.LOCKFILES)
-        self.assertEqual(sum(delta for _, delta in changes), 7 + 4 + 1)
+        changes = app.read_loc_changes(self.repo.root, app.kind_rules(app.LOCKFILES))
+        self.assertEqual(sum(delta for _, delta in per_commit(changes)), 7 + 4 + 1)
 
     def test_lockfiles_count_when_not_excluded(self):
-        changes = app.read_loc_changes(self.repo.root, [])
-        self.assertEqual(sum(delta for _, delta in changes), 12 + 100)
+        changes = app.read_loc_changes(self.repo.root, app.kind_rules([]))
+        self.assertEqual(sum(delta for _, delta in per_commit(changes)), 12 + 100)
 
     def test_exclude_patterns_match_paths_and_basenames(self):
-        changes = app.read_loc_changes(self.repo.root, [*app.LOCKFILES, 'b.py', 'c*'])
-        self.assertEqual(sum(delta for _, delta in changes), 7)
+        changes = app.read_loc_changes(self.repo.root, app.kind_rules([*app.LOCKFILES, 'b.py', 'c*']))
+        self.assertEqual(sum(delta for _, delta in per_commit(changes)), 7)
+
+    def test_lines_are_split_by_kind_and_a_moved_file_takes_its_lines_along(self):
+        d1, d2 = date(2026, 2, 2), date(2026, 2, 3)
+        repo = Repo(Path(self.tmp.name) / 'kinds')
+        repo.commit(d1, app__py=['a'] * 5, helpers__py=['h'] * 4, test_app__py=['t'] * 3, README__md=['r'] * 2)
+        (repo.root / 'tests').mkdir()
+        repo.git('mv', 'helpers.py', 'tests/helpers.py')
+        repo.commit(d2, README__md=['r'])
+        changes = sorted(app.read_loc_changes(repo.root, app.kind_rules([])), key=lambda change: change[0])
+        self.assertEqual(
+            changes,
+            [(d1, {'src': 9, 'tests': 3, 'docs': 2}), (d2, {'src': -4, 'tests': 4, 'docs': -1})],
+        )
 
 
 class PartialClone(unittest.TestCase):
@@ -222,11 +339,24 @@ class Series(unittest.TestCase):
         self.assertEqual(series.starts, [date(2026, 1, 5), date(2026, 1, 12), date(2026, 1, 19), date(2026, 1, 26)])
         self.assertEqual(series.commits, [2, 0, 1, 0])
 
-    def test_loc_is_the_running_total_at_the_end_of_each_bucket(self):
-        changes = [(date(2025, 12, 30), 50), (date(2026, 1, 5), 10), (date(2026, 1, 20), -3)]
-        series = app.build_series([], changes, 'week', end=date(2026, 1, 26), n=4)
-        self.assertEqual(series.loc_before, 50)
-        self.assertEqual(series.loc, [60, 60, 57, 57])
+    CHANGES = [
+        (date(2025, 12, 30), {'src': 50, 'docs': 5}),
+        (date(2026, 1, 5), {'src': 10, 'tests': 4}),
+        (date(2026, 1, 20), {'src': -3}),
+    ]
+
+    def test_loc_is_the_running_total_per_kind_at_the_end_of_each_bucket(self):
+        series = app.build_series([], self.CHANGES, 'week', end=date(2026, 1, 26), n=4)
+        self.assertEqual(series.loc_before, {'src': 50, 'tests': 0, 'docs': 5})
+        self.assertEqual(series.loc, {'src': [60, 60, 57, 57], 'tests': [4, 4, 4, 4], 'docs': [5, 5, 5, 5]})
+        self.assertEqual(series.loc_total, [69, 69, 66, 66])
+        self.assertEqual(series.loc_deltas, [14, 0, -3, 0])
+
+    def test_only_the_chosen_kinds_are_kept_bottom_layer_first(self):
+        series = app.build_series([], self.CHANGES, 'week', end=date(2026, 1, 26), n=4, kinds=('src', 'docs'))
+        self.assertEqual(list(series.loc), ['src', 'docs'])
+        self.assertEqual(series.loc_stacks, [(60, 5), (60, 5), (57, 5), (57, 5)])
+        self.assertEqual(series.loc_total, [65, 65, 62, 62])
         self.assertEqual(series.loc_deltas, [10, 0, -3, 0])
 
     def test_window_reaches_back_before_the_first_commit(self):
@@ -260,7 +390,77 @@ class Bars(unittest.TestCase):
 
     def test_log_bars_grow_one_row_per_step(self):
         values = [1, 10, 100]
-        self.assertEqual(app.bar_rows(values, app.log_scale(values, 3), col=1), ['  █', ' ██', '███'])
+        rows = app.bar_rows([(v,) for v in values], app.log_scale(values, 3), col=1)
+        self.assertEqual(text(rows), ['  █', ' ██', '███'])
+
+
+def filled(cell):
+    """Eighths of the cell a bar covers: a split cell is full, the upper layer drawn as its background."""
+    return 8 if cell.upper is not None else app.BLOCKS.index(cell.char)
+
+
+class StackedBars(unittest.TestCase):
+    """Layers stack bottom up; a cell is a block in one layer's color over another layer's background."""
+
+    def cells(self, stack, height):
+        """One bar's cells, top to bottom, on a scale of one eighth of a row per unit."""
+        return [row[0] for row in app.bar_rows([stack], eighths(height), col=1)]
+
+    def test_layers_stack_bottom_up(self):
+        self.assertEqual(self.cells((8, 8), 2), [app.Cell('█', 1), app.Cell('█', 0)])
+
+    def test_a_boundary_inside_a_row_splits_the_cell_between_two_layers(self):
+        self.assertEqual(self.cells((3, 13), 2), [app.Cell('█', 1), app.Cell('▃', 0, 1)])
+
+    def test_the_top_cell_of_a_bar_takes_its_larger_layer(self):
+        self.assertEqual(self.cells((11, 1), 2)[0], app.Cell('▄', 0))
+        self.assertEqual(self.cells((9, 3), 2)[0], app.Cell('▄', 1))
+
+    def test_three_layers_in_one_row_lose_the_smallest(self):
+        self.assertEqual(self.cells((2, 1, 5), 1), [app.Cell('▃', 0, 2)])
+
+    def test_an_empty_layer_takes_no_room(self):
+        self.assertEqual(self.cells((8, 0, 8), 2), [app.Cell('█', 2), app.Cell('█', 0)])
+
+    def test_a_stack_is_exactly_as_tall_as_a_bar_of_its_total(self):
+        scale = app.linear_scale([169], 8)
+        for stack in [(100, 50, 19), (1, 1, 1), (0, 0, 7), (160, 0, 9), (3, 97, 0)]:
+            with self.subTest(stack=stack):
+                stacked = app.bar_rows([stack], scale, 1)
+                single = app.bar_rows([(sum(stack),)], scale, 1)
+                self.assertEqual(
+                    [filled(row[0]) for row in stacked],
+                    [filled(row[0]) for row in single],
+                )
+
+
+class Painting(unittest.TestCase):
+    COLORS = ('36', '33', '35')
+
+    def paint(self, cells, grid=False, color=True):
+        return app.paint_row(cells, grid, self.COLORS, app.Paint(color))
+
+    def test_in_color_each_layer_has_its_own_color(self):
+        self.assertEqual(self.paint([app.Cell('█', 0), app.Cell('▅', 2)]), '\033[36m█\033[0m\033[35m▅\033[0m')
+
+    def test_in_color_a_split_cell_shows_the_lower_layer_over_the_upper_layers_background(self):
+        self.assertEqual(self.paint([app.Cell('▃', 0, 1)]), '\033[36;43m▃\033[0m')
+
+    def test_without_color_full_cells_are_shaded_by_their_larger_layer(self):
+        cells = [
+            app.Cell('█', 0),
+            app.Cell('█', 1),
+            app.Cell('█', 2),
+            app.Cell('▃', 0, 1),
+            app.Cell('▆', 1, 2),
+            app.Cell('▃', 1),
+        ]
+        self.assertEqual(self.paint(cells, color=False), '█▓░▓▓▃')
+
+    def test_blank_cells_become_a_dim_gridline_in_grid_rows_and_are_trimmed_elsewhere(self):
+        cells = [app.Cell('█', 0), app.BLANK, app.BLANK]
+        self.assertEqual(self.paint(cells, grid=True, color=False), '█' + app.GRID * 2)
+        self.assertEqual(self.paint(cells, color=False), '█')
 
 
 class LinearScale(unittest.TestCase):
@@ -333,7 +533,6 @@ class LogScale(unittest.TestCase):
         self.assertGreater(scale.to_rows(1), 0)
 
 
-
 class ValueLabels(unittest.TestCase):
     def test_zero_has_no_label(self):
         self.assertEqual(app.value_label(0), '')
@@ -402,7 +601,7 @@ class Cli(unittest.TestCase):
         self.assertTrue(commits[0].startswith('Commits per day · 4 in 21 days · peak 2'), commits[0])
         self.assertTrue(loc[0].startswith('Lines of code · 0 → 25 (+25)'), loc[0])
         self.assertEqual(len(commits), 1 + 3 + 2)
-        self.assertEqual(len(loc), 1 + 3 + 2)
+        self.assertEqual(len(loc), 1 + 1 + 3 + 2)  # title, legend, rows, axis, dates
 
     def test_both_charts_share_the_same_columns(self):
         repo = self.recent_repo()
@@ -410,7 +609,7 @@ class Cli(unittest.TestCase):
         commits, loc = chart_blocks(out)
 
         # Both bottom rows start drawing on the day of the first commit, 20 days ago.
-        self.assertEqual(bar_cells(commits[3])[0][0], bar_cells(loc[3])[0][0])
+        self.assertEqual(bar_cells(chart_body(commits)[-1])[0][0], bar_cells(chart_body(loc)[-1])[0][0])
         self.assertEqual(commits[-2:], loc[-2:])
 
     def test_default_window_spans_the_history_when_it_fits(self):
@@ -443,13 +642,13 @@ class Cli(unittest.TestCase):
         _, out, _ = run_main(str(repo.root), '--last', '21', '-H', '3', '--values')
         commits, loc = chart_blocks(out)
         self.assertEqual(len(commits), 1 + 3 + 1 + 2)
-        self.assertEqual(len(loc), 1 + 3 + 1 + 2)
+        self.assertEqual(len(loc), 1 + 1 + 3 + 1 + 2)
 
         def tokens(row):
             self.assertTrue(row.startswith(' ' * app.GUTTER + ' │'), row)
-            return [(m.start(), m.group()) for m in re.finditer(r'\S+', row[app.GUTTER + 2:])]
+            return [(m.start(), m.group()) for m in re.finditer(r'\S+', row[app.GUTTER + 2 :])]
 
-        count_row, change_row, bottom_bars = tokens(commits[4]), tokens(loc[4]), bar_cells(commits[3])
+        count_row, change_row, bottom_bars = tokens(commits[4]), tokens(loc[5]), bar_cells(commits[3])
         self.assertEqual([text for _, text in count_row], ['1', '2', '1'])
         self.assertEqual([text for _, text in change_row], ['+30', '+15', '-20'])
         # Each number starts where its bar starts, in both charts.
@@ -465,8 +664,8 @@ class Cli(unittest.TestCase):
         chart_rows = [line for line in out.splitlines() if any(ch in line for ch in '│┤└')]
         self.assertTrue(all(len(line) <= 40 for line in chart_rows), chart_rows)
 
-    def y_labels(self, block, height=8):
-        return [line[: app.GUTTER].strip() for line in block[1 : 1 + height]]
+    def y_labels(self, block):
+        return [line[: app.GUTTER].strip() for line in chart_body(block)]
 
     def test_the_y_axis_has_round_ticks_with_gridlines(self):
         repo = self.recent_repo()
@@ -476,7 +675,7 @@ class Cli(unittest.TestCase):
         self.assertEqual(self.y_labels(loc), ['60', '', '45', '', '30', '', '15', ''])
         for block in (commits, loc):
             labelled = [bool(label) for label in self.y_labels(block)]
-            self.assertEqual([app.GRID in line for line in block[1:9]], labelled)
+            self.assertEqual([app.GRID in line for line in chart_body(block)], labelled)
 
     def test_log_puts_the_y_axis_on_a_1_2_5_ladder(self):
         repo = self.recent_repo()
@@ -484,6 +683,47 @@ class Cli(unittest.TestCase):
         self.assertIn('log scale', out.splitlines()[0])
         _, loc = chart_blocks(out)
         self.assertEqual(self.y_labels(loc), ['50', '', '', '', '20', '', '', ''])
+
+    def kinds_repo(self):
+        """30 lines of src and 5 of docs three days ago, 10 lines of tests today."""
+        repo = Repo(self.root / 'proj')
+        repo.commit(self.today - timedelta(days=3), app__py=['a'] * 30, README__md=['r'] * 5)
+        repo.commit(self.today, test_app__py=['t'] * 10)
+        return repo
+
+    def test_the_loc_chart_stacks_src_tests_and_docs_under_a_legend(self):
+        repo = self.kinds_repo()
+        _, out, _ = run_main(str(repo.root), '--last', '4')
+        _, loc = chart_blocks(out)
+        self.assertTrue(loc[0].startswith('Lines of code · 0 → 45 (+45)'), loc[0])
+        self.assertEqual(
+            loc[1].split(), ['█', 'src', '30', '(+30)', '▓', 'tests', '10', '(+10)', '░', 'docs', '5', '(+5)']
+        )
+        # Without color the layers are told apart by shading.
+        body = ''.join(chart_body(loc))
+        self.assertIn('▓', body)
+        self.assertIn('░', body)
+
+    def test_kinds_pick_which_lines_to_chart(self):
+        repo = self.kinds_repo()
+        _, out, _ = run_main(str(repo.root), '--last', '4', '-k', 'docs,tests')
+        _, loc = chart_blocks(out)
+        self.assertTrue(loc[0].startswith('Lines of code · 0 → 15 (+15)'), loc[0])
+        self.assertEqual(loc[1].split(), ['█', 'tests', '10', '(+10)', '▓', 'docs', '5', '(+5)'])
+
+    def test_an_unknown_kind_is_a_usage_error(self):
+        repo = self.kinds_repo()
+        with self.assertRaises(SystemExit) as raised:
+            run_main(str(repo.root), '-k', 'src,code')
+        self.assertEqual(raised.exception.code, 2)
+
+    def test_rules_on_the_command_line_override_the_built_in_ones(self):
+        repo = self.kinds_repo()
+        _, out, _ = run_main(str(repo.root), '--last', '4', '--src', 'test_*', '--tests', '*.md')
+        _, loc = chart_blocks(out)
+        self.assertEqual(
+            loc[1].split(), ['█', 'src', '40', '(+40)', '▓', 'tests', '5', '(+5)', '░', 'docs', '0', '(+0)']
+        )
 
     def test_runs_from_a_subdirectory(self):
         repo = self.recent_repo()

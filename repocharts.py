@@ -13,6 +13,15 @@ Two charts share one time axis, so their columns line up:
      Merges count with their diff against the first parent, so a merged
      branch's lines land on the day of the merge and the final total equals
      the text lines at HEAD. Binary files and lockfiles are left out.
+     The bars stack three kinds of lines, src at the bottom, then tests, then docs,
+     each in its own color (without color: █ ▓ ░ shading); -k picks which to chart.
+
+Every file is one kind: that of the first rule it matches among -x (left out),
+then --src, --tests and --docs in the order given, then the built-in docs rules
+(Markdown and kb/, docs/), then the built-in tests rules (test directories and
+test file names); anything else is src. A GLOB matches the path from the repo
+root or the file name; `name/` matches the files under any directory of that
+name, `a/b/` the files under that path.
 
 The y axis is linear with round ticks and a dotted gridline near each labelled
 row's top edge, where its value lies; the chart top is rounded up to the next tick.
@@ -27,7 +36,9 @@ rather than the total, which the bar and the title already show.
     repocharts.py -b week -H 4      # by week, 4 rows high
     repocharts.py -b week --log     # by week, small weeks readable next to spikes
     repocharts.py ~/Code/x -b month # another repo, by month
-    repocharts.py -x 'vendor/*'     # leave more files out of the line count
+    repocharts.py -x vendor/        # leave more files out of the line count
+    repocharts.py -k src            # only src in the line chart, no tests or docs
+    repocharts.py --tests 'it/' --src 'docs/*.py'  # fix which kind some files are
 """
 
 import argparse
@@ -37,13 +48,14 @@ import os
 import shutil
 import subprocess
 import sys
-from collections import Counter
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from fnmatch import fnmatchcase
 from fractions import Fraction
 from pathlib import Path
+from typing import NamedTuple
 
 GRANULARITIES = ('day', 'week', 'month')
 # Generated dependency pins, not code; matched against file names.
@@ -55,13 +67,25 @@ LOCKFILES = (
     'go.sum',
     'Package.resolved',
 )
+# Kinds of lines of code, in stacking order from the bottom.
+KINDS = ('src', 'tests', 'docs')
+# Built-in kind rules, tried after -x and --src/--tests/--docs; files they miss are src. Docs go first,
+# so Markdown is docs even in a test directory and kb/test-plan.md stays docs.
+DOC_RULES = ('kb/', 'docs/', 'doc/', '*.md', '*.mdx', '*.markdown', '*.rst', '*.adoc')
+TEST_RULES = (
+    *('test/', 'tests/', '*Tests/', '__tests__/', '__mocks__/', 'spec/', 'e2e/', 'cypress/', 'testdata/'),
+    *('test_*', 'test-*', '*_test.*', '*.test.*', '*.spec.*', '*_spec.*', 'conftest.py'),
+)
+DEFAULT_RULES = (*(('docs', p) for p in DOC_RULES), *(('tests', p) for p in TEST_RULES))
 BLOCKS = ' ▁▂▃▄▅▆▇█'
+SHADES = '█▓░'  # without color, a full cell shows its layer by shading, bottom layer first
 GUTTER = 4  # width of the y-axis labels; compact() never needs more
 MAX_COL = 3  # widest column per bucket without --values: a 2-cell bar plus a 1-cell gap
 MAX_BAR = MAX_COL - 1
 EXACT_BELOW = 10_000  # --values prints smaller numbers in full, larger ones like compact()
 UNITS = {'k': 10**3, 'M': 10**6, 'G': 10**9}
-BOLD, DIM, RED, GREEN, CYAN = '1', '2', '31', '32', '36'
+BOLD, DIM, RED, GREEN, YELLOW, MAGENTA, CYAN = '1', '2', '31', '32', '33', '35', '36'
+KIND_COLORS = {'src': CYAN, 'tests': YELLOW, 'docs': MAGENTA}
 # Y axis
 NICE = tuple(Fraction(c) for c in ('1', '1.5', '2', '2.5', '3', '4', '5', '6', '8'))  # tick intervals x 10^e
 MAX_TICKS = 6  # labels per chart before they thin out to every 2nd, 4th, ... row
@@ -80,12 +104,22 @@ class RepoError(Exception):
 class Series:
     starts: list[date]
     commits: list[int]
-    loc: list[int]
-    loc_before: int  # lines of code just before the first bucket
+    loc: dict[str, list[int]]  # kind -> lines of code at the end of each bucket, bottom layer first
+    loc_before: dict[str, int]  # kind -> lines of code just before the first bucket
+
+    @property
+    def loc_stacks(self) -> list[tuple[int, ...]]:
+        """Each bucket's lines of code, one number per kind."""
+        return list(zip(*self.loc.values()))
+
+    @property
+    def loc_total(self) -> list[int]:
+        return [sum(stack) for stack in self.loc_stacks]
 
     @property
     def loc_deltas(self) -> list[int]:
-        return [after - before for before, after in zip([self.loc_before, *self.loc], self.loc)]
+        totals = self.loc_total
+        return [after - before for before, after in zip([sum(self.loc_before.values()), *totals], totals)]
 
 
 @dataclass
@@ -96,6 +130,17 @@ class Scale:
     ticks: dict[int, int]  # row -> the value at its top edge, labelled on the y axis
     grid: set[int]  # rows whose top edge gets a gridline
     to_rows: Callable[[int], float]  # value -> bar height in rows
+
+
+class Cell(NamedTuple):
+    """One character of a bar: a block in the color of one layer, over the background of another."""
+
+    char: str
+    lower: int | None = None  # layer drawn by the block
+    upper: int | None = None  # layer filling the rest of the cell, behind the block
+
+
+BLANK = Cell(' ')
 
 
 class Paint:
@@ -174,14 +219,33 @@ def read_commit_days(repo: Path) -> list[date]:
     return [local_day(ts) for ts in out.split()]
 
 
-def is_excluded(path: str, patterns) -> bool:
-    name = path.rsplit('/', 1)[-1]
-    return any(fnmatchcase(path, p) or fnmatchcase(name, p) for p in patterns)
+def matches(path: str, pattern: str) -> bool:
+    """Whether a glob matches the path or the file name.
+
+    `name/` matches the files under any directory of that name, `a/b/` the files under that path.
+    """
+    parts = path.split('/')
+    if not pattern.endswith('/'):
+        return fnmatchcase(path, pattern) or fnmatchcase(parts[-1], pattern)
+    pattern = pattern[:-1]
+    dirs = ['/'.join(parts[:i]) for i in range(1, len(parts))] if '/' in pattern else parts[:-1]
+    return any(fnmatchcase(d, pattern) for d in dirs)
 
 
-def read_loc_changes(repo: Path, excludes) -> list[tuple[date, int]]:
-    """(committer day, added - deleted lines) for each first-parent commit of HEAD, newest first.
+def kind_rules(excludes, overrides=()) -> list[tuple[str | None, str]]:
+    """(kind, glob) in the order they are tried: excludes (kind None), then overrides, then the built-in rules."""
+    return [*((None, pattern) for pattern in excludes), *overrides, *DEFAULT_RULES]
 
+
+def classify(path: str, rules) -> str | None:
+    """The kind of the first rule matching the path, src when none does; None leaves the file out."""
+    return next((kind for kind, pattern in rules if matches(path, pattern)), 'src')
+
+
+def read_loc_changes(repo: Path, rules) -> list[tuple[date, dict[str, int]]]:
+    """(committer day, added - deleted lines per kind) for each first-parent commit of HEAD, newest first.
+
+    Renames count as a deletion plus an addition, so a file moved to another kind takes its lines along.
     Lazy fetching is off: in a partial clone git would otherwise download missing
     blobs one commit at a time, so a missing blob fails the call instead.
     """
@@ -201,35 +265,40 @@ def read_loc_changes(repo: Path, excludes) -> list[tuple[date, int]]:
         'HEAD',
         env={'GIT_NO_LAZY_FETCH': '1'},
     )
+    kinds = {}  # path -> kind; most paths come up in many commits
     changes = []
     for line in out.splitlines():
         if line.startswith('@'):
-            changes.append([local_day(line[1:]), 0])
+            changes.append((local_day(line[1:]), dict.fromkeys(KINDS, 0)))
             continue
         if '\t' not in line:
             continue
         added, deleted, path = line.split('\t', 2)
-        if added == '-' or is_excluded(path.strip('"'), excludes):  # '-' marks a binary file
+        if added == '-':  # a binary file
             continue
-        changes[-1][1] += int(added) - int(deleted)
-    return [(day, delta) for day, delta in changes]
+        path = path.strip('"')
+        if path not in kinds:
+            kinds[path] = classify(path, rules)
+        if kind := kinds[path]:
+            changes[-1][1][kind] += int(added) - int(deleted)
+    return changes
 
 
 # Series ----------------------------------------------------------------------
 
 
-def build_series(commit_days, loc_changes, by: str, end: date, n: int) -> Series:
-    """The n buckets ending with the one that starts at `end`."""
+def build_series(commit_days, loc_changes, by: str, end: date, n: int, kinds=KINDS) -> Series:
+    """The n buckets ending with the one that starts at `end`, with lines of code of the given kinds."""
     starts = [shift(end, by, i - n + 1) for i in range(n)]
     commits = Counter(bucket_start(day, by) for day in commit_days)
-    deltas = Counter()
-    for day, delta in loc_changes:
-        deltas[bucket_start(day, by)] += delta
-    loc_before = sum(delta for start, delta in deltas.items() if start < starts[0])
-    loc, total = [], loc_before
-    for start in starts:
-        total += deltas[start]
-        loc.append(total)
+    deltas = defaultdict(Counter)  # bucket start -> kind -> change
+    for day, change in loc_changes:
+        deltas[bucket_start(day, by)].update(change)
+    loc_before = {kind: sum(d[kind] for start, d in deltas.items() if start < starts[0]) for kind in kinds}
+    loc = {
+        kind: list(itertools.accumulate((deltas[start][kind] for start in starts), initial=loc_before[kind]))[1:]
+        for kind in kinds
+    }
     return Series(starts, [commits[start] for start in starts], loc, loc_before)
 
 
@@ -350,18 +419,58 @@ def log_scale(values, height: int) -> Scale:
 # Rendering -------------------------------------------------------------------
 
 
-def bar_rows(values, scale: Scale, col: int) -> list[str]:
-    """Rows top to bottom; each bucket takes `col` cells, the last one a gap when col > 1."""
+def stack_bounds(stack, scale: Scale) -> list[int]:
+    """Where each layer of a bar ends, in eighths of a row from the bottom.
+
+    The top sits where a bar of the total would, so a nonzero total gets at least an eighth;
+    the bounds in between are the running sums rounded to an eighth.
+    """
+    sums = list(itertools.accumulate(max(0, v) for v in stack))
+    if not sums[-1]:
+        return [0] * len(sums)
+    top = min(scale.height * 8, max(1, round(scale.to_rows(sums[-1]) * 8)))
+    return [*(min(top, round(scale.to_rows(s) * 8)) for s in sums[:-1]), top]
+
+
+def stack_cell(bounds: list[int], row: int) -> Cell:
+    """The cell `row` rows up a bar (0 = bottom) whose layers end at `bounds`.
+
+    A cell shows at most two layers, a block over a background, and only one in the bar's top
+    cell, where the background must stay empty; the smallest parts merge into a neighbour
+    until the rest fits, so the larger layer wins.
+    """
+    floor = row * 8
+    runs, below = [], 0  # [layer, eighths] of the layers in this cell, bottom up
+    for layer, top in enumerate(bounds):
+        eighths = min(top, floor + 8) - max(below, floor)
+        if eighths > 0:
+            runs.append([layer, eighths])
+        below = top
+    filled = sum(eighths for _, eighths in runs)
+    while len(runs) > (2 if filled == 8 else 1):
+        i = min(range(len(runs)), key=lambda i: runs[i][1])
+        _, eighths = runs.pop(i)
+        runs[max(i - 1, 0)][1] += eighths
+    if not runs:
+        return BLANK
+    if len(runs) == 2:
+        (lower, eighths), (upper, _) = runs
+        return Cell(BLOCKS[eighths], lower, upper)
+    return Cell(BLOCKS[filled], runs[0][0])
+
+
+def bar_rows(stacks, scale: Scale, col: int) -> list[list[Cell]]:
+    """Rows top to bottom; each bucket takes `col` cells, the last one a gap when col > 1.
+
+    A stack is a bucket's values, one per layer, drawn bottom up.
+    """
     bar = min(col - 1, MAX_BAR) if col > 1 else 1
     gap = col - bar
-    height = scale.height
-    # Bar heights in eighths of a row; any nonzero value gets at least one.
-    levels = [min(height * 8, max(1, round(scale.to_rows(v) * 8))) if v > 0 else 0 for v in values]
-    rows = []
-    for r in reversed(range(height)):
-        cells = (BLOCKS[min(8, max(0, level - r * 8))] * bar + ' ' * gap for level in levels)
-        rows.append(''.join(cells).rstrip())
-    return rows
+    bounds = [stack_bounds(stack, scale) for stack in stacks]
+    return [
+        [cell for b in bounds for cell in [stack_cell(b, r)] * bar + [BLANK] * gap]
+        for r in reversed(range(scale.height))
+    ]
 
 
 def value_label(n: int, signed: bool = False) -> str:
@@ -377,14 +486,29 @@ def value_labels(series: Series) -> tuple[list[str], list[str]]:
     return [value_label(c) for c in series.commits], [value_label(d, signed=True) for d in series.loc_deltas]
 
 
-def paint_row(row: str, grid_width: int, color: str, paint: Paint) -> str:
-    """Bars in color; with a grid width, the blank cells up to it become a dim gridline."""
-    if not grid_width:
-        return paint(row, color)
+def shade(cell: Cell) -> str:
+    """The cell without color: full cells shaded by the layer filling most of them, a bar's top cell as is."""
+    if cell.upper is not None:
+        return SHADES[cell.lower if BLOCKS.index(cell.char) > 4 else cell.upper]
+    return SHADES[cell.lower] if cell.char == BLOCKS[8] else cell.char
+
+
+def paint_row(cells: list[Cell], grid: bool, colors, paint: Paint) -> str:
+    """Bars in their layers' colors (`colors` by layer), shaded without color.
+
+    Blank cells are a dim gridline in grid rows; elsewhere the trailing ones are dropped.
+    """
+    end = len(cells) if grid else max((i + 1 for i, cell in enumerate(cells) if cell != BLANK), default=0)
     out = []
-    for blank, run in itertools.groupby(row.ljust(grid_width), key=lambda ch: ch == ' '):
-        text = ''.join(run)
-        out.append(paint(GRID * len(text), DIM) if blank else paint(text, color))
+    for (lower, upper), run in itertools.groupby(cells[:end], key=lambda cell: (cell.lower, cell.upper)):
+        run = list(run)
+        if lower is None:
+            out.append(paint(GRID * len(run), DIM) if grid else ' ' * len(run))
+        elif not paint.enabled:
+            out.append(''.join(map(shade, run)))
+        else:
+            code = colors[lower] if upper is None else f'{colors[lower]};{int(colors[upper]) + 10}'  # 3x -> 4x: bg
+            out.append(paint(''.join(cell.char for cell in run), code))
     return ''.join(out)
 
 
@@ -420,19 +544,17 @@ def x_axis(starts: list[date], by: str, col: int) -> tuple[str, str]:
 
 
 def render_chart(
-    title: str, values, scale: Scale, starts, by: str, col: int, color: str, paint: Paint, labels=None
+    head: list[str], stacks, scale: Scale, starts, by: str, col: int, colors, paint: Paint, labels=None
 ) -> list[str]:
-    """Title, bar rows, the --values row when labels are given, the axis and its dates."""
-    width = len(starts) * col
-    lines = [title]
-    for i, row in enumerate(bar_rows(values, scale, col)):
+    """Title lines, bar rows, the --values row when labels are given, the axis and its dates."""
+    lines = list(head)
+    for i, row in enumerate(bar_rows(stacks, scale, col)):
         row_number = scale.height - i
         tick = scale.ticks.get(row_number)
         label, edge = ('', '│') if tick is None else (compact(tick), '┤')
-        grid_width = width if row_number in scale.grid else 0
-        lines.append(paint(f'{label:>{GUTTER}} {edge}', DIM) + paint_row(row, grid_width, color, paint))
+        lines.append(paint(f'{label:>{GUTTER}} {edge}', DIM) + paint_row(row, row_number in scale.grid, colors, paint))
     if labels is not None:
-        lines.append(paint(f'{"":>{GUTTER}} │', DIM) + value_row(labels, col, color, paint))
+        lines.append(paint(f'{"":>{GUTTER}} │', DIM) + value_row(labels, col, colors[0], paint))
     ticks, dates = x_axis(starts, by, col)
     lines.append(paint(f'{"0":>{GUTTER}} └{ticks}', DIM))
     lines.append(paint(f'{"":>{GUTTER}}  {dates}', DIM))
@@ -451,11 +573,20 @@ def commits_title(series: Series, by: str, paint: Paint) -> str:
 
 
 def loc_title(series: Series, excluded: list[str], paint: Paint) -> str:
-    after = series.loc[-1]
-    title = paint('Lines of code', BOLD) + f' · {series.loc_before:,} → {after:,} ({after - series.loc_before:+,})'
+    before, after = sum(series.loc_before.values()), series.loc_total[-1]
+    title = paint('Lines of code', BOLD) + f' · {before:,} → {after:,} ({after - before:+,})'
     if excluded:
         title += paint(f' · excluding {", ".join(excluded)}', DIM)
     return title
+
+
+def legend(series: Series, colors, paint: Paint) -> str:
+    """Each kind's swatch, its lines at the end and its change over the window."""
+    items = []
+    for layer, (kind, lines) in enumerate(series.loc.items()):
+        swatch = paint(BLOCKS[8], colors[layer]) if paint.enabled else SHADES[layer]
+        items.append(f'{swatch} {kind} {lines[-1]:,} ({lines[-1] - series.loc_before[kind]:+,})')
+    return f'{"":>{GUTTER}}  ' + '  '.join(items)
 
 
 # Main ------------------------------------------------------------------------
@@ -466,6 +597,13 @@ def positive_int(text: str) -> int:
     if value < 1:
         raise argparse.ArgumentTypeError(f'must be at least 1: {text}')
     return value
+
+
+def kind_list(text: str) -> tuple[str, ...]:
+    picked = {kind.strip() for kind in text.split(',')} - {''}
+    if not picked or not picked <= set(KINDS):
+        raise argparse.ArgumentTypeError(f'pick from {",".join(KINDS)}: {text}')
+    return tuple(kind for kind in KINDS if kind in picked)
 
 
 def parse_args(argv):
@@ -499,13 +637,38 @@ def parse_args(argv):
         'columns widen to fit them, so fewer buckets fit the terminal',
     )
     parser.add_argument(
+        '-k',
+        '--kinds',
+        type=kind_list,
+        default=KINDS,
+        metavar='LIST',
+        help='which lines of code to chart, stacked bottom up: src, tests, docs, comma-separated (default: all)',
+    )
+    parser.add_argument(
         '-x',
         '--exclude',
         action='append',
         default=[],
         metavar='GLOB',
-        help='leave matching files out of the line count; matched against the path and the file name; repeatable',
+        help='leave matching files out of the line count; matched against the path and the file name, '
+        '`dir/` against directories; repeatable',
     )
+    built_in = {
+        'src': 'files no rule matches are src',
+        'tests': f'built in: {" ".join(TEST_RULES)}',
+        'docs': f'built in, tried before the tests ones: {" ".join(DOC_RULES)}',
+    }
+    for kind in KINDS:
+        parser.add_argument(
+            f'--{kind}',
+            dest='rules',
+            action='append',
+            default=[],
+            type=lambda glob, kind=kind: (kind, glob),
+            metavar='GLOB',
+            help=f'count matching files as {kind}, ahead of the built-in rules; repeatable, the first match wins '
+            f'({built_in[kind]})',
+        )
     parser.add_argument(
         '--with-lockfiles',
         action='store_true',
@@ -524,7 +687,7 @@ def run(args) -> None:
     excludes = [*([] if args.with_lockfiles else LOCKFILES), *args.exclude]
     commit_days = read_commit_days(repo)
     try:
-        loc_changes = read_loc_changes(repo, excludes)
+        loc_changes = read_loc_changes(repo, kind_rules(excludes, args.rules))
     except subprocess.CalledProcessError:
         if not is_partial_clone(repo):
             raise
@@ -536,12 +699,12 @@ def run(args) -> None:
     avail = max(10, shutil.get_terminal_size().columns - GUTTER - 3)
     wanted = args.last or count_periods(bucket_start(min(days), by), end, by)
     n = min(wanted, avail)
-    series = build_series(commit_days, loc_changes or [], by, end, n)
+    series = build_series(commit_days, loc_changes or [], by, end, n, args.kinds)
     # With --values every bucket needs room for its widest number plus a gap.
     need = max(map(len, sum(value_labels(series), [])), default=0) + 1 if args.values else 1
     if n * need > avail:
         n = avail // need
-        series = build_series(commit_days, loc_changes or [], by, end, n)
+        series = build_series(commit_days, loc_changes or [], by, end, n, args.kinds)
     if args.last and n < args.last:
         print(f'repocharts: the terminal fits {plural(n, by)}; showing the last {n}', file=sys.stderr)
     col = max(need, min(MAX_COL, avail // n))
@@ -556,15 +719,25 @@ def run(args) -> None:
             paint(f'{"":>{GUTTER}}  `git -C {top} backfill` downloads them in batches (can be large); then rerun', DIM),
         ]
     else:
-        loc_title_text = loc_title(series, excluded, paint)
-        loc_scale = scale_for(series.loc, args.height)
-        loc_block = render_chart(loc_title_text, series.loc, loc_scale, series.starts, by, col, CYAN, paint, changes)
+        colors = tuple(KIND_COLORS[kind] for kind in args.kinds)
+        head = [loc_title(series, excluded, paint), legend(series, colors, paint)]
+        loc_scale = scale_for(series.loc_total, args.height)
+        loc_block = render_chart(head, series.loc_stacks, loc_scale, series.starts, by, col, colors, paint, changes)
     commit_scale = scale_for(series.commits, args.height)
+    commit_stacks = [(count,) for count in series.commits]
     log_note = ' · log scale' if args.log else ''
     blocks = [
         [paint(top.name, BOLD) + f' · by {by}{log_note} · {series.starts[0]} → {last_day}'],
         render_chart(
-            commits_title(series, by, paint), series.commits, commit_scale, series.starts, by, col, GREEN, paint, counts
+            [commits_title(series, by, paint)],
+            commit_stacks,
+            commit_scale,
+            series.starts,
+            by,
+            col,
+            (GREEN,),
+            paint,
+            counts,
         ),
         loc_block,
     ]
