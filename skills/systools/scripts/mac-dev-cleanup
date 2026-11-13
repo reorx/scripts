@@ -3,16 +3,24 @@
 # requires-python = ">=3.11"
 # ///
 """Release macOS dev resources: booted iOS simulators, agent-browser Chrome trees, stale
-Rust build artifacts in the shared cargo target dir, old entries in the uv cache, and
-code-sign clones left behind by browsers that did not quit normally.
+Rust build artifacts in the shared cargo target dir, unused entries in the uv, go, pnpm
+and npm caches, expired codex sessions, and code-sign clones left behind by browsers that
+did not quit normally. The per-project rules and the disk monitor live in dev-space, next
+to this script; the `projects` and `watch` sections run it, so the 06:00 job stays the
+single entry point.
 
 None of them cleans up after itself. A booted simulator keeps a full launchd_sim tree of
 iOS daemons and widget extensions alive (hundreds of processes, GBs of RAM); a leaked
 agent-browser session keeps a ~10-process headless Chrome tree spinning at ~100% CPU
 per renderer, indefinitely; and a target dir shared by every Rust project only grows, as
-does the uv cache, which keeps every wheel and environment it ever made. Every killed
-Chrome leaves a copy of its app bundle under /var/folders, which keeps the version it
-was launched from on disk after the app has updated.
+do the package caches, which keep every version they ever fetched. Every killed Chrome
+leaves a copy of its app bundle under /var/folders, which keeps the version it was
+launched from on disk after the app has updated.
+
+Cache sections keep what an active project (~/Code, committed or edited within 30 days)
+references and what was used within the last week, and report two sizes: du, and real,
+the space deleting it frees (uv and pnpm files are APFS clones of each other and of the
+projects' copies, so du overstates them several times).
 
 `--only games` (never part of the default run) closes Hearthstone and Battle.net before
 the night, when the Mac wakes on its own for agents: left open, the game keeps the
@@ -23,18 +31,26 @@ Exit code: 0 on success, 2 if a section crashed (the others still ran). With --d
 """
 
 import argparse
+import base64
+import contextlib
+import ctypes
 import fcntl
+import hashlib
 import json
 import os
 import plistlib
 import re
 import shutil
 import signal
+import sqlite3
+import stat
+import struct
 import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable
+import tomllib
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -54,9 +70,11 @@ PS_ARGS = ["ps", "-Awwo", "pid,ppid,etime,pcpu,command"]
 DANGER_MARKER = "⚠️"
 
 # clones runs after browser, so it also takes the clones of the sessions browser just killed.
-DEFAULT_TARGETS = ["browser", "sim", "cargo", "uv", "clones"]
+# projects (dev-space's per-project rules) runs before the caches, so references from the
+# node_modules and .venvs it removes no longer keep cache entries alive; watch measures last.
+DEFAULT_TARGETS = ["browser", "sim", "projects", "cargo", "uv", "go", "pnpm", "npm", "codex", "clones", "watch"]
 # These free disk, not memory.
-DISK_TARGETS = {"cargo", "uv", "clones"}
+DISK_TARGETS = {"projects", "cargo", "uv", "go", "pnpm", "npm", "codex", "clones", "watch"}
 
 
 @dataclass(frozen=True)
@@ -441,6 +459,213 @@ def cleanup_games(dry_run: bool) -> int:
     return len(targets)
 
 
+# ── Shared: trash, real sizes, the ~/Code index ─────────────
+# Every disk step moves what it deletes into a trash dir on the same volume first (rename is
+# atomic, so a tool sees an entry whole or not at all), then deletes the trash.
+TRASH_PREFIX = ".mac-dev-cleanup-trash-"
+# A tool of the cleaned kind that started this recently may be installing right now.
+BUSY_SECONDS = 600
+
+# du counts every APFS clone in full, but deleting one clone frees nothing while another
+# lives, and pnpm and uv install by clonefile: their caches look several times bigger than
+# what deleting them gives back. getattrlist's extended common attributes tell how many
+# files share a file's data (CLONE_REFCNT, 1 when nobody else does), which data stream
+# (CLONEID) and the bytes only this file holds (PRIVATESIZE). Verified with `cp -c` on
+# 2026-11-13. 0x200 is EXT_FLAGS, not the refcount (0x41 for any clone).
+_ATTR_CMNEXT_PRIVATESIZE = 0x8
+_ATTR_CMNEXT_CLONEID = 0x100
+_ATTR_CMNEXT_CLONE_REFCNT = 0x1000
+_FSOPT_NOFOLLOW = 0x1
+_FSOPT_ATTR_CMN_EXTENDED = 0x20
+
+
+class _AttrList(ctypes.Structure):
+    _fields_ = [
+        ("bitmapcount", ctypes.c_ushort),
+        ("reserved", ctypes.c_ushort),
+        ("commonattr", ctypes.c_uint32),
+        ("volattr", ctypes.c_uint32),
+        ("dirattr", ctypes.c_uint32),
+        ("fileattr", ctypes.c_uint32),
+        ("forkattr", ctypes.c_uint32),  # holds the extended common attrs under FSOPT_ATTR_CMN_EXTENDED
+    ]
+
+
+_LIBC = ctypes.CDLL(None, use_errno=True)
+
+
+def clone_attrs(path: str) -> tuple[int, int, int] | None:
+    """(private bytes, clone id, clone refcount) of a regular file; None when the volume can't tell."""
+    wanted = _ATTR_CMNEXT_PRIVATESIZE | _ATTR_CMNEXT_CLONEID | _ATTR_CMNEXT_CLONE_REFCNT
+    attrs = _AttrList(5, 0, 0, 0, 0, 0, wanted)
+    buf = ctypes.create_string_buffer(64)
+    if _LIBC.getattrlist(os.fsencode(path), ctypes.byref(attrs), buf, 64, _FSOPT_NOFOLLOW | _FSOPT_ATTR_CMN_EXTENDED):
+        return None
+    # Returned in bit order after the u32 length: off_t private, u64 clone id, u32 refcount.
+    _length, private, clone_id, refcnt = struct.unpack_from("<IqQI", buf.raw)
+    return private, clone_id, refcnt
+
+
+def iter_tree(path: Path) -> Iterator[str]:
+    """path and everything under it, never following symlinks."""
+    if path.is_symlink() or not path.is_dir():
+        yield str(path)
+        return
+    for dirpath, dirs, files in os.walk(path):
+        yield dirpath
+        for name in files:
+            yield os.path.join(dirpath, name)
+        for name in dirs:
+            if os.path.islink(os.path.join(dirpath, name)):
+                yield os.path.join(dirpath, name)
+
+
+def measure_real(paths: Iterable[Path | str]) -> tuple[int, int]:
+    """(du bytes, bytes deleting every path together would really free).
+
+    A hard-linked inode counts only when all its links are in the set; a clone group counts
+    once, and only when all its members are in it (otherwise just the members' private bytes).
+    """
+    inodes: dict[int, list] = {}  # ino → [nlink, links seen, blocks, private, clone id, refcnt]
+    du = 0
+    for root in paths:
+        for name in iter_tree(Path(root)):
+            try:
+                st = os.lstat(name)
+            except FileNotFoundError:
+                continue
+            record = inodes.get(st.st_ino)
+            if record:
+                record[1] += 1
+                continue
+            blocks = st.st_blocks * 512
+            du += blocks
+            regular = stat.S_ISREG(st.st_mode)
+            private, clone_id, refcnt = (clone_attrs(name) if regular else None) or (blocks, 0, 1)
+            inodes[st.st_ino] = [st.st_nlink if regular else 1, 1, blocks, private, clone_id, refcnt]
+
+    real = 0
+    groups: dict[int, list] = {}  # clone id → [refcnt, members seen, largest member, private sum]
+    for nlink, seen, blocks, private, clone_id, refcnt in inodes.values():
+        if seen < nlink:
+            continue  # a hard link outside the set keeps the data
+        if refcnt <= 1:
+            real += private
+            continue
+        group = groups.setdefault(clone_id, [refcnt, 0, 0, 0])
+        group[1] += 1
+        group[2] = max(group[2], blocks)
+        group[3] += private
+    for refcnt, members, largest, private in groups.values():
+        real += largest + private if members >= refcnt else private
+    return du, real
+
+
+def report_sizes(label: str, count: int, paths: list[Path]) -> tuple[int, int]:
+    du, real = measure_real(paths)
+    print(f"  {label:<34} {count:>6}  du {human_bytes(du):>9}  real {human_bytes(real):>9}")
+    return du, real
+
+
+def make_trash(parent: Path) -> Path:
+    return Path(tempfile.mkdtemp(prefix=TRASH_PREFIX, dir=parent))
+
+
+def rmtree_force(path: Path) -> None:
+    """rmtree that first makes read-only dirs writable (the go module cache is all 0555)."""
+    for dirpath, _dirs, _files in os.walk(path):
+        os.chmod(dirpath, 0o755)
+    shutil.rmtree(path)
+
+
+def busy_pids(pattern: re.Pattern, ps_rows: list[tuple], min_age: int = BUSY_SECONDS) -> list[int]:
+    """Processes matching pattern that started less than min_age seconds ago."""
+    return sorted(pid for pid, _ppid, age, _cpu, cmd in ps_rows if age < min_age and pattern.search(cmd))
+
+
+# One walk of ~/Code feeds every reference-based section: go.sum, uv locks and venvs, pnpm
+# node_modules, PEP 723 scripts. tmp/ copies don't count (they are never active, and project
+# rules clean them), nor do vendored or built trees, nor any GOPATH's module cache.
+CODE_ROOT = Path.home() / "Code"
+CODE_SKIP_DIRS = {
+    ".git", "tmp", ".venv", "venv", "target", "__pycache__", "vendor", "site-packages", ".build",
+    "DerivedData", ".next", "dist", "build", ".tox", "Pods", "node_modules",
+}
+# A project committed to, or whose lock/manifest changed, within this window keeps its references.
+ACTIVE_DAYS = 30
+
+
+@dataclass
+class CodeIndex:
+    go_mods: list[Path] = field(default_factory=list)  # dirs holding a go.mod
+    locks: list[Path] = field(default_factory=list)  # uv.lock and pylock*.toml files
+    venvs: list[Path] = field(default_factory=list)  # project .venv dirs
+    node_modules: list[Path] = field(default_factory=list)  # node_modules dirs pnpm made (with .pnpm/)
+    scripts: set[str] = field(default_factory=set)  # file names of PEP 723 scripts
+
+
+def is_pep723_script(path: str, name: str) -> bool:
+    if not name.endswith(".py") and ("." in name or not os.access(path, os.X_OK)):
+        return False
+    try:
+        with open(path, "rb") as f:
+            return b"# /// script" in f.read(4096)
+    except OSError:
+        return False
+
+
+def build_code_index(root: Path) -> CodeIndex:
+    index = CodeIndex()
+    abandoned_gopath = root / "go"
+    for dirpath, dirs, files in os.walk(root):
+        here = Path(dirpath)
+        if "node_modules" in dirs and (here / "node_modules/.pnpm").is_dir():
+            index.node_modules.append(here / "node_modules")
+        if ".venv" in dirs:
+            index.venvs.append(here / ".venv")
+        dirs[:] = sorted(
+            d for d in dirs
+            if d not in CODE_SKIP_DIRS and here / d != abandoned_gopath and not (d == "mod" and here.name == "pkg")
+        )
+        for name in sorted(files):
+            if name == "go.mod":
+                index.go_mods.append(here)
+            elif name == "uv.lock" or (name.startswith("pylock") and name.endswith(".toml")):
+                index.locks.append(here / name)
+            elif is_pep723_script(os.path.join(dirpath, name), name):
+                index.scripts.add(name)
+    return index
+
+
+_CODE_INDEX: CodeIndex | None = None
+_GIT_LAST_COMMIT: dict[str, float] = {}
+
+
+def code_index() -> CodeIndex:
+    """The ~/Code index, built on first use and shared by the sections of this run."""
+    global _CODE_INDEX
+    if _CODE_INDEX is None:
+        _CODE_INDEX = build_code_index(CODE_ROOT)
+    return _CODE_INDEX
+
+
+def git_last_commit(directory: Path) -> float:
+    key = str(directory)
+    if key not in _GIT_LAST_COMMIT:
+        out = run(["git", "-C", key, "log", "-1", "--format=%ct"], timeout=30).stdout.strip()
+        _GIT_LAST_COMMIT[key] = float(out) if out.isdigit() else 0.0
+    return _GIT_LAST_COMMIT[key]
+
+
+def is_active(directory: Path, now: float, *names: str) -> bool:
+    """Committed to, or one of the named files changed, within ACTIVE_DAYS."""
+    newest = git_last_commit(directory)
+    for name in names:
+        with contextlib.suppress(FileNotFoundError):
+            newest = max(newest, (directory / name).stat().st_mtime)
+    return now - newest < ACTIVE_DAYS * 86400
+
+
 # ── cargo target cleanup ────────────────────────────────────
 # What cargo-sweep reports per target dir, e.g. `[INFO] Cleaned 4.51 GiB from "…"`.
 SWEEP_RESULT_RE = re.compile(r"(?:Cleaned|Would clean:) (nothing|[\d.]+ (?:B|KiB|MiB|GiB|TiB)) from")
@@ -484,23 +709,92 @@ def human_bytes(size: float) -> str:
     return f"{size / 1024:.1f} TiB"
 
 
-def reset_polluted_atimes(target: Path, dry_run: bool) -> int:
-    """Set fingerprint JSONs read since cargo last wrote them back to atime = mtime.
+# cargo-sweep ranks a .fingerprint/<unit>/ dir by the newest atime of the files in it, and
+# every build reads them, fresh or not (cargo 1.98 reads the hash, dep-info, json and
+# invoked.timestamp files). But this Mac updates atime on a read only while atime < mtime
+# (measured 2026-11-13: no 24h rule, ctime irrelevant), so after a rebuild only the first
+# build registers and a dependency used daily looks unused from then on. Hence "re-arming":
+# after each sweep, record every unit's real last use in a sidecar and set its atimes one
+# second before mtime, so the next read records itself; before the next sweep, show
+# cargo-sweep the real last use. The json files never count as use: `cargo sweep
+# --installed` and other tools read them all.
+CARGO_SIDECAR = Path.home() / ".local/state/mac-dev-cleanup/cargo-lastuse.json"
+REARM_GAP_NS = 10**9
 
-    cargo-sweep ranks artifacts by the newest atime in each .fingerprint/<unit>/ dir, and
-    cargo's freshness check reads only the hash file there, so that atime is a true
-    "last used by a build". The JSON is read by cargo only right before rewriting it, but
-    `cargo sweep --installed` (even with --dry-run) reads every one, which makes the whole
-    target look used today and silently disables the time-based sweep for weeks.
-    """
-    count = 0
-    for path in target.glob("*/.fingerprint/*/*.json"):
-        stat = path.stat()
-        if stat.st_atime_ns > stat.st_mtime_ns:
-            count += 1
-            if not dry_run:
-                os.utime(path, ns=(stat.st_mtime_ns, stat.st_mtime_ns))
-    return count
+
+def fingerprint_units(target: Path) -> list[Path]:
+    """Every .fingerprint/<unit>/ dir, for host builds (<profile>/) and --target builds (<triple>/<profile>/)."""
+    return sorted(p for pattern in ("*/.fingerprint/*", "*/*/.fingerprint/*") for p in target.glob(pattern) if p.is_dir())
+
+
+def plan_cargo_lastuse(target: Path, sidecar: dict[str, float]) -> dict[str, float]:
+    """Unit (relative to target) → real last use: the recorded one, or a read since re-arming, whichever is newer."""
+    lastuse = {}
+    for unit in fingerprint_units(target):
+        rel = str(unit.relative_to(target))
+        seen = [sidecar.get(rel, 0.0)]
+        mtimes = []
+        for f in unit.iterdir():
+            if f.name.endswith(".json") or not f.is_file():
+                continue
+            st = f.stat()
+            mtimes.append(st.st_mtime)
+            if st.st_atime_ns >= st.st_mtime_ns:  # not armed: read since re-arming, or written since
+                seen.append(st.st_atime)
+        last = max(seen)
+        lastuse[rel] = last if last > 0 else max(mtimes, default=unit.stat().st_mtime)
+    return lastuse
+
+
+def apply_lastuse(target: Path, lastuse: dict[str, float]) -> list[tuple[str, int, int]]:
+    """Set every file's atime to its unit's real last use. Returns the original (path, atime, mtime)s."""
+    originals = []
+    for rel, last in lastuse.items():
+        unit = target / rel
+        if not unit.is_dir():
+            continue
+        for f in unit.iterdir():
+            if f.is_file():
+                st = f.stat()
+                originals.append((str(f), st.st_atime_ns, st.st_mtime_ns))
+                os.utime(f, ns=(int(last * 1e9), st.st_mtime_ns))
+    return originals
+
+
+def restore_atimes(originals: list[tuple[str, int, int]]) -> None:
+    for path, atime_ns, mtime_ns in originals:
+        with contextlib.suppress(FileNotFoundError):
+            os.utime(path, ns=(atime_ns, mtime_ns))
+
+
+def rearm_target(target: Path, lastuse: dict[str, float]) -> dict[str, float]:
+    """Arm every surviving unit (atime one second before mtime). Returns the sidecar to save."""
+    sidecar = {}
+    for rel, last in lastuse.items():
+        unit = target / rel
+        if not unit.is_dir():
+            continue  # swept
+        sidecar[rel] = last
+        for f in unit.iterdir():
+            if f.is_file():
+                st = f.stat()
+                os.utime(f, ns=(st.st_mtime_ns - REARM_GAP_NS, st.st_mtime_ns))
+    return sidecar
+
+
+def load_cargo_sidecar(target: Path) -> dict[str, float]:
+    try:
+        data = json.loads(CARGO_SIDECAR.read_text())
+    except (FileNotFoundError, ValueError):
+        return {}
+    return data.get("units", {}) if data.get("target") == str(target) else {}
+
+
+def save_cargo_sidecar(target: Path, units: dict[str, float]) -> None:
+    CARGO_SIDECAR.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CARGO_SIDECAR.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"target": str(target), "units": units}))
+    os.replace(tmp, CARGO_SIDECAR)
 
 
 def lock_target(target: Path) -> list[int] | None:
@@ -535,27 +829,32 @@ def sweep_target(cargo: str, stub: Path, target: Path, keep_days: int, max_size:
     before = dir_size(target)
     print(f"  {target}  {human_bytes(before)}")
 
-    polluted = reset_polluted_atimes(target, dry_run)
-    if polluted and dry_run:
-        print(f"  [dry-run] would reset atime on {polluted} fingerprint json(s) read outside cargo; estimates below run low")
-    elif polluted:
-        print(f"  reset atime on {polluted} fingerprint json(s) read outside cargo")
-
+    lastuse = plan_cargo_lastuse(target, load_cargo_sidecar(target))
+    cutoff = time.time() - keep_days * 86400
+    print(f"  {len(lastuse)} fingerprint units, {sum(v < cutoff for v in lastuse.values())} unused > {keep_days}d by real last use")
+    # A dry run shows cargo-sweep the real last use too, then puts the atimes back.
+    originals = apply_lastuse(target, lastuse)
     total = 0
     passes = [(f"unused > {keep_days}d", ["--time", str(keep_days)]), (f"cap {max_size}", ["--maxsize", max_size])]
-    for label, criterion in passes:
-        cmd = [cargo, "sweep", *criterion, *(["--dry-run"] if dry_run else []), str(stub)]
-        result = run(cmd, timeout=600)
-        cleaned = parse_sweep_bytes(result.stdout + result.stderr)
-        if cleaned is None:
-            tail = (result.stderr or result.stdout).strip().splitlines()[-1:] or ["no output"]
-            print(f"  {DANGER_MARKER} {label}: cargo sweep failed: {tail[0][:200]}")
-            continue
-        total += cleaned
-        print(f"  {label:<16} {'would clean' if dry_run else 'cleaned'} {human_bytes(cleaned)}")
+    try:
+        for label, criterion in passes:
+            cmd = [cargo, "sweep", *criterion, *(["--dry-run"] if dry_run else []), str(stub)]
+            result = run(cmd, timeout=600)
+            cleaned = parse_sweep_bytes(result.stdout + result.stderr)
+            if cleaned is None:
+                tail = (result.stderr or result.stdout).strip().splitlines()[-1:] or ["no output"]
+                print(f"  {DANGER_MARKER} {label}: cargo sweep failed: {tail[0][:200]}")
+                continue
+            total += cleaned
+            print(f"  {label:<16} {'would clean' if dry_run else 'cleaned'} {human_bytes(cleaned)}")
+    finally:
+        if dry_run:
+            restore_atimes(originals)
 
     if not dry_run:
-        print(f"✅ done, {human_bytes(before)} → {human_bytes(dir_size(target))}")
+        # Interrupted before this point, the files keep atime = real last use: nothing is lost.
+        save_cargo_sidecar(target, rearm_target(target, lastuse))
+        print(f"✅ done, {human_bytes(before)} → {human_bytes(dir_size(target))}, re-armed {len(lastuse)} units")
     return total
 
 
@@ -622,7 +921,7 @@ UV_BUCKETS = (
     "binaries-v0",
 )
 UV_MARKERS = {"CACHEDIR.TAG", ".gitignore", ".git", ".lock"}
-UV_TRASH_PREFIX = ".mac-dev-cleanup-trash-"
+UV_TRASH_PREFIX = TRASH_PREFIX
 # An install persists an archive first and links it after; anything younger may be mid-install.
 UV_GRACE_SECONDS = 86400
 # A uv holding the cache lock for less than this may be installing right now.
@@ -632,7 +931,12 @@ UV_KIND_LABELS = {
     "orphan": "unreferenced archives",
     "wheel": "downloaded wheels",
     "env": "environments",
+    "index": "index metadata",
 }
+# A `uv run --script` env whose script still exists under ~/Code is kept this long: uv keeps no
+# last-use time, so even a script run daily gets its env rebuilt (a clone, seconds) this often.
+UV_SCRIPT_ENV_DAYS = 30
+UV_INDEX_BUCKET = "simple-v18"
 
 
 @dataclass
@@ -699,13 +1003,22 @@ def uv_pointer_bytes(cache: Path) -> bytes:
     return b"\n".join(chunks)
 
 
-def plan_uv_cleanup(cache: Path, keep_days: int, ps_output: str, now: float) -> tuple[list[UvRemoval], list[str]]:
+def plan_uv_cleanup(
+    cache: Path,
+    keep_days: int,
+    ps_output: str,
+    now: float,
+    pins: set[tuple[str, str]] | None = None,
+    scripts: set[str] | None = None,
+) -> tuple[list[UvRemoval], list[str]]:
     """What to delete from the cache. Returns (removals, entries kept only because a process uses them).
 
     uv records no last-use time and this Mac only updates atime on the first read after a
-    write, so age is creation time: a still-needed wheel is downloaded once more, an
-    environment rebuilt from the archives. Wheels built from source stay, since rebuilding
-    them takes minutes and a toolchain.
+    write, so age is creation time. What still has a user is kept regardless of age: wheels
+    an active project's lock or .venv pins (`pins`), and for UV_SCRIPT_ENV_DAYS the env of a
+    script that still exists (`scripts`, file names). The rest is downloaded once more or
+    rebuilt from the archives. Wheels built from source stay, since rebuilding them takes
+    minutes and a toolchain.
     """
     grace_cutoff = now - UV_GRACE_SECONDS
     age_cutoff = now - keep_days * 86400
@@ -737,13 +1050,75 @@ def plan_uv_cleanup(cache: Path, keep_days: int, ps_output: str, now: float) -> 
             if archive.name.encode() not in pointers:
                 consider("orphan", archive, grace_cutoff)
         elif set(sources) == {"wheels"}:
+            if pins is not None and any(uv_wheel_key(cache, lk) in pins for lk in links):
+                continue
             consider("wheel", archive, age_cutoff, links)
         elif set(sources) == {"envs"}:
             consider("env", archive, age_cutoff, links)
 
-    for env in sorted((cache / "environments-v2").glob("*/pyvenv.cfg")):
-        consider("env", env.parent, age_cutoff)
+    script_cutoff = now - UV_SCRIPT_ENV_DAYS * 86400
+    for cfg in sorted((cache / "environments-v2").glob("*/pyvenv.cfg")):
+        kept_script = scripts is not None and uv_env_prompt(cfg) in scripts
+        consider("env", cfg.parent, script_cutoff if kept_script else age_cutoff)
+
+    # The index's HTTP cache: a missing entry is fetched again on the next resolve.
+    for dirpath, _dirs, files in os.walk(cache / UV_INDEX_BUCKET):
+        for name in files:
+            path = Path(dirpath, name)
+            if path.lstat().st_mtime < age_cutoff:
+                removals.append(UvRemoval("index", path))
     return removals, in_use
+
+
+def uv_wheel_key(cache: Path, link: Path) -> tuple[str, str] | None:
+    """wheels-v5/<index>/<name>/<version>-<tags> → (normalized name, version)."""
+    parts = link.relative_to(cache / "wheels-v5").parts
+    return (norm_dist(parts[-2]), wheel_version(parts[-1])) if len(parts) >= 2 else None
+
+
+def uv_env_prompt(cfg: Path) -> str:
+    """The script file name a `uv run --script` env was made for (pyvenv.cfg's prompt)."""
+    match = re.search(r"^prompt = (.+)$", cfg.read_text(errors="replace"), re.M)
+    return match.group(1).strip() if match else ""
+
+
+def norm_dist(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name).lower()
+
+
+def wheel_version(name: str) -> str:
+    return name.split("-", 1)[0]
+
+
+def lock_pins(text: str) -> set[tuple[str, str]]:
+    """(normalized name, version) of every package in a uv.lock ([[package]]) or pylock.toml ([[packages]])."""
+    try:
+        data = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return set()
+    packages = [*data.get("package", []), *data.get("packages", [])]
+    return {(norm_dist(p["name"]), str(p.get("version", ""))) for p in packages if isinstance(p, dict) and "name" in p}
+
+
+def venv_pins(venv: Path) -> set[tuple[str, str]]:
+    pins = set()
+    for info in venv.glob("lib/python*/site-packages/*.dist-info"):
+        match = re.match(r"^(.+?)-(\d[^-]*)\.dist-info$", info.name)
+        if match:
+            pins.add((norm_dist(match.group(1)), match.group(2)))
+    return pins
+
+
+def uv_refs(index: "CodeIndex", now: float) -> set[tuple[str, str]]:
+    """What active projects pin: their lock files and installed .venvs."""
+    pins: set[tuple[str, str]] = set()
+    for lock in index.locks:
+        if is_active(lock.parent, now, lock.name, "pyproject.toml", ".venv"):
+            pins |= lock_pins(lock.read_text(errors="replace"))
+    for venv in index.venvs:
+        if is_active(venv.parent, now, "uv.lock", "pyproject.toml", ".venv"):
+            pins |= venv_pins(venv)
+    return pins
 
 
 def apply_uv_plan(cache: Path, removals: list[UvRemoval]) -> None:
@@ -797,26 +1172,29 @@ def cleanup_uv(keep_days: int, dry_run: bool) -> int:
         print(f"uv started < {UV_BUSY_SECONDS // 60}m ago may be installing (pid {', '.join(map(str, busy))}), skipped this run")
         return 0
 
-    removals, in_use = plan_uv_cleanup(cache, keep_days, "\n".join(row[-1] for row in ps_rows), time.time())
+    now = time.time()
+    index = code_index()
+    pins = uv_refs(index, now)
+    removals, in_use = plan_uv_cleanup(
+        cache, keep_days, "\n".join(row[-1] for row in ps_rows), now, pins=pins, scripts=index.scripts
+    )
     before = dir_size(cache)
-    print(f"  {cache}  {human_bytes(before)}")
-    seen: set[int] = set()
-    total = 0
+    print(f"  {cache}  {human_bytes(before)}  (keeping {len(pins)} pins of active projects, {len(index.scripts)} scripts' envs)")
     for kind, label in UV_KIND_LABELS.items():
         items = [i for i in removals if i.kind == kind]
         if not items:
             continue
-        size = tree_bytes([i.path for i in items], seen)
-        total += size
+        du, real = measure_real([i.path for i in items])
         age = "" if kind in ("stale", "orphan") else f" > {keep_days}d"
-        print(f"  {label + age:<26} {len(items):>5}  {human_bytes(size)}")
+        print(f"  {label + age:<26} {len(items):>5}  du {human_bytes(du):>9}  real {human_bytes(real):>9}")
     if in_use:
         print(f"  kept, in use: {', '.join(in_use)}")
     if not removals:
         print("nothing to clean")
         return 0
+    total, real = measure_real([i.path for i in removals])
     if dry_run:
-        print(f"[dry-run] would remove {len(removals)} entries, {human_bytes(total)} by du")
+        print(f"[dry-run] would remove {len(removals)} entries, du {human_bytes(total)}, real {human_bytes(real)}")
         return total
 
     free_before = volume_free(cache)
@@ -827,6 +1205,908 @@ def cleanup_uv(keep_days: int, dry_run: bool) -> int:
         f"volume free +{human_bytes(max(volume_free(cache) - free_before, 0))}"
     )
     return total
+
+
+# ── go module cache cleanup ─────────────────────────────────
+# `go clean -modcache` is all or nothing. Instead: drop module versions no active project's
+# go.sum needs (lines without the /go.mod suffix need the source) and that were extracted
+# more than a week ago. A dropped version loses its extracted tree and its .zip/.ziphash;
+# the tiny .mod/.info files stay, since resolving the module graph needs them. Go guards a
+# version's download and extraction with flock(<ver>.lock) but reads extracted sources
+# without a lock, which is why referenced versions are never touched. The build cache
+# (GOCACHE) trims itself: every go command prunes entries unused for 5 days, once a day.
+GO_BUSY_RE = re.compile(r"(?:^|/)go (?:build|test|run|install|get|mod|list|vet|generate|work)\b")
+TOOLCHAIN_LINE_RE = re.compile(r"^\s*(?:go\s+|toolchain\s+go)(\d+\.\d+(?:\.\d+)?(?:(?:rc|beta)\d+)?)\s*(?://.*)?$", re.M)
+TOOLCHAIN_KEY_RE = re.compile(r"^golang\.org/toolchain@v\d+\.\d+\.\d+-go(\d+\.\d+(?:\.\d+)?(?:(?:rc|beta)\d+)?)\.")
+
+
+@dataclass
+class GoRemoval:
+    key: str  # <module>@<version>, case-escaped like the cache paths
+    path: Path | None  # the extracted tree, None for a download-only version
+    files: list[Path]  # download cache files dropped with it (.zip, .ziphash)
+    lock: Path  # cache/download/<module>/@v/<version>.lock
+
+
+def go_escape(path: str) -> str:
+    """The module cache's case escaping: upper case → '!' + lower case."""
+    return re.sub(r"[A-Z]", lambda m: "!" + m.group().lower(), path)
+
+
+def go_sum_refs(text: str) -> set[str]:
+    refs = set()
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) == 3 and not fields[1].endswith("/go.mod"):
+            refs.add(f"{go_escape(fields[0])}@{go_escape(fields[1])}")
+    return refs
+
+
+def toolchain_wants(go_mod: str) -> set[str]:
+    return set(TOOLCHAIN_LINE_RE.findall(go_mod))
+
+
+def version_tuple(version: str) -> tuple[int, ...]:
+    return tuple(int(n) for n in re.findall(r"\d+", version))
+
+
+def go_extracted(mod: Path) -> dict[str, Path]:
+    """key → extracted dir. Nested modules are siblings named <path>@<version>, never descended into."""
+    found = {}
+    for dirpath, dirs, _files in os.walk(mod):
+        here = Path(dirpath)
+        if here == mod:
+            dirs[:] = [d for d in dirs if d != "cache" and not d.startswith(TRASH_PREFIX)]
+        keep = []
+        for d in dirs:
+            if "@" in d:
+                found[str((here / d).relative_to(mod))] = here / d
+            else:
+                keep.append(d)
+        dirs[:] = keep
+    return found
+
+
+def go_downloads(mod: Path) -> dict[str, Path]:
+    """key → cache/download/<module>/@v/<version>.zip."""
+    found = {}
+    root = mod / "cache/download"
+    for dirpath, dirs, files in os.walk(root):
+        if os.path.basename(dirpath) == "@v":
+            module = Path(dirpath).parent.relative_to(root)
+            found.update({f"{module}@{f[:-4]}": Path(dirpath, f) for f in files if f.endswith(".zip")})
+            dirs[:] = []
+    return found
+
+
+def plan_go_cleanup(mod: Path, refs: set[str], wants: set[str], keep_days: int, now: float) -> list[GoRemoval]:
+    """Versions to drop: unreferenced, not a wanted or the newest toolchain, untouched for keep_days."""
+    cutoff = now - keep_days * 86400
+    extracted, downloads = go_extracted(mod), go_downloads(mod)
+    toolchains = {k: m.group(1) for k in set(extracted) | set(downloads) if (m := TOOLCHAIN_KEY_RE.match(k))}
+    newest = max(toolchains.values(), key=version_tuple, default=None)
+
+    def wanted(key: str) -> bool:
+        version = toolchains.get(key)
+        if version is None:
+            return key in refs
+        return version == newest or any(version in (w, f"{w}.0") for w in wants)
+
+    plan = []
+    for key in sorted(set(extracted) | set(downloads)):
+        if wanted(key):
+            continue
+        tree, archive = extracted.get(key), downloads.get(key)
+        if tree is not None and tree.lstat().st_mtime >= cutoff:
+            continue  # extracted this week
+        old_zip = archive is not None and archive.lstat().st_mtime < cutoff
+        if tree is None and not old_zip:
+            continue
+        files = [f for f in (archive, archive.with_suffix(".ziphash")) if f.exists()] if old_zip else []
+        module, version = key.rsplit("@", 1)
+        plan.append(GoRemoval(key, tree, files, mod / "cache/download" / module / "@v" / f"{version}.lock"))
+    return plan
+
+
+def try_flock(path: Path) -> int | None | bool:
+    """An exclusive non-blocking flock on path: its fd, None if there is no such file, False if it is held."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        return False
+    return fd
+
+
+def apply_go_plan(mod: Path, plan: list[GoRemoval]) -> tuple[int, int]:
+    """Returns (versions removed, versions skipped because a go process holds their lock)."""
+    trash = make_trash(mod)
+    removed = skipped = 0
+    try:
+        for i, item in enumerate(plan):
+            fd = try_flock(item.lock)
+            if fd is False:
+                skipped += 1
+                continue
+            try:
+                if item.path is not None and item.path.exists():
+                    os.chmod(item.path, 0o755)  # moving a dir to another parent needs write access to it
+                    item.path.rename(trash / f"{i}-{item.path.name}")
+                for f in item.files:
+                    f.rename(trash / f"{i}-{f.name}")
+                removed += 1
+            finally:
+                if fd is not None:
+                    os.close(fd)
+    finally:
+        rmtree_force(trash)
+    return removed, skipped
+
+
+def cleanup_go(keep_days: int, dry_run: bool) -> int:
+    """Trim the go module cache. Returns bytes cleaned (or that would be), by du."""
+    print("── go module cache ────────────────────────────────")
+    go = shutil.which("go")
+    if not go:
+        print("go not found, skipped")
+        return 0
+    env = json.loads(run([go, "env", "-json", "GOMODCACHE", "GOCACHE", "GOVERSION"]).stdout or "{}")
+    mod = Path(env.get("GOMODCACHE", ""))
+    if not env.get("GOMODCACHE") or not (mod / "cache/download").is_dir():
+        print(f"no module cache at {mod}, nothing to clean")
+        return 0
+    busy = busy_pids(GO_BUSY_RE, parse_ps(ps_snapshot()))
+    if busy:
+        print(f"go started < {BUSY_SECONDS // 60}m ago may be downloading (pid {', '.join(map(str, busy))}), skipped this run")
+        return 0
+    trim = Path(env.get("GOCACHE", "")) / "trim.txt"
+    if trim.exists() and time.time() - trim.stat().st_mtime > 3 * 86400:
+        print(f"  {DANGER_MARKER} go build cache last trimmed {human_age(int(time.time() - trim.stat().st_mtime))} ago (go trims it daily)")
+
+    now = time.time()
+    active = [d for d in code_index().go_mods if is_active(d, now, "go.mod", "go.sum")]
+    refs: set[str] = set()
+    wants: set[str] = set()
+    for d in active:
+        with contextlib.suppress(FileNotFoundError):
+            refs |= go_sum_refs((d / "go.sum").read_text(errors="replace"))
+        wants |= toolchain_wants((d / "go.mod").read_text(errors="replace"))
+    plan = plan_go_cleanup(mod, refs, wants, keep_days, now)
+    print(f"  {mod}  {human_bytes(dir_size(mod))}  ({env.get('GOVERSION')}, {len(active)} active projects, {len(refs)} versions referenced)")
+    if not plan:
+        print("nothing to clean")
+        return 0
+    trees = [r.path for r in plan if r.path]
+    report_sizes(f"extracted, unused > {keep_days}d", len(trees), trees)
+    zips = [f for r in plan for f in r.files]
+    report_sizes(f"downloaded zips, unused > {keep_days}d", sum(1 for f in zips if f.suffix == ".zip"), zips)
+    total, real = measure_real(trees + zips)
+    if dry_run:
+        print(f"[dry-run] would remove {len(plan)} module versions, du {human_bytes(total)}, real {human_bytes(real)}")
+        return total
+    free_before = volume_free(mod)
+    removed, skipped = apply_go_plan(mod, plan)
+    note = f", {skipped} skipped (a go process holds their lock)" if skipped else ""
+    print(f"✅ done, removed {removed} module versions{note}, volume free +{human_bytes(max(volume_free(mod) - free_before, 0))}")
+    return total
+
+
+# ── pnpm cleanup ────────────────────────────────────────────
+# `pnpm store prune` can't run here: it deletes every store file with nlink == 1, and on APFS
+# pnpm installs node_modules by clonefile, so every file in this store has nlink 1 and the
+# whole store would go. It also wipes all metadata unconditionally and takes no lock. So:
+# keep a package (its index json and the files it, and its side-effect builds, point at) when
+# a node_modules that exists names it in .pnpm/, or it was stored this week; delete the rest.
+# Index first, then files, so an interruption only leaves orphans for the next run.
+# A command line run as `<path>/<tool> …` or `node <path>/<tool> …`, past its leading options.
+_TOOL_CMD = r"^(?:\S*/)?(?:node\s+(?:--\S+\s+)*)?(?:\S*/)?"
+# Only commands that write the store or the dlx cache make the run wait; `pnpm exec`, `pnpm
+# run` and scripts (a dev server started minutes ago) only read it. Bare `pnpm` installs.
+PNPM_BUSY_RE = re.compile(
+    _TOOL_CMD + r"(?:pnpm(?:\.c?js)?(?:\s+(?:-C|--dir|-F|--filter)\s+\S+|\s+(?!(?:-C|--dir|-F|--filter)\s)-\S+)*"
+    r"(?:\s+(?:install|i|add|update|up|upgrade|remove|rm|uninstall|un|dlx|fetch|import|rebuild|rb|store"
+    r"|install-test|it|link|ln|dedupe|patch-commit|create)(?:\s|$)|\s*$)|pnpx(?:\.c?js)?(?:\s|$))"
+)
+PNPM_ENTRY_RE = re.compile(r"^((?:@[^+]+\+)?[^@]+)@([^_]+)")
+PNPM_INDEX_RE = re.compile(r"^[0-9a-f]+-(.+)\.json$")
+
+
+def pnpm_key(entry: str) -> str | None:
+    """node_modules/.pnpm/<entry> → '<name>@<version>' in the store index's naming ('/' as '+')."""
+    match = PNPM_ENTRY_RE.match(entry)
+    return f"{match.group(1)}@{match.group(2)}" if match else None
+
+
+def index_key(file_name: str) -> str | None:
+    match = PNPM_INDEX_RE.match(file_name)
+    return match.group(1) if match else None
+
+
+def store_file_path(files_dir: Path, integrity: str, mode: int) -> Path:
+    digest = base64.b64decode(integrity.split("-", 1)[1]).hex()
+    return files_dir / digest[:2] / (digest[2:] + ("-exec" if mode & 0o111 else ""))
+
+
+def index_files(body: dict) -> Iterator[dict]:
+    yield from body.get("files", {}).values()
+    for effect in (body.get("sideEffects") or {}).values():
+        if isinstance(effect, dict):
+            yield from (effect.get("added") or {}).values()
+
+
+def pnpm_nm_keys(node_modules: Iterable[Path]) -> set[str]:
+    keys = set()
+    for nm in node_modules:
+        with contextlib.suppress(OSError):
+            keys.update(k for k in map(pnpm_key, os.listdir(nm / ".pnpm")) if k)
+    return keys
+
+
+def plan_pnpm_store(store: Path, nm_keys: set[str], keep_days: int, now: float) -> tuple[list[Path], list[Path]]:
+    """(index jsons to drop, store files to drop). A kept index that can't be read aborts with ValueError."""
+    cutoff = now - keep_days * 86400
+    files_dir = store / "files"
+    keep: set[str] = set()
+    drop_index = []
+    for sub in sorted(os.listdir(store / "index")):
+        for name in sorted(os.listdir(store / "index" / sub)):
+            path = store / "index" / sub / name
+            key = index_key(name)
+            if key is None:
+                continue
+            if key not in nm_keys and path.lstat().st_mtime < cutoff:
+                drop_index.append(path)
+                continue
+            body = json.loads(path.read_bytes())  # unreadable → ValueError: don't guess what it keeps
+            keep.update(str(store_file_path(files_dir, f["integrity"], f["mode"])) for f in index_files(body))
+    drop_files = []
+    for sub in sorted(os.listdir(files_dir)):
+        for name in sorted(os.listdir(files_dir / sub)):
+            path = files_dir / sub / name
+            if str(path) not in keep and path.lstat().st_mtime < cutoff:  # young: an install may be in flight
+                drop_files.append(path)
+    return drop_index, drop_files
+
+
+def plan_pnpm_dlx(dlx: Path, ps_output: str, keep_days: int, now: float) -> tuple[list[Path], list[Path]]:
+    """(dirs to drop, node_modules of the runs kept). pnpm never deletes an old dlx run itself.
+
+    <key>/pkg links to the current run and is recreated whenever pnpm reinstalls the command,
+    so its own mtime is the last (re)install: past keep_days the whole command goes, otherwise
+    only its superseded runs. A run a process's command line points into is always kept.
+    """
+    cutoff = now - keep_days * 86400
+    drop, kept_nm = [], []
+    for key in sorted(dlx.iterdir()):
+        if not key.is_dir() or key.is_symlink() or key.name.startswith(TRASH_PREFIX):
+            continue
+        link = key / "pkg"
+        current = os.path.realpath(link) if link.is_symlink() else None
+        expired = current is None or link.lstat().st_mtime < cutoff
+        runs = [r for r in sorted(key.iterdir()) if r.is_dir() and not r.is_symlink()]
+        running = [r for r in runs if f"{r}/" in ps_output]
+        if expired and not running:
+            drop.append(key)
+            continue
+        for r in runs:
+            if r in running or (not expired and os.path.realpath(r) == current):
+                kept_nm.append(r / "node_modules")
+            else:
+                drop.append(r)
+    return drop, kept_nm
+
+
+def plan_pnpm_metadata(caches: Path, keep_days: int, now: float) -> list[Path]:
+    """Registry metadata files older than keep_days (pnpm rewrites a file whenever it refetches it)."""
+    cutoff = now - keep_days * 86400
+    roots = [p for base in (caches, caches / "v11") if base.is_dir() for p in base.iterdir() if p.is_dir() and p.name.startswith("metadata")]
+    drop = []
+    for root in roots:
+        for dirpath, _dirs, files in os.walk(root):
+            drop.extend(Path(dirpath, f) for f in files if Path(dirpath, f).lstat().st_mtime < cutoff)
+    return sorted(drop)
+
+
+def cleanup_pnpm(keep_days: int, dry_run: bool) -> int:
+    """Trim the pnpm store, dlx cache and metadata. Returns bytes cleaned (or that would be), by du."""
+    print("── pnpm ───────────────────────────────────────────")
+    pnpm = shutil.which("pnpm")
+    if not pnpm:
+        print("pnpm not found, skipped")
+        return 0
+    store = Path(run([pnpm, "store", "path"]).stdout.strip())
+    if store.name != "v10" or not (store / "index").is_dir() or not (store / "files").is_dir():
+        version = run([pnpm, "--version"]).stdout.strip()
+        print(f"{DANGER_MARKER} pnpm {version} keeps its store as {store}, a layout this step doesn't know; skipped")
+        return 0
+    ps_rows = parse_ps(ps_snapshot())
+    busy = busy_pids(PNPM_BUSY_RE, ps_rows)
+    if busy:
+        print(f"pnpm started < {BUSY_SECONDS // 60}m ago may be installing (pid {', '.join(map(str, busy))}), skipped this run")
+        return 0
+
+    now = time.time()
+    caches = Path.home() / "Library/Caches/pnpm"
+    dlx = caches / "dlx"
+    ps_output = "\n".join(row[-1] for row in ps_rows)
+    dlx_drop, dlx_nm = plan_pnpm_dlx(dlx, ps_output, keep_days, now) if dlx.is_dir() else ([], [])
+    node_modules = [*code_index().node_modules, *sorted(Path.home().glob("Library/pnpm/global/*/node_modules")), *dlx_nm]
+    try:
+        index_drop, file_drop = plan_pnpm_store(store, pnpm_nm_keys(node_modules), keep_days, now)
+    except ValueError as e:
+        print(f"  {DANGER_MARKER} a kept store index is unreadable ({e}); store skipped")
+        index_drop, file_drop = [], []
+    meta_drop = plan_pnpm_metadata(caches, keep_days, now)
+
+    print(f"  {store}  ({len(node_modules)} node_modules keep their packages)")
+    if not (dlx_drop or index_drop or file_drop or meta_drop):
+        print("nothing to clean")
+        return 0
+    report_sizes(f"dlx runs, unused > {keep_days}d / superseded", len(dlx_drop), dlx_drop)
+    report_sizes(f"store packages, unreferenced > {keep_days}d", len(index_drop), index_drop + file_drop)
+    report_sizes(f"metadata, older than {keep_days}d", len(meta_drop), meta_drop)
+    total, real = measure_real(dlx_drop + index_drop + file_drop + meta_drop)
+    if dry_run:
+        print(f"[dry-run] would remove du {human_bytes(total)}, real {human_bytes(real)} ({len(file_drop)} store files)")
+        return total
+
+    free_before = volume_free(store)
+    if dlx_drop:
+        trash = make_trash(dlx)
+        try:
+            for i, path in enumerate(dlx_drop):
+                if path.exists():
+                    path.rename(trash / f"{i}-{path.name}")
+        finally:
+            shutil.rmtree(trash)
+    for path in index_drop + file_drop + meta_drop:
+        path.unlink(missing_ok=True)
+    print(f"✅ done, volume free +{human_bytes(max(volume_free(store) - free_before, 0))}")
+    return total
+
+
+# ── npm cleanup ─────────────────────────────────────────────
+# _cacache is content-addressed: index-v5 buckets are append-only logs of
+# "<sha1>\t{key, integrity, time, …}" lines (a key's last line wins, integrity null = deleted),
+# content-v2 holds the data by hash. No last-access time exists, so a key expires keep_days
+# after it was last written; content no live key points to goes. Writes are tmp + rename and
+# appends, without locks, so the worst race is a cache miss. _npx/<hash>/ is one npx package;
+# npm 11 creates and removes <dir>/concurrency.lock around every run, so the dir's mtime is
+# its last use, and a lock present means it runs right now.
+# Only installs make the run wait. npx / npm exec (every agent session starts its MCP servers
+# that way) hold their _npx dir's concurrency.lock while installing, which plan_npx honours,
+# and what they add to _cacache is younger than the one-day grace.
+NPM_BUSY_RE = re.compile(
+    _TOOL_CMD + r"npm(?:-cli\.js)?(?:\s+(?:--prefix|-C|-w|--workspace)\s+\S+|\s+(?!(?:--prefix|-C|-w|--workspace)\s)-\S+)*"
+    r"\s+(?:install|i|in|add|ci|clean-install|ic|update|up|upgrade|cache|pack|publish"
+    r"|install-test|it|install-ci-test|cit|dedupe|ddp|uninstall|remove|rm|r|un|link|ln|rebuild|rb)(?:\s|$)"
+)
+NPM_GRACE_SECONDS = 86400
+
+
+@dataclass
+class CacachePlan:
+    content: list[Path] = field(default_factory=list)
+    drop_buckets: list[Path] = field(default_factory=list)
+    rewrite: dict[Path, list[str]] = field(default_factory=dict)
+    tmp: list[Path] = field(default_factory=list)
+    bucket_mtimes: dict[Path, int] = field(default_factory=dict)
+    expired: int = 0
+    live: int = 0
+
+
+def cacache_content_path(cache: Path, integrity: str) -> Path:
+    algo, b64 = integrity.split("-", 1)
+    digest = base64.b64decode(b64).hex()
+    return cache / "content-v2" / algo / digest[:2] / digest[2:4] / digest[4:]
+
+
+def read_bucket(path: Path) -> list[tuple[str, dict]]:
+    rows = []
+    for line in path.read_text(errors="replace").splitlines():
+        _, sep, body = line.partition("\t")
+        if not sep:
+            continue
+        try:
+            entry = json.loads(body)
+        except ValueError:
+            continue
+        if isinstance(entry, dict) and "key" in entry:
+            rows.append((line, entry))
+    return rows
+
+
+def plan_cacache(cache: Path, keep_days: int, now: float) -> CacachePlan:
+    plan = CacachePlan()
+    cutoff_ms = (now - keep_days * 86400) * 1000
+    buckets: dict[Path, list[tuple[str, dict]]] = {}
+    for dirpath, _dirs, files in os.walk(cache / "index-v5"):
+        for name in files:
+            path = Path(dirpath, name)
+            plan.bucket_mtimes[path] = path.stat().st_mtime_ns
+            buckets[path] = read_bucket(path)
+    latest: dict[str, tuple[dict, Path, str]] = {}
+    for path, rows in buckets.items():
+        for line, entry in rows:
+            latest[entry["key"]] = (entry, path, line)
+    fresh = {k for k, (e, _, _) in latest.items() if e.get("integrity") and (e.get("time") or 0) >= cutoff_ms}
+    plan.live = len(fresh)
+    plan.expired = sum(1 for e, _, _ in latest.values() if e.get("integrity")) - len(fresh)
+
+    keep = set()
+    for key in fresh:
+        for token in str(latest[key][0]["integrity"]).split():
+            with contextlib.suppress(ValueError, IndexError):
+                keep.add(str(cacache_content_path(cache, token)))
+    grace = now - NPM_GRACE_SECONDS  # content written in the last day may still await its index line
+    for dirpath, _dirs, files in os.walk(cache / "content-v2"):
+        for name in files:
+            path = Path(dirpath, name)
+            if str(path) not in keep and path.lstat().st_mtime < grace:
+                plan.content.append(path)
+    plan.content.sort()
+
+    for path, rows in buckets.items():
+        keys = dict.fromkeys(entry["key"] for _, entry in rows)
+        kept = [latest[k][2] for k in keys if k in fresh]
+        if not kept:
+            plan.drop_buckets.append(path)
+        elif len(kept) < len(rows):
+            plan.rewrite[path] = kept
+    plan.drop_buckets.sort()
+    tmp = cache / "tmp"
+    if tmp.is_dir():
+        plan.tmp = sorted(p for p in tmp.iterdir() if p.lstat().st_mtime < grace)
+    return plan
+
+
+def apply_cacache_plan(plan: CacachePlan) -> None:
+    """Content first, then the index: a reader meanwhile sees a miss, never a dangling hit it trusts."""
+    for path in plan.content:
+        path.unlink(missing_ok=True)
+    for path in plan.drop_buckets:
+        if path.exists() and path.stat().st_mtime_ns == plan.bucket_mtimes.get(path):  # untouched since planned
+            path.unlink()
+    for path, lines in plan.rewrite.items():
+        if not path.exists() or path.stat().st_mtime_ns != plan.bucket_mtimes.get(path):
+            continue
+        tmp = path.with_name(f"{path.name}.{TRASH_PREFIX}{os.getpid()}")
+        tmp.write_text("".join(f"\n{line}" for line in lines))
+        os.replace(tmp, path)
+    for path in plan.tmp:
+        if path.is_dir() and not path.is_symlink():
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            path.unlink(missing_ok=True)
+
+
+def plan_npx(npx: Path, ps_output: str, keep_days: int, now: float) -> list[Path]:
+    cutoff = now - keep_days * 86400
+    drop = []
+    for d in sorted(npx.iterdir()):
+        if not d.is_dir() or d.is_symlink() or d.name.startswith(TRASH_PREFIX):
+            continue
+        if d.lstat().st_mtime >= cutoff or (d / "concurrency.lock").exists() or f"{d}/" in ps_output:
+            continue
+        drop.append(d)
+    return drop
+
+
+def apply_npx_plan(npx: Path, drop: list[Path]) -> int:
+    """Take each dir's own concurrency lock (as npx does), then move it to the trash. Returns dirs removed."""
+    trash = make_trash(npx)
+    removed = 0
+    try:
+        for i, d in enumerate(drop):
+            try:
+                (d / "concurrency.lock").mkdir()
+            except (FileExistsError, FileNotFoundError):
+                continue  # an npx started meanwhile, or the dir is gone
+            d.rename(trash / f"{i}-{d.name}")
+            removed += 1
+    finally:
+        shutil.rmtree(trash)
+    return removed
+
+
+def cleanup_npm(keep_days: int, dry_run: bool) -> int:
+    """Trim npm's _cacache and _npx. Returns bytes cleaned (or that would be), by du."""
+    print("── npm ────────────────────────────────────────────")
+    npm = shutil.which("npm")
+    if not npm:
+        print("npm not found, skipped")
+        return 0
+    root = Path(run([npm, "config", "get", "cache"]).stdout.strip())
+    major = int((run([npm, "--version"]).stdout.strip().split(".") or ["0"])[0] or 0)
+    ps_rows = parse_ps(ps_snapshot())
+    busy = busy_pids(NPM_BUSY_RE, ps_rows)
+    if busy:
+        print(f"npm started < {BUSY_SECONDS // 60}m ago may be installing (pid {', '.join(map(str, busy))}), skipped this run")
+        return 0
+
+    now = time.time()
+    cache = root / "_cacache"
+    plan = CacachePlan()
+    if (cache / "index-v5").is_dir() and (cache / "content-v2").is_dir():
+        plan = plan_cacache(cache, keep_days, now)
+    elif cache.exists():
+        print(f"  {DANGER_MARKER} {cache} has a layout this step doesn't know; _cacache skipped")
+    npx = root / "_npx"
+    npx_drop: list[Path] = []
+    if npx.is_dir() and major >= 11:
+        npx_drop = plan_npx(npx, "\n".join(row[-1] for row in ps_rows), keep_days, now)
+    elif npx.is_dir():
+        print(f"  {DANGER_MARKER} npm {major} doesn't mark npx runs with concurrency.lock; _npx skipped")
+
+    print(f"  {root}  (_cacache: {plan.live} keys used in {keep_days}d, {plan.expired} expired)")
+    cacache_files = plan.content + plan.drop_buckets + plan.tmp
+    if not (cacache_files or plan.rewrite or npx_drop):
+        print("nothing to clean")
+        return 0
+    report_sizes(f"_cacache, unused > {keep_days}d", len(plan.content), cacache_files)
+    report_sizes(f"_npx packages, unused > {keep_days}d", len(npx_drop), npx_drop)
+    total, real = measure_real(cacache_files + npx_drop)
+    if dry_run:
+        print(f"[dry-run] would remove du {human_bytes(total)}, real {human_bytes(real)}"
+              + (f", compact {len(plan.rewrite)} index bucket(s)" if plan.rewrite else ""))
+        return total
+    free_before = volume_free(root)
+    apply_cacache_plan(plan)
+    removed = apply_npx_plan(npx, npx_drop) if npx_drop else 0
+    print(f"✅ done, {removed} npx package(s) removed, volume free +{human_bytes(max(volume_free(root) - free_before, 0))}")
+    return total
+
+
+# ── codex session cleanup ───────────────────────────────────
+# `codex resume` and the app list sessions from state_5.sqlite's `threads` table, which names
+# each rollout's path; deleting a rollout file by hand leaves a row that can't be opened. So:
+# - compress: a rollout unused for a week becomes <name>.jsonl.zst. codex reads that form
+#   transparently whatever its compression flag says (rollout/src/compression.rs,
+#   open_rollout_line_reader, codex 0.167), and the index keeps the .jsonl path. The publish
+#   protocol is codex's own: encode and verify aside, then under the writer coordination
+#   lock, with the thread's writer lock free and the source unchanged, link the .zst in place
+#   and remove the .jsonl.
+# - delete: past the delete age, `codex delete --force <uuid>`, which removes the rollout
+#   (either form), the state rows and the name index together. Without --force it refuses
+#   when there is no terminal. It also refuses threads others reference.
+# Threads spawned from one another age as one: a family is as recent as its newest member.
+CODEX_STATE_DB = "state_5.sqlite"
+CODEX_THREAD_COLUMNS = {"id", "rollout_path", "updated_at", "is_pinned", "archived"}
+CODEX_DELETE_MAX = 200
+CODEX_DELETE_BUDGET = 600  # seconds per run, ~2s per delete
+CODEX_TMP_STALE = 6 * 3600  # codex's own TEMP_FILE_STALE_AFTER
+
+
+@dataclass
+class CodexThread:
+    id: str
+    path: Path  # the .jsonl path the index stores
+    updated_at: float
+    pinned: bool
+    related: list[str] = field(default_factory=list)  # spawn parent and children
+    file: Path | None = None  # what is on disk: the .jsonl, its .jsonl.zst, or nothing (dangling row)
+    mtime: float = 0.0
+
+    @property
+    def compressed(self) -> bool:
+        return self.file is not None and self.file.name.endswith(".zst")
+
+
+@dataclass
+class CodexPlan:
+    compress: list[CodexThread] = field(default_factory=list)
+    delete: list[CodexThread] = field(default_factory=list)
+    skipped: list[tuple[CodexThread, str]] = field(default_factory=list)
+
+
+def load_codex_threads(home: Path) -> dict[str, CodexThread] | None:
+    """Unarchived threads from codex's state db; None when the db isn't the layout this step knows."""
+    db = home / CODEX_STATE_DB
+    if not db.is_file() or any(p.name != CODEX_STATE_DB for p in home.glob("state_*.sqlite")):
+        return None
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        if not CODEX_THREAD_COLUMNS <= {row[1] for row in con.execute("pragma table_info(threads)")}:
+            return None
+        rows = con.execute("select id, rollout_path, updated_at, is_pinned from threads where archived = 0").fetchall()
+        has_edges = con.execute("select 1 from sqlite_master where name = 'thread_spawn_edges'").fetchone()
+        edges = con.execute("select parent_thread_id, child_thread_id from thread_spawn_edges").fetchall() if has_edges else []
+    finally:
+        con.close()
+    threads = {}
+    for tid, rollout, updated, pinned in rows:
+        updated = float(updated or 0)
+        threads[tid] = CodexThread(tid, Path(rollout), updated / 1000 if updated > 1e11 else updated, bool(pinned))
+    for parent, child in edges:
+        if parent in threads and child in threads:
+            threads[parent].related.append(child)
+            threads[child].related.append(parent)
+    for t in threads.values():
+        for candidate in (t.path, t.path.with_name(t.path.name + ".zst")):
+            if candidate.is_file():
+                t.file, t.mtime = candidate, candidate.stat().st_mtime
+                break
+    return threads
+
+
+def codex_history(home: Path) -> dict[str, float]:
+    """Session id → when the user last typed into it (history.jsonl)."""
+    latest: dict[str, float] = {}
+    with contextlib.suppress(FileNotFoundError):
+        for line in (home / "history.jsonl").read_text(errors="replace").splitlines():
+            with contextlib.suppress(ValueError, KeyError, TypeError):
+                entry = json.loads(line)
+                latest[entry["session_id"]] = max(latest.get(entry["session_id"], 0.0), float(entry["ts"]))
+    return latest
+
+
+def codex_locked_ids(home: Path) -> set[str]:
+    """Threads whose writer lock a codex process holds right now."""
+    held = set()
+    for lock in (home / "thread-writer-locks").glob("*.lock"):
+        if lock.name.startswith("."):
+            continue
+        fd = try_flock(lock)
+        if fd is False:
+            held.add(lock.stem)
+        elif fd is not None:
+            os.close(fd)
+    return held
+
+
+def plan_codex(threads: dict[str, CodexThread], history: dict[str, float], opened: set[str], locked: set[str],
+               compress_days: int, delete_days: int, now: float) -> CodexPlan:
+    last = {t.id: max(t.updated_at, t.mtime, history.get(t.id, 0.0)) for t in threads.values()}
+    family_last: dict[str, float] = {}
+    for tid in threads:
+        if tid in family_last:
+            continue
+        members, todo = set(), [tid]
+        while todo:
+            cur = todo.pop()
+            if cur not in members:
+                members.add(cur)
+                todo.extend(threads[cur].related)
+        newest = max(last[m] for m in members)
+        family_last.update(dict.fromkeys(members, newest))
+
+    plan = CodexPlan()
+    for t in sorted(threads.values(), key=lambda t: t.id):
+        age = now - family_last[t.id]
+        if age <= compress_days * 86400:
+            continue
+        if t.file is not None and (str(t.file) in opened or str(t.path) in opened):
+            plan.skipped.append((t, "open in a running codex"))
+        elif t.id in locked:
+            plan.skipped.append((t, "writer lock held"))
+        elif age > delete_days * 86400 and not t.pinned:
+            plan.delete.append(t)
+        elif t.file is not None and not t.compressed:
+            plan.compress.append(t)
+    return plan
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def zstd_sha256(zstd: str, path: Path) -> str | None:
+    digest = hashlib.sha256()
+    with subprocess.Popen([zstd, "-d", "-q", "-c", str(path)], stdout=subprocess.PIPE) as proc:
+        for chunk in iter(lambda: proc.stdout.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest() if proc.returncode == 0 else None
+
+
+def zstd_size(zstd: str, path: Path) -> int:
+    """Bytes `zstd -3` turns path into, without writing them anywhere."""
+    size = 0
+    with subprocess.Popen([zstd, "-3", "-q", "-c", str(path)], stdout=subprocess.PIPE) as proc:
+        for chunk in iter(lambda: proc.stdout.read(1 << 20), b""):
+            size += len(chunk)
+    return size
+
+
+def same_file(path: Path, before: os.stat_result) -> bool:
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return False
+    return (st.st_ino, st.st_size, st.st_mtime_ns) == (before.st_ino, before.st_size, before.st_mtime_ns)
+
+
+@contextlib.contextmanager
+def codex_publication_lock(home: Path, thread_id: str) -> Iterator[bool]:
+    """codex's publication guard: hold .coordination.lock, having seen the thread's writer lock free."""
+    locks = home / "thread-writer-locks"
+    locks.mkdir(exist_ok=True)
+    coord = os.open(locks / ".coordination.lock", os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                fcntl.flock(coord, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    yield False
+                    return
+                time.sleep(0.05)
+        probe = try_flock(locks / f"{thread_id}.lock")
+        if probe is not None and probe is not False:
+            os.close(probe)  # every writer takes coordination first, so the probe can go
+        yield probe is not False
+    finally:
+        os.close(coord)
+
+
+def compress_rollout(home: Path, thread: CodexThread, on_encoded: Callable[[], object] | None = None) -> tuple[int, int] | None:
+    """Replace a rollout by its .jsonl.zst. Returns (blocks before, blocks after), None when skipped."""
+    zstd = shutil.which("zstd")
+    plain = thread.path
+    target = plain.with_name(plain.name + ".zst")
+    if zstd is None or not plain.is_file() or target.exists():
+        return None
+    before = plain.stat()
+    fd, tmp_name = tempfile.mkstemp(prefix="rollout-compress-", suffix=".jsonl.zst.tmp", dir=plain.parent)
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as out:
+            if subprocess.run([zstd, "-3", "-q", "-c", str(plain)], stdout=out, timeout=600).returncode != 0:
+                return None
+        if on_encoded:
+            on_encoded()
+        if zstd_sha256(zstd, tmp) != file_sha256(plain):
+            return None  # corrupt, or the rollout changed while encoding
+        os.chmod(tmp, stat.S_IMODE(before.st_mode))
+        os.utime(tmp, ns=(before.st_atime_ns, before.st_mtime_ns))
+        with codex_publication_lock(home, thread.id) as free:
+            if not free or not same_file(plain, before):
+                return None
+            try:
+                os.link(tmp, target)
+            except FileExistsError:
+                return None
+            if not same_file(plain, before):
+                target.unlink()
+                return None
+            plain.unlink()
+        return before.st_blocks * 512, target.stat().st_blocks * 512
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def plan_codex_releases(home: Path, ps_output: str) -> list[Path]:
+    """Standalone releases neither `current` nor any running process uses (codex prunes only the daemon's)."""
+    releases = home / "packages/standalone/releases"
+    if not releases.is_dir():
+        return []
+    current = (home / "packages/standalone/current").resolve()
+    return [
+        d for d in sorted(releases.iterdir())
+        if d.is_dir() and not d.is_symlink() and d.resolve() != current
+        and f"{d}/" not in ps_output and f"{d.resolve()}/" not in ps_output
+    ]
+
+
+def cleanup_codex(compress_days: int, delete_days: int, dry_run: bool) -> int:
+    """Compress and delete expired codex sessions, drop unused releases. Returns bytes freed (or that would be)."""
+    print("── codex sessions ─────────────────────────────────")
+    home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    if not home.is_dir():
+        print(f"no codex home at {home}, nothing to clean")
+        return 0
+    threads = load_codex_threads(home)
+    if threads is None:
+        print(f"{DANGER_MARKER} {home} has no {CODEX_STATE_DB} with the threads table this step knows (codex upgraded?); skipped")
+        return 0
+    now = time.time()
+    sessions = home / "sessions"
+    lsof = run(["lsof", "-Fn", "+D", str(sessions)], timeout=120).stdout if sessions.is_dir() else ""
+    opened = {line[1:] for line in lsof.splitlines() if line.startswith("n")}
+    plan = plan_codex(threads, codex_history(home), opened, codex_locked_ids(home), compress_days, delete_days, now)
+    ps_output = "\n".join(row[-1] for row in parse_ps(ps_snapshot()))
+    releases = plan_codex_releases(home, ps_output)
+    stale_tmp = [p for p in sessions.glob("*/*/*/rollout-compress-*.tmp") if now - p.lstat().st_mtime > CODEX_TMP_STALE]
+
+    codex = shutil.which("codex")
+    print(f"  {home}  ({len(threads)} sessions, {len(opened)} rollout(s) open, {sum(t.compressed for t in threads.values())} compressed)")
+    if not (plan.compress or plan.delete or releases or stale_tmp):
+        print("nothing to clean" + (f" ({len(plan.skipped)} expired but in use)" if plan.skipped else ""))
+        return 0
+    zstd = shutil.which("zstd")
+    compressible = [t for t in plan.compress if t.file] if zstd else []
+    if plan.compress and not zstd:
+        print(f"  {DANGER_MARKER} zstd not found (brew install zstd), {len(plan.compress)} session(s) left uncompressed")
+    comp_du = sum(t.file.stat().st_blocks * 512 for t in compressible)
+    if dry_run:  # what compressing frees, measured: rollouts with images barely shrink
+        comp_du -= sum(-(-zstd_size(zstd, t.file) // 4096) * 4096 for t in compressible)
+    label = f"compress, unused > {compress_days}d"
+    print(f"  {label:<34} {len(compressible):>6}  " + (f"frees {human_bytes(comp_du):>9}" if dry_run else ""))
+    deletable = plan.delete if codex else []
+    if plan.delete and not codex:
+        print(f"  {DANGER_MARKER} codex CLI not found, {len(plan.delete)} expired session(s) kept")
+    del_du, _ = report_sizes(f"delete, unused > {delete_days}d", len(deletable), [t.file for t in deletable if t.file])
+    rel_du, _ = report_sizes("releases nothing runs from", len(releases), releases)
+    for t, why in plan.skipped:
+        print(f"  kept {t.id}: {why}")
+    if dry_run:
+        print(
+            f"[dry-run] would compress {len(compressible)}, delete {len(deletable)} session(s), "
+            f"{len(releases)} release(s): frees {human_bytes(comp_du + del_du + rel_du)}"
+        )
+        return comp_du + del_du + rel_du
+
+    free_before = volume_free(home)
+    for path in stale_tmp:
+        path.unlink(missing_ok=True)
+    compressed = comp_freed = 0
+    for t in compressible:
+        sizes = compress_rollout(home, t)
+        if sizes is not None:
+            compressed += 1
+            comp_freed += sizes[0] - sizes[1]
+    deleted, refused, started = 0, [], time.monotonic()
+    for t in deletable[:CODEX_DELETE_MAX]:
+        if time.monotonic() - started > CODEX_DELETE_BUDGET:
+            break
+        result = run([codex, "delete", "--force", t.id], timeout=60)
+        if result.returncode == 0:
+            deleted += 1
+        else:
+            refused.append(f"{t.id}: {((result.stderr or result.stdout).strip().splitlines() or ['?'])[-1][:120]}")
+    for line in refused:
+        print(f"  codex refused {line}")
+    if releases:
+        trash = make_trash(releases[0].parent)
+        try:
+            for i, d in enumerate(releases):
+                d.rename(trash / f"{i}-{d.name}")
+        finally:
+            shutil.rmtree(trash)
+    print(
+        f"✅ done, compressed {compressed} (freed {human_bytes(comp_freed)}), deleted {deleted} session(s), "
+        f"{len(releases)} release(s), volume free +{human_bytes(max(volume_free(home) - free_before, 0))}"
+    )
+    return comp_freed + del_du + rel_du
+
+
+# ── dev-space hand-off (project rules, monitoring) ──────────
+# dev-space (next to this script) owns the per-project rules and the disk monitor; the 06:00
+# run reaches them through two sections. projects runs before the cache sections, so caches
+# no longer count references from node_modules/.venvs it just deleted; watch runs last.
+def dev_space_args(section: str, dry_run: bool) -> list[str]:
+    if section == "projects":
+        return ["clean", "--scheduled", *(["-n"] if dry_run else [])]
+    return ["watch", "--no-record", "--no-notify"] if dry_run else ["watch", "--agent"]
+
+
+def dev_space_found(section: str, returncode: int, dry_run: bool) -> int:
+    """dev-space's exit code as this script's "found" count; failures raise, for run_sections to report."""
+    if returncode == 0:
+        return 0
+    if section == "projects" and dry_run and returncode == 1:
+        return 1
+    raise RuntimeError(f"dev-space {' '.join(dev_space_args(section, dry_run))} exited {returncode}")
+
+
+def run_dev_space(section: str, dry_run: bool) -> int:
+    print(f"── {section} (dev-space) {'─' * (36 - len(section))}")
+    script = Path(__file__).resolve().parent / "dev-space"
+    if not script.is_file():
+        print(f"{script.name} not found next to this script, skipped")
+        return 0
+    sys.stdout.flush()  # the child writes to the same log
+    returncode = subprocess.run([str(script), *dev_space_args(section, dry_run)], timeout=3600).returncode
+    return dev_space_found(section, returncode, dry_run)
 
 
 # ── browser code-sign clone cleanup ─────────────────────────
@@ -847,7 +2127,7 @@ CLONE_GLOB = "*.code_sign_clone/code_sign_clone.*"
 # Clone birth time minus the browser's start time, in seconds. ps reports elapsed time in
 # whole seconds, so the estimated start can be a little late.
 CLONE_MATCH_WINDOW = (-30, 300)
-CLONE_TRASH_PREFIX = ".mac-dev-cleanup-trash-"
+CLONE_TRASH_PREFIX = TRASH_PREFIX
 # A trash dir younger than this may belong to a run still deleting it.
 CLONE_TRASH_GRACE = 3600
 
@@ -1029,6 +2309,507 @@ def check(name: str, got, want) -> None:
         print(f"  ❌ {name}\n       got:  {got!r}\n       want: {want!r}")
 
 
+def _aged(path: Path, days: float, now: float) -> Path:
+    """Set atime and mtime `days` ago. An mtime before the birth time moves the birth time back on APFS."""
+    when = now - days * 86400
+    os.utime(path, (when, when))
+    return path
+
+
+def _write(path: Path, data: bytes | str = b"x", days: float | None = None, now: float = 0.0) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(data.encode() if isinstance(data, str) else data)
+    return _aged(path, days, now) if days is not None else path
+
+
+def selftest_measure_real() -> None:
+    print("\nmeasure_real (APFS clones, hard links)")
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        solo = _write(root / "solo", os.urandom(300_000))
+        a = _write(root / "a", os.urandom(300_000))
+        b = root / "b"
+        run(["cp", "-c", str(a), str(b)])
+        h1 = _write(root / "h1", os.urandom(300_000))
+        h2 = root / "h2"
+        os.link(h1, h2)
+        size = solo.stat().st_blocks * 512
+        check("a file nothing shares is freed in full", measure_real([solo])[1], size)
+        check("SAFETY: one of two clones frees nothing", measure_real([a])[1], 0)
+        check("both clones together free one copy", measure_real([a, b])[1], size)
+        check("du counts each clone, real counts the copy once", measure_real([a, b])[0], 2 * size)
+        check("SAFETY: one of two hard links frees nothing", measure_real([h1])[1], 0)
+        check("both hard links free the inode once", measure_real([h1, h2])[1], size)
+        check("a dir is walked, clones inside it pair up", measure_real([root])[1] >= 3 * size, True)
+
+
+def selftest_code_index() -> None:
+    print("\nCodeIndex (one walk of ~/Code for every reference-based section)")
+    with tempfile.TemporaryDirectory() as tmp:
+        code = Path(tmp)
+        proj = code / "proj"
+        _write(proj / "go.mod", "module x\n")
+        _write(proj / "go.sum", "")
+        _write(proj / "uv.lock", "")
+        _write(proj / "web/pylock.toml", "")
+        _write(proj / ".venv/lib/python3.12/site-packages/foo-1.0.dist-info/METADATA", "")
+        (proj / "node_modules/.pnpm/x@1.0.0").mkdir(parents=True)
+        (proj / "node_modules/inner/node_modules/.pnpm").mkdir(parents=True)
+        _write(proj / "tool.py", "#!/usr/bin/env -S uv run --script\n# /// script\n# ///\n")
+        runner = _write(proj / "bin/runme", "#!/usr/bin/env -S uv run --script\n# /// script\n# ///\n")
+        runner.chmod(0o755)
+        _write(proj / "plain.py", "print(1)\n")
+        _write(proj / "tmp/copy/go.mod", "module copy\n")
+        (proj / "tmp/copy/node_modules/.pnpm").mkdir(parents=True)
+        _write(code / "go/pkg/mod/example.com/m@v1/go.mod", "module m\n")
+        index = build_code_index(code)
+        check("go.mod dirs, not tmp copies or the module cache", index.go_mods, [proj])
+        check("uv and pylock lock files", sorted(index.locks), [proj / "uv.lock", proj / "web/pylock.toml"])
+        check("project venvs", index.venvs, [proj / ".venv"])
+        check("pnpm node_modules, not descended into, not under tmp", index.node_modules, [proj / "node_modules"])
+        check("PEP 723 scripts by file name, with or without .py", index.scripts, {"tool.py", "runme"})
+
+
+def selftest_cargo_rearm() -> None:
+    print("\ncargo: real last use (re-armed atimes)")
+    with tempfile.TemporaryDirectory() as tmp:
+        target = Path(tmp)
+        now = time.time()
+        day = 86400
+
+        def unit(name: str, mtime_days: float, atime_days: float, polluted_json_days: float | None = None) -> Path:
+            d = target / "debug/.fingerprint" / name
+            for f in (f"lib-{name}", f"dep-lib-{name}", "invoked.timestamp", f"lib-{name}.json"):
+                _write(d / f, "x")
+                os.utime(d / f, (now - atime_days * day, now - mtime_days * day))
+            if polluted_json_days is not None:
+                os.utime(d / f"lib-{name}.json", (now - polluted_json_days * day, now - mtime_days * day))
+            return d
+
+        armed = unit("armed", mtime_days=30, atime_days=30 + 1 / 86400)  # re-armed, not read since
+        read = unit("read", mtime_days=30, atime_days=2)  # read by a build two days ago
+        legacy = unit("legacy", mtime_days=20, atime_days=20 + 1 / 86400)  # armed, but no sidecar entry
+        unit("polluted", mtime_days=40, atime_days=40, polluted_json_days=0)
+        sidecar = {"debug/.fingerprint/armed": now - 3 * day, "debug/.fingerprint/gone": now - day}
+        lastuse = plan_cargo_lastuse(target, sidecar)
+        days = {k.rsplit("/", 1)[-1]: round((now - v) / day) for k, v in lastuse.items()}
+        check("an armed unit nobody read keeps its recorded last use", days.get("armed"), 3)
+        check("a read since re-arming is the new last use", days.get("read"), 2)
+        check("no record and still armed → its last build", days.get("legacy"), 20)
+        check("SAFETY: a json read outside cargo does not count as use", days.get("polluted"), 40)
+
+        hash_file = armed / "lib-armed"
+        before = hash_file.stat()
+        originals = apply_lastuse(target, lastuse)
+        check("before the sweep every file shows the unit's real last use",
+              round((now - hash_file.stat().st_atime) / day), 3)
+        check("mtimes are never touched", hash_file.stat().st_mtime_ns, before.st_mtime_ns)
+        restore_atimes(originals)
+        check("a dry run puts the atimes back exactly", hash_file.stat().st_atime_ns, before.st_atime_ns)
+
+        shutil.rmtree(legacy)  # swept
+        new_sidecar = rearm_target(target, lastuse)
+        check("re-arming records each surviving unit's last use", sorted(new_sidecar),
+              sorted(f"debug/.fingerprint/{n}" for n in ("armed", "read", "polluted")))
+        st = (read / "lib-read").stat()
+        check("re-armed: atime one second before mtime", st.st_mtime_ns - st.st_atime_ns, 10**9)
+        with open(read / "lib-read", "rb") as f:
+            f.read()
+        check("CANARY: on this Mac a read after re-arming records the use",
+              (read / "lib-read").stat().st_atime > now - 60, True)
+
+
+def selftest_uv_refs() -> None:
+    print("\nuv: references from active projects")
+    lock = '[[package]]\nname = "Typing_Extensions"\nversion = "4.12.2"\n\n[[package]]\nname = "foo.bar"\nversion = "1.0"\n'
+    check("uv.lock pins, names normalized", lock_pins(lock), {("typing-extensions", "4.12.2"), ("foo-bar", "1.0")})
+    pylock = '[[packages]]\nname = "numpy"\nversion = "2.1.0"\n'
+    check("pylock.toml pins", lock_pins(pylock), {("numpy", "2.1.0")})
+    check("a broken lock file yields nothing", lock_pins("[[package"), set())
+    check("wheel pointer dir name → version", wheel_version("1.26.4-cp312-cp312-macosx_11_0_arm64"), "1.26.4")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp)
+        now = time.time()
+        archive = cache / "archive-v0"
+        for name in ("CACHEDIR.TAG", ".gitignore", ".lock"):
+            (cache / name).touch()
+
+        def entry(path: Path, days: float, prompt: str | None = None) -> Path:
+            path.mkdir(parents=True)
+            if prompt is not None:
+                (path / "pyvenv.cfg").write_text(f"uv = 0.9.17\nprompt = {prompt}\n")
+            return _aged(path, days, now)
+
+        def link(path: Path, target: Path) -> Path:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.symlink_to(target)
+            return path
+
+        pinned = entry(archive / "PINNEDxxxxxxxxxxxxxxx", 40)
+        link(cache / "wheels-v5/pypi/typing-extensions/4.12.2-py3-none-any", pinned)
+        unpinned = entry(archive / "UNPINNEDxxxxxxxxxxxxx", 10)
+        link(cache / "wheels-v5/pypi/numpy/1.0.0-cp312-cp312-macosx_11_0_arm64", unpinned)
+        script_env = entry(cache / "environments-v2/brewer-0123456789abcdef", 10, prompt="brewer.py")
+        aged_script_env = entry(cache / "environments-v2/brewer-fedcba9876543210", 40, prompt="brewer.py")
+        gone_script_env = entry(cache / "environments-v2/deleted-0123456789abcdef", 10, prompt="deleted.py")
+        old_index = _write(cache / "simple-v18/pypi/requests.rkyv", "x", days=10, now=now)
+        new_index = _write(cache / "simple-v18/pypi/httpx.rkyv", "x", days=1, now=now)
+        removals, _ = plan_uv_cleanup(cache, keep_days=7, ps_output="", now=now,
+                                      pins={("typing-extensions", "4.12.2")}, scripts={"brewer.py"})
+        removed = {i.path for i in removals}
+        check("SAFETY: an old wheel an active lock pins is kept", pinned in removed, False)
+        check("an unpinned wheel past 7 days goes", unpinned in removed, True)
+        check("SAFETY: a script env whose script still exists is kept for 30 days", script_env in removed, False)
+        check("a script env past 30 days goes even if the script exists", aged_script_env in removed, True)
+        check("a script env whose script is gone goes after 7 days", gone_script_env in removed, True)
+        check("index metadata past 7 days goes", old_index in removed, True)
+        check("recent index metadata stays", new_index in removed, False)
+
+
+def selftest_go() -> None:
+    print("\ngo: module cache")
+    gosum = (
+        "github.com/BurntSushi/toml v1.3.2 h1:o7IhLm0Msx3BaB+n3Ag7L8EVlByGnpq14C4YWiu/gL8=\n"
+        "github.com/BurntSushi/toml v1.3.2/go.mod h1:CxXYINrC8qIiEnFrOxCa7Jy5BFHlXnUU2pbicEuybxQ=\n"
+        "golang.org/x/mod v0.9.0/go.mod h1:abc=\n"
+    )
+    check("go.sum: source lines only, paths case-escaped", go_sum_refs(gosum), {"github.com/!burnt!sushi/toml@v1.3.2"})
+    check("go.mod go/toolchain lines", toolchain_wants("module x\n\ngo 1.24\n\ntoolchain go1.25.3\n"), {"1.24", "1.25.3"})
+
+    with tempfile.TemporaryDirectory() as tmp:
+        mod = Path(tmp)
+        now = time.time()
+
+        def extracted(key: str, days: float) -> Path:
+            d = mod / key
+            _write(d / "go.mod", "module m\n")
+            _write(d / "sub/file.go", "package m\n")
+            for p in (d / "sub", d):
+                _aged(p, days, now)
+            return d
+
+        def download(key: str, days: float) -> dict[str, Path]:
+            path, ver = key.split("@")
+            base = mod / "cache/download" / path / "@v"
+            files = {ext: _write(base / f"{ver}.{ext}", "x", days=days, now=now) for ext in ("zip", "ziphash", "mod", "info", "lock")}
+            return files
+
+        kept_ref = extracted("github.com/!burnt!sushi/toml@v1.3.2", 40)
+        dropped = extracted("github.com/foo/bar@v1.0.0", 40)
+        dropped_dl = download("github.com/foo/bar@v1.0.0", 40)
+        young = extracted("github.com/foo/bar@v1.1.0", 2)
+        parent = extracted("golang.org/x/tools@v0.1.0", 40)
+        nested = extracted("golang.org/x/tools/gopls@v0.18.1", 40)
+        tc_old = extracted("golang.org/toolchain@v0.0.1-go1.26.0.darwin-arm64", 40)
+        tc_newest = extracted("golang.org/toolchain@v0.0.1-go1.26.10.darwin-arm64", 40)
+        tc_wanted = extracted("golang.org/toolchain@v0.0.1-go1.25.3.darwin-arm64", 40)
+        zip_only = download("github.com/old/zip@v2.0.0", 40)
+        for d in [kept_ref, dropped, young, parent, nested, tc_old, tc_newest, tc_wanted]:
+            for dp, _dirs, files in os.walk(d, topdown=False):
+                for f in files:
+                    os.chmod(os.path.join(dp, f), 0o444)
+                os.chmod(dp, 0o555)  # how go leaves the module cache: read-only
+
+        refs = {"github.com/!burnt!sushi/toml@v1.3.2", "golang.org/x/tools/gopls@v0.18.1"}
+        plan = plan_go_cleanup(mod, refs, {"1.25.3"}, keep_days=7, now=now)
+        dirs = sorted(str(r.path.relative_to(mod)) for r in plan if r.path)
+        check("old unreferenced extracted dirs go, nested modules told apart", dirs,
+              ["github.com/foo/bar@v1.0.0", "golang.org/toolchain@v0.0.1-go1.26.0.darwin-arm64", "golang.org/x/tools@v0.1.0"])
+        files = sorted(str(f.relative_to(mod / "cache/download")) for r in plan for f in r.files)
+        check("their zips go, and zips nothing extracted from", files, [
+            "github.com/foo/bar/@v/v1.0.0.zip", "github.com/foo/bar/@v/v1.0.0.ziphash",
+            "github.com/old/zip/@v/v2.0.0.zip", "github.com/old/zip/@v/v2.0.0.ziphash",
+        ])
+        for what, path in [("a referenced module", kept_ref), ("a module extracted 2 days ago", young),
+                           ("the newest toolchain", tc_newest), ("a toolchain a go.mod asks for", tc_wanted)]:
+            check(f"SAFETY: keeps {what}", any(r.path == path for r in plan), False)
+
+        busy = next(r for r in plan if r.path == parent)
+        lock_fd = os.open(busy.lock, os.O_RDONLY) if busy.lock.exists() else None
+        if lock_fd is None:
+            busy.lock.parent.mkdir(parents=True, exist_ok=True)
+            busy.lock.touch()
+            lock_fd = os.open(busy.lock, os.O_RDONLY)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        removed, skipped = apply_go_plan(mod, plan)
+        os.close(lock_fd)
+        check("SAFETY: a version whose .lock a go process holds is skipped", (parent.exists(), skipped), (True, 1))
+        check("read-only module trees are deleted", (dropped.exists(), tc_old.exists()), (False, False))
+        check("its zip went, its go.mod and info stay for the module graph",
+              [dropped_dl["zip"].exists(), dropped_dl["mod"].exists(), dropped_dl["info"].exists()], [False, True, True])
+        check("zip-only versions lose the zip", zip_only["zip"].exists(), False)
+        check("no trash left behind", [p.name for p in mod.iterdir() if p.name.startswith(TRASH_PREFIX)], [])
+
+
+def selftest_pnpm() -> None:
+    print("\npnpm: store, dlx, metadata")
+    check("node_modules/.pnpm names → index keys",
+          [pnpm_key(n) for n in ["@scope+name@1.2.3_react@18.2.0", "name@1.0.0-beta.1_peer@2", "plain@3.0.0", ".modules.yaml", "node_modules"]],
+          ["@scope+name@1.2.3", "name@1.0.0-beta.1", "plain@3.0.0", None, None])
+    check("index file name → key", index_key("9c68503dbfd7-@napi-rs+wasm-runtime@1.2.4.json"), "@napi-rs+wasm-runtime@1.2.4")
+    integrity = "sha512-" + base64.b64encode(bytes(range(64))).decode()
+    hexd = bytes(range(64)).hex()
+    check("integrity → store file path", store_file_path(Path("/s/files"), integrity, 0o644), Path(f"/s/files/{hexd[:2]}/{hexd[2:]}"))
+    check("an executable gets -exec", store_file_path(Path("/s/files"), integrity, 0o755).name.endswith("-exec"), True)
+    writers = ["node /opt/homebrew/bin/pnpm install", "pnpm i --frozen-lockfile", "pnpm -C web add zod",
+               "pnpm --filter app update", "/opt/homebrew/bin/pnpm", "pnpm dlx create-vite", "pnpx tsx a.ts",
+               "node /x/pnpm.cjs fetch"]
+    check("installs, dlx and bare pnpm count as busy", [bool(PNPM_BUSY_RE.search(c)) for c in writers], [True] * len(writers))
+    readers = ["node /opt/homebrew/bin/pnpm exec vite preview --port 4173", "pnpm run dev", "pnpm dev",
+               "pnpm -C web build", "du -sk /Users/me/Library/pnpm", "node /Users/me/Library/pnpm/global/5/.pnpm/x/cli.js"]
+    check("SAFETY of the run: exec, scripts and other readers don't block it",
+          [bool(PNPM_BUSY_RE.search(c)) for c in readers], [False] * len(readers))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = Path(tmp) / "store/v10"
+        now = time.time()
+
+        def blob(tag: str, days: float, mode: int = 0o644) -> tuple[dict, Path]:
+            digest = hashlib.sha512(tag.encode()).digest()
+            meta = {"integrity": "sha512-" + base64.b64encode(digest).decode(), "mode": mode, "size": 1}
+            path = store_file_path(store / "files", meta["integrity"], mode)
+            _write(path, tag, days=days, now=now)
+            return meta, path
+
+        def index(key: str, files: dict, days: float, side: dict | None = None) -> Path:
+            body = {"name": key.rsplit("@", 1)[0], "version": key.rsplit("@", 1)[1], "requiresBuild": bool(side), "files": files}
+            if side:
+                body["sideEffects"] = {"darwin-arm64": {"added": side}}
+            digest = hashlib.sha256(key.encode()).hexdigest()
+            return _write(store / "index" / digest[:2] / f"{digest[2:]}-{key}.json", json.dumps(body), days=days, now=now)
+
+        a, a_path = blob("A", 40)
+        b, b_path = blob("B", 40)
+        s, s_path = blob("S-side-effect", 40, mode=0o755)
+        c, c_path = blob("C", 40)
+        n, n_path = blob("N", 1)
+        _, orphan_old = blob("orphan-old", 40)
+        _, orphan_young = blob("orphan-young", 1)
+        index("foo@1.0.0", {"index.js": a}, 40)
+        index("@scope+bar@2.0.0", {"index.js": b}, 40, side={"build/out.node": s})
+        dropped_index = index("baz@3.0.0", {"index.js": c, "shared.js": a}, 40)
+        index("new@1.0.0", {"index.js": n}, 1)
+        nm_keys = {"foo@1.0.0", "@scope+bar@2.0.0"}
+        drop_index, drop_files = plan_pnpm_store(store, nm_keys, keep_days=7, now=now)
+        check("only the old unreferenced package's index goes", drop_index, [dropped_index])
+        check("its exclusive file and old orphans go", sorted(drop_files), sorted([c_path, orphan_old]))
+        for what, path in [("a file a kept package shares", a_path), ("a scoped package's file", b_path),
+                           ("a kept package's side-effect build output", s_path), ("a package stored this week", n_path),
+                           ("an orphan written this week (an install in flight)", orphan_young)]:
+            check(f"SAFETY: keeps {what}", path in drop_files, False)
+        check("SAFETY: unlike `pnpm store prune`, nlink == 1 alone deletes nothing",
+              a_path.stat().st_nlink == 1 and a_path not in drop_files, True)
+
+        dlx = Path(tmp) / "dlx"
+        k1_new, k1_old = dlx / "k1/19aa-100", dlx / "k1/18aa-90"
+        for d in (k1_new, k1_old):
+            (d / "node_modules/.pnpm/tool@1.0.0").mkdir(parents=True)
+        (dlx / "k1/pkg").symlink_to(k1_new)
+        os.utime(dlx / "k1/pkg", (now - 86400, now - 86400), follow_symlinks=False)
+        (dlx / "k2/17aa-1/node_modules").mkdir(parents=True)
+        (dlx / "k2/pkg").symlink_to(dlx / "k2/17aa-1")
+        os.utime(dlx / "k2/pkg", (now - 30 * 86400, now - 30 * 86400), follow_symlinks=False)
+        (dlx / "k3/16aa-1/node_modules").mkdir(parents=True)
+        (dlx / "k3/pkg").symlink_to(dlx / "k3/16aa-1")
+        os.utime(dlx / "k3/pkg", (now - 30 * 86400, now - 30 * 86400), follow_symlinks=False)
+        ps_output = f"node {dlx}/k3/16aa-1/node_modules/.bin/mcp-server\n"
+        drop, kept_nm = plan_pnpm_dlx(dlx, ps_output, keep_days=7, now=now)
+        check("a superseded run goes; a command unused for 7 days goes whole", sorted(drop), sorted([k1_old, dlx / "k2"]))
+        check("SAFETY: a dlx command still running is kept", any(str(p).startswith(str(dlx / "k3")) for p in drop), False)
+        check("kept runs' node_modules still reference the store", sorted(kept_nm),
+              sorted([k1_new / "node_modules", dlx / "k3/16aa-1/node_modules"]))
+
+        caches = Path(tmp) / "Caches/pnpm"
+        stale_meta = _write(caches / "metadata-v1.3/registry.npmjs.org/left-pad.json", "{}", days=10, now=now)
+        fresh_meta = _write(caches / "metadata-v1.3/registry.npmjs.org/react.json", "{}", days=1, now=now)
+        v11_meta = _write(caches / "v11/metadata-full/registry.npmjs.org/a.json", "{}", days=10, now=now)
+        other = _write(caches / "lockfile-verified.jsonl", "{}", days=40, now=now)
+        drop = plan_pnpm_metadata(caches, keep_days=7, now=now)
+        check("metadata files past 7 days go, file by file", sorted(drop), sorted([stale_meta, v11_meta]))
+        check("SAFETY: recent metadata and other cache files stay", (fresh_meta in drop, other in drop), (False, False))
+
+
+def selftest_npm() -> None:
+    print("\nnpm: _cacache and _npx")
+    writers = ["npm install", "node /opt/homebrew/bin/npm ci", "npm --prefix x i -D foo",
+               "/opt/homebrew/bin/npm cache add foo", "npm update"]
+    check("installs and cache commands count as busy", [bool(NPM_BUSY_RE.search(c)) for c in writers], [True] * len(writers))
+    readers = ["npm run dev", "node /opt/homebrew/bin/npm start", "npm test", "npm --prefix x run build",
+               "node /Users/me/.npm/_npx/abc/node_modules/.bin/vite",
+               "npm exec @upstash/context7-mcp@latest", "npx -y tsx a.ts", "npm create vite@latest"]
+    check("SAFETY of the run: scripts, npx/exec (each agent session's MCP servers; _npx dirs carry their own lock) don't block it",
+          [bool(NPM_BUSY_RE.search(c)) for c in readers], [False] * len(readers))
+    with tempfile.TemporaryDirectory() as tmp:
+        cache = Path(tmp) / "_cacache"
+        now = time.time()
+        old, young = (now - 30 * 86400) * 1000, (now - 86400) * 1000
+
+        def integrity(tag: str) -> str:
+            return "sha512-" + base64.b64encode(hashlib.sha512(tag.encode()).digest()).decode()
+
+        def content(tag: str, days: float) -> Path:
+            return _write(cacache_content_path(cache, integrity(tag)), tag, days=days, now=now)
+
+        def line(key: str, tag: str | None, when: float) -> str:
+            body = json.dumps({"key": key, "integrity": integrity(tag) if tag else None, "time": when, "size": 1, "metadata": {}})
+            return f"{hashlib.sha1(body.encode()).hexdigest()}\t{body}"
+
+        mixed = _write(cache / "index-v5/aa/bb/mixed", "\n" + line("k-old", "I3", old) + "\n" + line("k-young", "I2", young), days=1, now=now)
+        all_old = _write(cache / "index-v5/cc/dd/all-old", "\n" + line("k-shared-old", "I1", old) + "\nnot json at all", days=30, now=now)
+        _write(cache / "index-v5/ee/ff/shared", "\n" + line("k-shared-young", "I1", young), days=1, now=now)
+        tomb = _write(cache / "index-v5/11/22/tomb", "\n" + line("k-gone", "I4", young) + "\n" + line("k-gone", None, young), days=1, now=now)
+        i1, i2, i3, i4 = content("I1", 30), content("I2", 1), content("I3", 30), content("I4", 30)
+        in_flight = content("I-in-flight", 0)
+        plan = plan_cacache(cache, keep_days=7, now=now)
+        check("content only expired keys point to goes", sorted(plan.content), sorted([i3, i4]))
+        for what, path in [("content a live key shares with an expired one", i1), ("content of a live key", i2),
+                           ("content written in the last day (index not appended yet)", in_flight)]:
+            check(f"SAFETY: keeps {what}", path in plan.content, False)
+        check("a bucket whose keys all expired goes whole, garbage lines tolerated", sorted(plan.drop_buckets), sorted([all_old, tomb]))
+        check("a mixed bucket is rewritten to its live keys", [json.loads(ln.split("\t", 1)[1])["key"] for ln in plan.rewrite.get(mixed, [])], ["k-young"])
+        stale_tmp = _write(cache / "tmp/abc", "x", days=2, now=now)
+        _write(cache / "tmp/def", "x", days=0, now=now)
+        check("staging files older than a day go", plan_cacache(cache, keep_days=7, now=now).tmp, [stale_tmp])
+        apply_cacache_plan(plan)
+        check("applied: content and buckets gone, rewrite kept the live key",
+              (i3.exists(), all_old.exists(), "k-young" in mixed.read_text(), "k-old" in mixed.read_text()), (False, False, True, False))
+
+        npx = Path(tmp) / "_npx"
+        stale = _aged(_mk(npx / "aaaa"), 10, now)
+        fresh = _aged(_mk(npx / "bbbb"), 1, now)
+        locked = _mk(npx / "cccc")
+        (locked / "concurrency.lock").mkdir()
+        _aged(locked, 10, now)
+        running = _aged(_mk(npx / "dddd"), 10, now)
+        drop = plan_npx(npx, f"node {running}/node_modules/.bin/mcp\n", keep_days=7, now=now)
+        check("an npx dir unused for 7 days goes", drop, [stale])
+        check("SAFETY: recent, locked (running npx) and process-referenced dirs stay",
+              [p in drop for p in (fresh, locked, running)], [False, False, False])
+
+
+def _mk(path: Path) -> Path:
+    path.mkdir(parents=True)
+    return path
+
+
+def selftest_codex() -> None:
+    print("\ncodex: sessions and old releases")
+    with tempfile.TemporaryDirectory() as tmp:
+        home = Path(tmp)
+        now = time.time()
+        day = 86400
+        db = sqlite3.connect(home / "state_5.sqlite")
+        db.execute("create table threads(id text, rollout_path text, updated_at integer, is_pinned integer, archived integer)")
+        db.execute("create table thread_spawn_edges(parent_thread_id text, child_thread_id text, status text)")
+
+        def thread(tid: str, days: float, pinned: int = 0, file_days: float | None = None, body: bool = True, zst: bool = False) -> Path:
+            path = home / "sessions/2026/10/01" / f"rollout-{tid}.jsonl"
+            if body:
+                target = path.with_name(path.name + ".zst") if zst else path
+                _write(target, '{"type":"x"}\n' * 200, days=days if file_days is None else file_days, now=now)
+            db.execute("insert into threads values(?,?,?,?,0)", (tid, str(path), int(now - days * day), pinned))
+            return path
+
+        thread("c-old", 10)
+        thread("d-old", 40)
+        thread("fresh", 1)
+        thread("pin", 40, pinned=1)
+        opened = thread("open", 40)
+        thread("parent", 40)
+        thread("child", 2)
+        thread("touched", 40, file_days=1)
+        thread("hist", 40)
+        thread("zst", 10, zst=True)
+        thread("locked", 40)
+        thread("gone", 40, body=False)
+        db.execute("insert into thread_spawn_edges values('parent','child','open')")
+        db.commit()
+        db.close()
+        _write(home / "history.jsonl", json.dumps({"session_id": "hist", "ts": int(now - day), "text": "hi"}) + "\n")
+        threads = load_codex_threads(home)
+        check("schema check: a state db codex 0.167 writes", threads is not None, True)
+        plan = plan_codex(threads, codex_history(home), {str(opened)}, {"locked"}, compress_days=7, delete_days=30, now=now)
+        check("delete: unused for 30 days, including a dangling row", sorted(t.id for t in plan.delete), ["d-old", "gone"])
+        check("compress: unused for 7 days, or kept from deletion only because pinned",
+              sorted(t.id for t in plan.compress), ["c-old", "pin"])
+        check("skipped with a reason: open in a running codex, writer lock held",
+              sorted((t.id, why) for t, why in plan.skipped), [("locked", "writer lock held"), ("open", "open in a running codex")])
+        untouched = {"fresh", "parent", "child", "touched", "hist", "zst"}
+        acted = {t.id for t in plan.delete + plan.compress} | {t.id for t, _ in plan.skipped}
+        check("SAFETY: recent, family-active, recently written or typed-into, already compressed: untouched",
+              sorted(untouched & acted), [])
+
+        if shutil.which("zstd"):
+            t = threads["c-old"]
+            original = t.path.read_bytes()
+            mtime = t.path.stat().st_mtime_ns
+            locks = home / "thread-writer-locks"
+            locks.mkdir()
+            held = _write(locks / "c-old.lock", "")
+            fd = os.open(held, os.O_RDONLY)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            check("SAFETY: a thread with an active writer is not compressed", compress_rollout(home, t), None)
+            os.close(fd)
+            check("…and nothing is left half done", sorted(p.name for p in t.path.parent.iterdir() if "c-old" in p.name or p.suffix == ".tmp"),
+                  ["rollout-c-old.jsonl"])
+            check("a changing rollout is not compressed",
+                  compress_rollout(home, t, on_encoded=lambda: t.path.open("a").write("more\n")), None)
+            t.path.write_bytes(original)
+            os.utime(t.path, ns=(mtime, mtime))
+            saved = compress_rollout(home, t)
+            zst = t.path.with_name(t.path.name + ".zst")
+            check("compressed in codex's own format, the plain file removed", (saved is not None, zst.exists(), t.path.exists()), (True, True, False))
+            check("lossless", run(["zstd", "-d", "-c", str(zst)]).stdout.encode() == original, True)
+            check("mtime kept, so the age signal survives", zst.stat().st_mtime_ns, mtime)
+        else:
+            print("  (zstd not installed, compression checks skipped)")
+
+        releases = home / "packages/standalone/releases"
+        for name in ("0.166.0-aarch64", "0.167.0-aarch64", "0.167.1-aarch64"):
+            _write(releases / name / "codex", "bin")
+        (home / "packages/standalone/current").symlink_to(releases / "0.167.1-aarch64")
+        ps_output = f"{releases}/0.167.0-aarch64/codex resume\n"
+        check("old releases nothing runs from go; current and running ones stay",
+              plan_codex_releases(home, ps_output), [releases / "0.166.0-aarch64"])
+
+        zstd = shutil.which("zstd")
+        if zstd:
+            sample = _write(home / "sample.jsonl", "".join(f'{{"n": {i}, "text": "hello"}}\n' for i in range(5000)))
+            packed = subprocess.run([zstd, "-3", "-q", "-c", str(sample)], capture_output=True).stdout
+            check("dry-run measures the compressed size exactly (rollouts hold base64 images; no fixed ratio)",
+                  zstd_size(zstd, sample), len(packed))
+
+        bad = home / "bad"
+        bad.mkdir()
+        sqlite3.connect(bad / "state_5.sqlite").execute("create table threads(id text)").connection.close()
+        check("SAFETY: an unknown state schema → skip the section", load_codex_threads(bad), None)
+        check("SAFETY: a renamed state db (new codex) → skip the section", load_codex_threads(home / "packages"), None)
+
+
+def selftest_dev_space() -> None:
+    print("\nprojects / watch: dev-space hand-off")
+    check("projects runs the scheduled clean", dev_space_args("projects", dry_run=False), ["clean", "--scheduled"])
+    check("projects under --dry-run only reports", dev_space_args("projects", dry_run=True), ["clean", "--scheduled", "-n"])
+    check("watch dispatches analysis agents", dev_space_args("watch", dry_run=False), ["watch", "--agent"])
+    check("watch under --dry-run neither records, notifies nor dispatches", dev_space_args("watch", dry_run=True),
+          ["watch", "--no-record", "--no-notify"])
+    check("dry-run exit 1 means there is something to clean", dev_space_found("projects", 1, dry_run=True), 1)
+    check("exit 0 means done", dev_space_found("projects", 0, dry_run=False), 0)
+    try:
+        dev_space_found("projects", 2, dry_run=False)
+        failed = False
+    except RuntimeError:
+        failed = True
+    check("exit 2 fails the section (reported by run_sections)", failed, True)
+    order = DEFAULT_TARGETS
+    caches = ["cargo", "uv", "go", "pnpm", "npm", "codex"]
+    check("projects runs before every cache section, so stale node_modules/.venv no longer pin them",
+          all(order.index("projects") < order.index(c) for c in caches), True)
+    check("watch runs last, measuring what the run left", order[-1], "watch")
+    check("the new sections free disk, not memory", {"projects", "go", "pnpm", "npm", "codex", "watch"} <= DISK_TARGETS, True)
+
+
 def selftest() -> int:
     print("parse_etime")
     check("mm:ss", parse_etime("08:50"), 530)
@@ -1111,27 +2892,6 @@ def selftest() -> int:
     check("GiB", human_bytes(19.5 * 1024**3), "19.5 GiB")
     check("MiB", human_bytes(21 * 1024**2), "21.0 MiB")
     check("bytes", human_bytes(512), "512 B")
-
-    print("\ncargo: reset_polluted_atimes")
-    with tempfile.TemporaryDirectory() as tmp:
-        target = Path(tmp)
-        polluted = target / "debug/.fingerprint/foo-1234abcd/lib-foo.json"
-        clean = target / "release/.fingerprint/bar-5678abcd/lib-bar.json"
-        hash_file = polluted.with_name("lib-foo")
-        for path in (polluted, clean, hash_file):
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("{}")
-        mtime = 1_700_000_000_000_000_000
-        os.utime(polluted, ns=(mtime + 86_400 * 10**9, mtime))  # read a day after cargo wrote it
-        os.utime(clean, ns=(mtime, mtime))
-        os.utime(hash_file, ns=(mtime + 3600 * 10**9, mtime))  # cargo's own freshness read
-        check("dry-run counts only the polluted json", reset_polluted_atimes(target, dry_run=True), 1)
-        check("dry-run changes nothing", polluted.stat().st_atime_ns, mtime + 86_400 * 10**9)
-        check("reset counts the polluted json", reset_polluted_atimes(target, dry_run=False), 1)
-        check("json atime is back to its mtime", polluted.stat().st_atime_ns, mtime)
-        check("json mtime preserved", polluted.stat().st_mtime_ns, mtime)
-        check("SAFETY: hash file atime (the real LRU signal) untouched", hash_file.stat().st_atime_ns, mtime + 3600 * 10**9)
-        check("second pass finds nothing", reset_polluted_atimes(target, dry_run=False), 0)
 
     print("\ncargo: lock_target")
     with tempfile.TemporaryDirectory() as tmp:
@@ -1359,6 +3119,16 @@ def selftest() -> int:
     check("orphaned clones are removed by the daily run", "clones" in DEFAULT_TARGETS, True)
     check("the clone step frees disk, not memory", "clones" in DISK_TARGETS, True)
 
+    selftest_measure_real()
+    selftest_code_index()
+    selftest_cargo_rearm()
+    selftest_uv_refs()
+    selftest_go()
+    selftest_pnpm()
+    selftest_npm()
+    selftest_codex()
+    selftest_dev_space()
+
     print("\nrun_sections")
     ran = []
 
@@ -1403,16 +3173,18 @@ def run_sections(sections: list[tuple[str, Callable[[], int]]]) -> tuple[int, li
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Release iOS simulator, agent-browser, cargo target, uv cache and browser code-sign clone resources",
+        description="Release iOS simulator, agent-browser, project, dev cache, codex session and browser "
+        "code-sign clone resources",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("-n", "--dry-run", action="store_true", help="Report what would be cleaned, change nothing")
     parser.add_argument(
         "--only",
-        choices=["sim", "browser", "cargo", "uv", "clones", "games"],
-        help="Clean only simulators, only agent-browser, only the cargo target, only the uv cache, "
-        "only orphaned browser code-sign clones, "
-        "or close games (default: all but games, which only ever run when asked for explicitly)",
+        choices=[*DEFAULT_TARGETS, "games"],
+        help="Run one section: browser (agent-browser Chrome), sim (simulators), projects "
+        "(dev-space clean --scheduled), cargo, uv, go, pnpm, npm (dev caches), codex (sessions), "
+        "clones (browser code-sign clones), watch (dev-space watch --agent), or games "
+        "(default: all but games, which only ever run when asked for explicitly)",
     )
     parser.add_argument(
         "--min-age",
@@ -1425,9 +3197,9 @@ def main() -> int:
     parser.add_argument(
         "--cargo-days",
         type=int,
-        default=21,
+        default=7,
         metavar="DAYS",
-        help="Remove cargo artifacts no build has used for DAYS (default: 21)",
+        help="Remove cargo artifacts no build has used for DAYS (default: 7)",
     )
     # cargo-sweep reads "GB" as 10^9 and sums apparent file sizes, counting the hardlinks
     # between incremental/ and deps/ twice, so its total runs ~5% above `du`. Use GiB.
@@ -1441,10 +3213,33 @@ def main() -> int:
     parser.add_argument(
         "--uv-days",
         type=int,
-        default=90,
+        default=7,
         metavar="DAYS",
-        help="Remove downloaded wheels and cached environments in the uv cache created more than "
-        "DAYS ago (default: 90). uv keeps no last-use time; a still-needed one is just fetched again",
+        help="Remove uv cache entries created more than DAYS ago that no active project pins "
+        "(default: 7). uv keeps no last-use time; a still-needed one is just fetched again",
+    )
+    for tool, what in (("go", "go module versions"), ("pnpm", "pnpm store packages, dlx runs and metadata"),
+                       ("npm", "npm _cacache entries and _npx packages")):
+        parser.add_argument(
+            f"--{tool}-days",
+            type=int,
+            default=7,
+            metavar="DAYS",
+            help=f"Remove {what} no active project references and nothing used for DAYS (default: 7)",
+        )
+    parser.add_argument(
+        "--codex-compress-days",
+        type=int,
+        default=7,
+        metavar="DAYS",
+        help="zstd-compress codex sessions untouched for DAYS (default: 7); codex reads them as is",
+    )
+    parser.add_argument(
+        "--codex-delete-days",
+        type=int,
+        default=30,
+        metavar="DAYS",
+        help="`codex delete` unpinned sessions untouched for DAYS (default: 30)",
     )
     parser.add_argument("--selftest", action="store_true", help="Run behaviour checks and exit")
     args = parser.parse_args()
@@ -1461,7 +3256,7 @@ def main() -> int:
         print(f"═══ mac-dev-cleanup {time.strftime('%Y-%m-%d %H:%M:%S')} ═══")
 
     targets = [args.only] if args.only else DEFAULT_TARGETS
-    # Only processes affect memory; the cargo sweep, uv trim and clone removal free disk.
+    # Only processes affect memory; the other sections free disk.
     track_memory = not set(targets) <= DISK_TARGETS
     if track_memory:
         free_before, swap_before = mem_stats()
@@ -1470,8 +3265,14 @@ def main() -> int:
         "browser": lambda: cleanup_agent_browser(args.min_age, args.dry_run),
         "sim": lambda: cleanup_simulators(args.dry_run),
         "cargo": lambda: cleanup_cargo(args.cargo_days, args.cargo_max_size, args.dry_run),
+        "projects": lambda: run_dev_space("projects", args.dry_run),
         "uv": lambda: cleanup_uv(args.uv_days, args.dry_run),
+        "go": lambda: cleanup_go(args.go_days, args.dry_run),
+        "pnpm": lambda: cleanup_pnpm(args.pnpm_days, args.dry_run),
+        "npm": lambda: cleanup_npm(args.npm_days, args.dry_run),
+        "codex": lambda: cleanup_codex(args.codex_compress_days, args.codex_delete_days, args.dry_run),
         "clones": lambda: cleanup_clones(args.dry_run),
+        "watch": lambda: run_dev_space("watch", args.dry_run),
         "games": lambda: cleanup_games(args.dry_run),
     }
     found, failed = run_sections([(name, sections[name]) for name in targets])

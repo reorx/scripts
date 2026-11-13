@@ -1,6 +1,6 @@
 ---
 name: systools
-description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing what's on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots and live memory pressure — CPU temp, load, memory, swap, pageouts (\"how's my mac\", \"why is my mac slow\"); releasing leaked test resources — booted iOS simulators, agent-browser Chrome, the shared cargo target dir, the uv cache, browser code-sign clones under /var/folders (\"clean up simulators\", \"清理模拟器\", \"清理 cargo 缓存\", \"清理 uv 缓存\", \"~/.cache/uv is huge\", \"/var/folders is huge\", \"code_sign_clone\"), and the 23:00 job that closes Hearthstone/Battle.net (\"关掉游戏\", \"炉石没关\"); WindowServer CPU/GPU (\"WindowServer is hot\", \"UI feels laggy\"); keeping the Mac awake up to 24h (\"keep my mac awake\", \"防止休眠\"); the daily pmset wake/sleep schedule (\"sleep my mac at 1am\", \"自动休眠计划\"); auditing launchd + cron jobs and Background Task Management items (\"定时任务\", \"why isn't my launch agent running\"); repairing PostgreSQL that won't start under brew services (\"lock file postmaster.pid already exists\", \"数据库起不来\"); and tuning the local monitoring stack's per-process CPU alerts (\"prl_vm_app alert is noisy\", \"调 CPU 告警阈值\"). macOS-only except port management."
+description: "System ops toolkit for ports and macOS diagnostics. Use for: inspecting or killing what's on a port (\"what's on 3000\", \"port 8080 is taken\"); macOS health snapshots and live memory pressure — CPU temp, load, memory, swap, pageouts (\"how's my mac\", \"why is my mac slow\"); releasing leaked test resources — booted iOS simulators, agent-browser Chrome, the shared cargo target dir, the uv / go / pnpm / npm caches, expired codex sessions, browser code-sign clones under /var/folders (\"clean up simulators\", \"清理模拟器\", \"清理 cargo 缓存\", \"清理 uv 缓存\", \"清理 pnpm/npm/go 缓存\", \"codex 会话太大\", \"~/.cache/uv is huge\", \"/var/folders is huge\", \"code_sign_clone\"); per-project cleanup rules, archiving to the LaCie drive and disk monitoring with dev-space (\"磁盘满了\", \"项目目录太大\", \"归档到 LaCie\", \"dev-space\"), and the 23:00 job that closes Hearthstone/Battle.net (\"关掉游戏\", \"炉石没关\"); WindowServer CPU/GPU (\"WindowServer is hot\", \"UI feels laggy\"); keeping the Mac awake up to 24h (\"keep my mac awake\", \"防止休眠\"); the daily pmset wake/sleep schedule (\"sleep my mac at 1am\", \"自动休眠计划\"); auditing launchd + cron jobs and Background Task Management items (\"定时任务\", \"why isn't my launch agent running\"); repairing PostgreSQL that won't start under brew services (\"lock file postmaster.pid already exists\", \"数据库起不来\"); and tuning the local monitoring stack's per-process CPU alerts (\"prl_vm_app alert is noisy\", \"调 CPU 告警阈值\"). macOS-only except port management."
 ---
 
 # systools
@@ -135,11 +135,11 @@ This script samples virtual-memory counters at regular intervals and reports rea
 
 ## macOS Dev Resource Cleanup
 
-### Release leaked iOS simulators, agent-browser sessions, stale cargo artifacts, old uv cache entries and orphaned browser code-sign clones
+### Release leaked iOS simulators, agent-browser sessions, unused dev cache entries (cargo, uv, go, pnpm, npm), expired codex sessions and orphaned browser code-sign clones
 
 **Script:** `scripts/mac-dev-cleanup`
 
-**Prerequisites:** macOS only. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Wraps `ps`, `xcrun simctl`, `agent-browser close`, `osascript`, `memory_pressure`, for the cargo step `cargo` + [`cargo-sweep`](https://github.com/holmgr/cargo-sweep) (`cargo install cargo-sweep`; the step is skipped if either is missing), for the uv step `uv` + `lsof`, and for the clones step `getconf`.
+**Prerequisites:** macOS only. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Wraps `ps`, `xcrun simctl`, `agent-browser close`, `osascript`, `memory_pressure`, for the cargo step `cargo` + [`cargo-sweep`](https://github.com/holmgr/cargo-sweep) (`cargo install cargo-sweep`; the step is skipped if either is missing), for the uv step `uv` + `lsof`, for the go / pnpm / npm steps the tool itself (each is skipped if missing), for the codex step `codex` (deletion) + `zstd` (compression) + `lsof`, and for the clones step `getconf`. The `projects` and `watch` steps run `dev-space`, which must sit next to this script (see the dev-space section).
 
 The two biggest recurring causes of a degraded `mac-health` reading, and neither cleans up after itself:
 
@@ -147,6 +147,8 @@ The two biggest recurring causes of a degraded `mac-health` reading, and neither
 - **Leaked `agent-browser` sessions** — the CLI spawns a detached daemon (PPID 1) plus a ~10-process headless Chrome tree that survives the session that created it. Observed running for **days**, with renderers pinned at ~100% CPU each, ~5 of 10 cores gone.
 
 Plus two that eat disk instead: **the shared cargo target dir** (`build.target-dir` in `~/.cargo/config.toml`, here `~/Library/Caches/cargo-target`) that every Rust project builds into. It only grows — each dependency version, feature set and toolchain leaves its own artifacts — and reached 24 GB before this step existed. And **the uv cache** (`~/.cache/uv`), which keeps every wheel uv ever downloaded and every environment `uv run --script` / `uv run --with` / `uvx` ever built. It showed 13 GB on 2026-10-27; the first run took `du` to 5.6 GB but freed only 3.3 GB of real disk, because the rest was shared with installed venvs (see the uv notes below). And **browser code-sign clones** under `/var/folders/…/X/`: every Chrome that is killed rather than quit leaves a copy of its app bundle there. 35 of them, mostly from agent-browser sessions, made `/private/var/folders` show 81 GB on 2026-10-27, though they held only 0.7 GiB of real disk (see the clones notes below).
+
+Since 2026-11-13 (data volume at 99%, 7 GiB free), four more caches and the agents' sessions: **the go module cache** (`~/go/pkg/mod`, 7.3 GiB: every module version any build ever downloaded, extracted read-only, plus every toolchain `GOTOOLCHAIN=auto` fetched), **pnpm** (store 13 GiB plus `~/Library/Caches/pnpm` 4.8 GiB, of which `dlx` 3.5 GiB never shrinks: pnpm keeps every `pnpm dlx` run), **npm** (`~/.npm`, 3.4 GiB: `_cacache` and `_npx`, one dir per `npx` package, never removed) and **codex sessions** (`~/.codex`, 5.6 GiB of rollouts). Each step keeps what an *active project* references (a dir under `~/Code` committed to, or whose lock/manifest changed, within 30 days) plus anything used in the last 7 days, and reports `du` next to **real**: the bytes no surviving file shares (`getattrlist` `ATTR_CMNEXT_CLONE_REFCNT` / `PRIVATESIZE`), since uv and pnpm files are APFS clones of the projects' copies. And two hand-offs to `dev-space`: `projects` (per-project rules, before the cache steps, so `node_modules` / `.venv` it removes stop pinning cache entries) and `watch` (the disk monitor, last).
 
 And one opt-in step that is **never part of the default run**: `--only games` closes Hearthstone and Battle.net in the evening. Left open, Hearthstone keeps the display awake for hours (it holds a display-sleep assertion *and* injects input events, so the system thinks someone is at the keyboard), and Battle.net's helpers keep competing for CPU with agents during the night's dark wakes.
 
@@ -164,22 +166,29 @@ mac-dev-cleanup --only sim
 mac-dev-cleanup --only browser
 mac-dev-cleanup --only cargo
 mac-dev-cleanup --only uv
+mac-dev-cleanup --only go
+mac-dev-cleanup --only pnpm
+mac-dev-cleanup --only npm
+mac-dev-cleanup --only codex
 mac-dev-cleanup --only clones
+mac-dev-cleanup --only projects    # = dev-space clean --scheduled
+mac-dev-cleanup --only watch       # = dev-space watch --agent (--dry-run: --no-record --no-notify)
 
 # Safe to run mid-session: spare agent-browser sessions younger than 2h
 mac-dev-cleanup --min-age 2
 
-# One-off deeper cargo cleanup: drop what no build used for a week, cap at 15 GiB
-mac-dev-cleanup --only cargo --cargo-days 7 --cargo-max-size 15GiB
+# One-off deeper cargo cleanup: drop what no build used for 3 days, cap at 15 GiB
+mac-dev-cleanup --only cargo --cargo-days 3 --cargo-max-size 15GiB
 
-# One-off deeper uv cleanup: wheels and environments created more than 30 days ago
-mac-dev-cleanup --only uv --uv-days 30
+# Every cache step takes its own age (default 7 days); codex has two
+mac-dev-cleanup --only uv --uv-days 3
+mac-dev-cleanup --only codex --codex-compress-days 3 --codex-delete-days 14
 
 # Close games and their launchers (only ever runs when asked for explicitly)
 mac-dev-cleanup --only games --dry-run
 mac-dev-cleanup --only games
 
-# Behaviour checks (100 assertions, no side effects)
+# Behaviour checks (~195 assertions, no side effects)
 mac-dev-cleanup --selftest
 ```
 
@@ -189,11 +198,17 @@ mac-dev-cleanup --selftest
 |------|--------|
 | agent-browser | Groups Chrome processes into sessions by `--user-data-dir=…/agent-browser-chrome-<uuid>`, links each to its spawning daemon via the root process's PPID, then `agent-browser close --all`, then SIGTERM→SIGKILL any survivor |
 | simulators | `xcrun simctl shutdown all`, then quit Simulator.app via AppleScript, falling back to signals when it refuses |
-| cargo target | Finds the shared target via `cargo metadata` on a throwaway stub project, takes cargo's build locks, then `cargo sweep --time 21` (artifacts no build touched in 21 days) and `cargo sweep --maxsize 20GiB` (least recently used first) |
-| uv cache | Skips unless the `uv` binary contains every cache bucket name the script knows, and skips the day if a uv that holds the cache lock started < 10min ago. Then deletes: top-level entries that are not a current bucket (old/foreign bucket versions, temp dirs of dead runs) and archives nothing links to, both if created > 1 day ago; downloaded wheels and cached environments created > `--uv-days` (90) ago. Never touches wheels built from source, or anything a running process's command line points into |
+| projects | `dev-space clean --scheduled` (`-n` under `--dry-run`): every project's daily rules, plus the pressure tier when free space is low. dev-space exit 2 fails the step |
+| cargo target | Finds the shared target via `cargo metadata` on a throwaway stub project, takes cargo's build locks, stamps every fingerprint unit's files with its **real last use** (see the cargo notes), then `cargo sweep --time 7` and `cargo sweep --maxsize 20GiB` (least recently used first). Afterwards re-arms the survivors and records their last use in `~/.local/state/mac-dev-cleanup/cargo-lastuse.json`; a dry run puts the atimes back |
+| uv cache | Skips unless the `uv` binary contains every cache bucket name the script knows, and skips the day if a uv that holds the cache lock started < 10min ago. Then deletes: top-level entries that are not a current bucket and archives nothing links to, both if created > 1 day ago; downloaded wheels and cached environments created > `--uv-days` (7) ago, **except** wheels an active project's `uv.lock` / `pylock.toml` / `.venv` pins and, for 30 days, the env of a PEP 723 script that still exists under `~/Code`; `simple-v18` index metadata older than 7 days. Never touches wheels built from source, or anything a running process's command line points into |
+| go | `go env -json`; skips the day if a `go build/test/run/get/mod/…` started < 10min ago. Collects what active projects' `go.sum` (lines without `/go.mod`) and `go`/`toolchain` lines need, then per module version unreferenced and extracted > `--go-days` (7) ago: renames the extracted tree to a trash dir under a non-blocking flock of its `<ver>.lock` (busy → skipped), and drops its `.zip`/`.ziphash`; the small `.mod`/`.info` stay for graph resolution. Keeps the newest toolchain. Warns if `GOCACHE/trim.txt` is > 3 days old (go trims its build cache itself) |
+| pnpm | Skips unless `pnpm store path` ends in `/v10`, and the day if a store-writing pnpm (`install`/`add`/`dlx`/bare `pnpm`…; not `exec`/`run`) started < 10min ago. Store: an index json is kept if any `node_modules/.pnpm` under `~/Code`, the global dir or a kept dlx run names its package, or it is < 7 days old; files no kept index (or its `sideEffects`) points to and > 7 days old go. `dlx`: a command whose `pkg` link is > 7 days old goes whole, superseded runs of the others go. Metadata files > 7 days old go |
+| npm | `_cacache`: a key expires 7 days after its last index line; content no live key points to (and > 1 day old) goes, buckets are dropped or rewritten to their live lines (skipped if changed meanwhile). `_npx` (npm ≥ 11 only): dirs untouched for 7 days and not running, each taken under its own `concurrency.lock` before removal. Skips the day if an `npm install/ci/update/…` started < 10min ago. `npm run`/`start`/`test` don't count, nor `npx`/`npm exec` (every agent session starts its MCP servers that way): their `_npx` dir's lock and the 1-day grace already cover them |
+| codex | Reads `state_5.sqlite` read-only (skips the step on any other layout). A session's last use = newest of `threads.updated_at`, the rollout's mtime, its last `history.jsonl` entry, over its whole spawn family. Unused > 7 days: rollout replaced by `.jsonl.zst` with codex's own publication protocol. Unused > 30 days and not pinned: `codex delete --force <uuid>` (≤ 200 per run, ≤ 10 min). Skips rollouts open in a process (`lsof`) or whose writer lock is held. Also drops standalone releases neither `current` nor any process runs from |
+| watch | `dev-space watch --agent`: measure, record history, notify, dispatch proposal agents. Runs last |
 | clones | Lists `X/*.code_sign_clone/code_sign_clone.*` next to the user temp dir, reads each clone's `CFBundleExecutable`, then keeps every clone made within 30s before / 300s after a running browser of that app started (matched by executable, `--type=` helpers excluded) and every clone whose app it can't read. The rest are renamed into a trash dir and deleted |
 | games (`--only games`) | Matches Hearthstone (+ its BlizzardBrowser), Battle.net (+ its Helpers) and the Blizzard update Agent by executable path, asks the apps to quit via AppleScript by bundle id, waits 20s, then SIGTERM→SIGKILL whatever is left |
-| report | Free-memory % and swap before/after (process steps); target size before/after (cargo step); cache size before/after and the volume's real free-space gain (uv step); clones removed, their `du` size and the volume's real free-space gain (clones step) |
+| report | Free-memory % and swap before/after (process steps); target size before/after (cargo step); per kind of entry, its count, `du` and real size, then the volume's real free-space gain (uv, go, pnpm, npm, codex); clones removed, their `du` size and the volume's real free-space gain (clones step) |
 
 **Exit code:** 0 on success, 2 if a step crashed (the remaining steps still run). Under `--dry-run`, 1 means there is something to clean — composable as a check like `mac-health`.
 
@@ -210,8 +225,9 @@ mac-dev-cleanup --selftest
 
 **Cargo step: why it doesn't cause rebuild churn, and its traps:**
 
-- "Last used" is the atime of the files in `.fingerprint/<unit>-<hash>/`: cargo reads the hash file there on every build, fresh or not, to decide whether to recompile. The intent was that anything a project still builds keeps a fresh atime and survives. **But this Mac updates atime on a read only while atime < mtime** (measured 2026-10-27, see the uv notes): after a unit is rebuilt, the first fresh build bumps its atime once, and later fresh builds leave it alone. So the atime really says "first build after the last rebuild", and a dependency used daily but not recompiled for 21 days is swept and rebuilt once. Tracked in `kb/known-issues.md`.
-- **`cargo sweep --installed` / `--toolchains` poison that signal** — they read every fingerprint `.json` (even with `--dry-run`), stamping the whole target "used today", after which `--time` finds nothing for weeks. The script only uses `--time` / `--maxsize` (stat-only), and before each sweep resets any fingerprint `.json` whose atime is newer than its mtime back to its mtime. Cargo itself reads the `.json` only right before rewriting it, so this loses nothing. Old-toolchain artifacts need no `--installed`: after a `rustup update` nobody uses them, and `--time` collects them.
+- cargo-sweep's "last used" is the newest atime among the files in `.fingerprint/<unit>-<hash>/`: cargo reads the hash file, dep-info and `invoked.timestamp` there on every build, fresh or not. **But this Mac updates atime on a read only while atime < mtime** (measured 2026-10-27 and again 2026-11-13; no 24h rule, ctime irrelevant): after the first build following a rebuild, reads leave atime alone, so it said "first build after the last rebuild" and daily-used dependencies were swept and rebuilt every 21 days.
+- **Re-arming fixes it.** After each real sweep the script sets every surviving unit's file atimes to 1s *before* their mtime (mtime untouched: cargo's freshness check uses it), so the next build's read moves atime to now. Re-arming erases the last use, so each unit's is recorded in `~/.local/state/mac-dev-cleanup/cargo-lastuse.json`. Next run, a unit's real last use = the newest of: the recorded one, and the atime of any non-`.json` file no longer armed (read or rewritten since). A unit with neither (all files armed, no record) falls back to its newest mtime. Spotlight did not read re-armed files in `~/Library/Caches` within 180s of watching. Verified with a real fresh build of a test crate after re-arming.
+- **`cargo sweep --installed` / `--toolchains` read every fingerprint `.json`** (even with `--dry-run`). The real-last-use computation ignores `.json` files, and the stamping overwrites their atime before each sweep, so this no longer poisons anything; the script still uses only `--time` / `--maxsize`. Old-toolchain artifacts need no `--installed`: after a `rustup update` nobody uses them, and `--time` collects them.
 - cargo-sweep takes only a project path and resolves the target via `cargo metadata`; pointing it at the target dir itself fails. The stub project in a temp dir keeps the job independent of any real project.
 - If a build holds any of `.cargo-lock` / `.cargo-build-lock` / `.cargo-artifact-lock` (all flock(2)), the step skips the run. While sweeping it holds them itself, so a build that starts meanwhile prints `Blocking waiting for file lock on build directory` and waits (both verified against cargo 1.98).
 - **Size units:** cargo-sweep reads `GB` as 10⁹ and sums apparent file sizes, counting the hardlinks between `incremental/` and `deps/` twice, so its total runs ~5% above `du`. Pass `GiB`.
@@ -222,10 +238,24 @@ mac-dev-cleanup --selftest
 - **`uv cache prune` cannot run unattended here.** Every `uv` process holds a shared flock on `~/.cache/uv/.lock` for its whole life, and the resident `uv run` jobs (proc-top, condenser-probe) live for weeks, so prune waits forever for its exclusive lock. With `--force` it goes ahead, and its step two **deletes every cached environment unconditionally**, including `environments-v2/proc-top-*`, which the monitoring job is running from. The step does the same garbage collection by hand and skips entries in use.
 - **Cache layout** (0.9.17): downloads are unpacked into `archive-v0/<id>/`. The only references prune counts are symlinks: `wheels-v5/<index>/<pkg>/<ver>-<tag>` (downloaded wheels) and `sdists-v9/…` (wheels built from source). `environments-v2/` holds two kinds of entry: `<script>-<hash>/` real venvs from `uv run --script`, and `<interpreter-hash>/<hash>` symlinks into `archive-v0` for `uv run --with` / `uvx` environments. The step counts all three link sources, plus any archive id named inside a `.http`/`.rev` pointer file, before calling an archive unreferenced.
 - **Deleting a wheel's archive is safe.** The step removes the archive and its symlink but keeps the `.http` pointer: uv reads it, sees the archive is missing (`CachedWheel::from_http_pointer`: "Ignore stale pointers"), and downloads again. Verified by deleting the archive of `requests==2.32.3` and installing it again.
-- **Age is creation time.** uv keeps no last-use time, and atime doesn't help either: this Mac updates atime on a read only while atime < mtime (`cat`/Python read of a file whose atime is already past its mtime leaves it unchanged; proc-top's `pyvenv.cfg`, read at every start, still shows its June birth atime). So a wheel used weekly is re-downloaded every 90 days, and an environment is rebuilt from the archives, both in seconds. Wheels built from source never age out: rebuilding needs a toolchain and can take minutes.
+- **Age is creation time, references override it.** uv keeps no last-use time, and atime doesn't help either: this Mac updates atime on a read only while atime < mtime (`cat`/Python read of a file whose atime is already past its mtime leaves it unchanged; proc-top's `pyvenv.cfg`, read at every start, still shows its June birth atime). So the step keeps, at any age, the wheels whose (name, version) an active project's `uv.lock` / `pylock*.toml` or installed `.venv` (`*.dist-info`) pins, and for 30 days the env whose `pyvenv.cfg` `prompt` names a PEP 723 script that exists under `~/Code`. Everything else past 7 days goes: a wheel is re-downloaded and an environment rebuilt from the archives, both in seconds. Wheels built from source never age out: rebuilding needs a toolchain and can take minutes.
 - **`du` overstates the cache.** uv installs by APFS clone (`link-mode` default on macOS), so a cached file and every installed copy share blocks. `du` counts each in full, but deleting the cache copy frees nothing while a venv still holds the blocks. On 2026-10-27, `du` showed archive-v0 at 10.1 GiB, but only 2.55 GiB of it was not shared with a clone (`getattrlist` `ATTR_CMNEXT_PRIVATESIZE`). The step therefore reports the volume's real free-space gain next to `du`. To free the rest, delete venvs you no longer use.
 - **In use** = some process's command line contains the entry's path. `uv run` execs `<env>/bin/python3` by full path, so that covers resident jobs and this script's own environment. Entries are renamed into a trash dir before deletion, so a uv that looks at the same moment sees each one whole or not at all.
 - **Layout guard:** uv bumps a bucket's version whenever its format changes (e.g. `wheels-v6` / `simple-v21` from a newer uv). The step reads the uv binary and requires all the names in `UV_BUCKETS` as literal bytes. If any is missing, it logs a `⚠️` and skips: check `CacheBucket::to_str` in `crates/uv-cache/src/lib.rs` for the new version and update the constants and this note.
+
+**go / pnpm / npm steps: why not the tools' own commands, and their traps** (verified 2026-11-13 against go 1.25.7, pnpm 10.15.0, npm 11.20.0):
+
+- **`go clean -modcache` is all or nothing**, and every inactive project would re-download everything. go guards a version's download and extraction with `flock(cache/download/<mod>/@v/<ver>.lock)` but reads extracted sources without any lock, which is why referenced versions are never touched. The module cache is all `0555`; the step `chmod`s a tree's top dir to move it and the trash before deleting. `~/Code/go` is an abandoned GOPATH and is not indexed. Module paths in the cache are case-escaped (`!`+lower); `go.sum` keys are escaped the same way before matching.
+- **`pnpm store prune` would empty this store.** It deletes every store file with `nlink == 1`, assuming installs hard-link; on APFS pnpm installs by `clonefile`, so every file here has `nlink` 1. It also wipes all metadata and takes no lock. Index file names and `.pnpm/` dir names both spell scoped packages `@scope+name`. Index jsons go before files, so an interrupted run leaves only orphans, which the next run finds.
+- **npm keeps no last-access time.** A `_cacache` key's last index line (its `time`) is when it was last *written*; a package npm reads from cache daily but never re-fetches expires after 7 days and is downloaded once more. `npm cache clean` is all or nothing, and `npm cache verify` only drops unreachable content.
+- **`du` vs real:** pnpm `dlx` runs and store files are clones of each other and of projects' `node_modules`; the step reports both. go and npm files are not cloned, so their `du` is real.
+
+**codex step: how sessions are stored, and its traps** (verified 2026-11-13 against codex 0.167.1 source and `~/.codex`):
+
+- `codex resume` and the app list sessions from `state_5.sqlite` `threads` (`rollout_path` → `sessions/YYYY/MM/DD/rollout-*.jsonl`). Deleting a rollout by hand leaves a row that can't be opened, so deletion goes through `codex delete --force <uuid>` (removes rollout, state rows and name index; without `--force` it refuses when there's no terminal). It refuses threads with attached children or external references; refusals are printed and the session stays.
+- **Compressed rollouts are read transparently** whatever codex's compression feature flag says (`open_rollout_line_reader` checks for `<path>.zst`; the flag only gates codex's own background worker). The step publishes like codex does: encode to `rollout-compress-*.jsonl.zst.tmp` beside the source, verify by sha256 of the decompressed stream, then under `thread-writer-locks/.coordination.lock` and with the thread's own lock free and the source unchanged, link the `.zst` in place and remove the `.jsonl`. mtime is kept, so the age signal survives. Rollouts hold base64 images: `zstd -3` saved only 46% on a sample; the dry run measures the exact compressed size.
+- **A state db named anything but `state_5.sqlite`** (a codex migration) or a `threads` table missing a column skips the step with `⚠️`. Check the new schema in codex's `state` crate before updating `CODEX_STATE_DB` / `CODEX_THREAD_COLUMNS`.
+- Releases: codex prunes old standalone releases only for its daemon; TUI processes keep running from the version they started with, which the step detects from `ps` and keeps.
 
 **Clones step: what the clones are, and its traps** (verified 2026-10-27 against Chrome 156 and SunBrowser 152):
 
@@ -251,9 +281,40 @@ A second agent, `com.reorx.mac-dev-cleanup-games` (`launchd/com.reorx.mac-dev-cl
 - After finishing browser automation or iOS testing → run `mac-dev-cleanup` as the verification teardown step
 - Periodic hygiene while other sessions may be working → `mac-dev-cleanup --min-age 2`
 - "The cargo target / Rust cache is huge" → `mac-dev-cleanup --only cargo --dry-run`, then run it; lower `--cargo-days` or `--cargo-max-size` for a one-off deeper cut
-- "`~/.cache/uv` is huge" / "清理 uv 缓存" → `mac-dev-cleanup --only uv --dry-run`, then run it; `--uv-days 30` for a deeper cut. **Never `uv cache prune --force` / `uv cache clean --force`** on this Mac: they delete the environment proc-top runs from
+- "`~/.cache/uv` is huge" / "清理 uv 缓存" → `mac-dev-cleanup --only uv --dry-run`, then run it; `--uv-days 3` for a deeper cut. **Never `uv cache prune --force` / `uv cache clean --force`** on this Mac: they delete the environment proc-top runs from
+- "pnpm / npm / go cache is huge" → `mac-dev-cleanup --only pnpm --dry-run` (or `npm`, `go`), then run it. **Never `pnpm store prune`** on this Mac (see the pnpm notes)
+- "`~/.codex` is huge" → `mac-dev-cleanup --only codex --dry-run`, then run it. Never delete rollout files by hand: the session index keeps pointing at them
 - "`/private/var/folders` is huge" / a disk analyzer shows tens of GB of `code_sign_clone` → `mac-dev-cleanup --only clones --dry-run`, then run it. Expect a small real gain (see the clones notes)
 - "The screen never turned off" / "something is busy at night" and a game was left open → `mac-dev-cleanup --only games`
+
+### Per-project cleanup rules, archiving to LaCie, disk monitoring (dev-space)
+
+**Script:** `scripts/dev-space` (linked as `dev-space`). **Rules:** `config/dev-space.toml`. **Agent brief:** `references/dev-space-analysis.md`. **State:** `~/.local/state/dev-space/` (`actions.jsonl` audit log, `history.jsonl`, `alerts.json`, `proposals/`, `trash/`). Design and decisions: `kb/plans/2026-11-13-dev-disk-cleanup.md` in the scripts repo.
+
+What `mac-dev-cleanup` does for global caches, dev-space does inside `~/Code`. The config has defaults for every git project there (build trees and DB copies in `tmp/` after 7 days, SwiftPM index-build and `.next/cache` after 7 days, dependency dirs of projects idle for 30 days, `tmp/<date>-<task>/` evidence moved to LaCie after 14 days) plus rules per project. Each rule deletes, archives (to `/Volumes/LaCie/DevArchive/<project>/<path under ~>`, symlink left behind) or backs up a SQLite DB (vibench-live's production DB, daily, 7 daily + 8 weekly copies). Tiers: `daily` (06:00), `pressure` (also runs, with shorter ages, when free space < 15 GiB), `manual` (only by hand).
+
+```bash
+dev-space clean -n -v                 # what the daily tier would do, every path with its size and age
+dev-space clean -n --tier manual      # include manual-only rules
+dev-space clean -p vibench -r dev-migration-backups   # one rule of one project, for real
+dev-space rules vibench               # rules that apply to a project (defaults included)
+dev-space restore ~/Code/x/tmp/2026-10-01-task        # copy an archived dir back from LaCie
+dev-space scan                        # sizes of every project and cache, 7-day growth, limits
+dev-space watch --no-record --no-notify               # alerts, without touching state
+dev-space proposals                   # rule proposals codex wrote
+uv run scripts/test_dev_space.py      # behaviour tests
+```
+
+**Guards no rule can switch off:** a path git tracks, or that sits in a git worktree without being ignored, is never touched (untracked-not-ignored may be someone's work in progress); nor is anything a process has open, runs from or uses as cwd (one `lsof` snapshot per run); nor symlinks, paths outside the project's root/related dirs, or `protect` globs. Relative rule paths resolve against the project root only — reach a related dir (e.g. vibench-live) with a `~` path. Archive refuses `.git`, symlinks, `.app` bundles, secrets (`.env`, keys, `.gnupg`) and exFAT-illegal names, and skips when the volume isn't mounted (a `/Volumes/X` path must be a mount point, so an unplugged drive never means writing into an empty folder on the system disk). Copies are read back and compared by hash before the local copy goes; mtimes are kept. AppleDouble `._x` files exFAT creates beside `x` are not copied back on restore.
+
+**Monitoring:** `watch` (06:00, after the cleanup) records sizes, alerts by macOS notification on low free space (< 40 GiB warn, < 15 GiB critical), projects over `alert_size` (3 GiB for projects without rules), 7-day growth > 3 GiB, caches over budget, and an offsite backup older than 3 days; the same alert repeats only after 3 days or when it escalates. With `--agent` it runs `codex exec --ephemeral -s read-only` on up to 2 flagged projects (14-day cooldown each) and saves its final message as a proposal; nothing is applied until a human merges it into the config. The read-only sandbox blocks `ps`, so proposals see processes only through `lsof`.
+
+**Adding a project:** run `dev-space scan`, give an agent `references/dev-space-analysis.md`, review its TOML, add it under `[projects.<name>]`, then `dev-space clean -n -v -p <name> --tier manual` and read every path before the first real run.
+
+**When to use:**
+- "Disk is full" / "磁盘满了" → `dev-space scan` and `mac-dev-cleanup --dry-run` side by side; the `projects` section of the latter is dev-space
+- "这个项目目录太大" / a project shows up in a watch alert → `dev-space clean -n -v -p <name> --tier manual`, then rules or a proposal
+- "归档到 LaCie" / "恢复归档" → archive rules / `dev-space restore`
 
 ## macOS WindowServer Diagnostics
 

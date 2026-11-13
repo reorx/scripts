@@ -1,0 +1,400 @@
+# dev-space rules: what may be deleted, archived to LaCie or backed up, per project.
+#
+# Format and engine: ../scripts/dev-space (docstring) and kb/plans/2026-11-13-dev-space-rules-spec.md.
+# Research behind each project's rules: tmp/2026-11-13-dev-cleanup/<project>.md in the scripts repo.
+#
+# Whatever a rule says, the engine never touches a path that git tracks, that is not git-ignored,
+# that a process has open, that is a symlink, lies outside its project or matches `protect`.
+# Relative `paths` resolve against the project root only; reach related dirs with ~ paths.
+# when: daily = the 06:00 job; pressure = also when free space < pressure_free; manual = by hand.
+
+[settings]
+code_root = "~/Code"
+archive_root = "/Volumes/LaCie/DevArchive"
+state_dir = "~/.local/state/dev-space"
+pressure_free = "15GiB"
+# vibench-live is production: only the explicit rules under [projects.vibench] apply to it
+defaults_exclude = ["~/Code/vibench-live"]
+protect = []
+
+# ── Defaults: every git project directly under code_root ───────────────────
+[[defaults.rules]]
+id = "tmp-build-outputs"
+why = "Build trees produced or copied inside tmp/ during acceptance runs (Xcode DerivedData, SwiftPM .build, node_modules, venvs, cargo target). Pure build output; the cost of losing one is one rebuild."
+action = "delete"
+when = "daily"
+paths = ["tmp/**/DerivedData", "tmp/**/.build", "tmp/**/node_modules", "tmp/**/.venv", "tmp/**/target"]
+age_days = 7
+pressure_age_days = 3
+
+[[defaults.rules]]
+id = "tmp-db-copies"
+why = "SQLite copies made inside tmp/<task>/ for rehearsals and acceptance, with their -wal/-shm and .bak-* files. One-off copies of a real database; copy again when needed. Files directly in tmp/ are left alone: some projects keep their dev database there."
+action = "delete"
+when = "daily"
+paths = [
+  "tmp/*/**/*.sqlite", "tmp/*/**/*.sqlite-wal", "tmp/*/**/*.sqlite-shm", "tmp/*/**/*.sqlite.bak-*",
+  "tmp/*/**/*.db", "tmp/*/**/*.db-wal", "tmp/*/**/*.db-shm",
+]
+age_days = 7
+pressure_age_days = 3
+
+[[defaults.rules]]
+id = "editor-build-caches"
+why = "SourceKit-LSP's background index (.build/index-build) and Next.js' build cache (.next/cache). Both regenerate on the next editor session or build."
+action = "delete"
+when = "daily"
+paths = ["**/.build/index-build", "**/.next/cache"]
+age_days = 7
+
+[[defaults.rules]]
+id = "idle-project-deps"
+why = "Dependency and build dirs of a project nobody touched for 30 days (no commit, no uncommitted change). Reinstalling or rebuilding takes a few minutes the next time the project is opened."
+action = "delete"
+when = "daily"
+paths = [
+  "node_modules", "*/node_modules", "*/*/node_modules",
+  ".venv", "*/.venv", "*/*/.venv",
+  ".build", "*/.build", "*/*/.build",
+  ".next", "*/.next", "*/*/.next",
+  ".turbo", ".parcel-cache", ".svelte-kit", ".nuxt",
+  "target", "src-tauri/target",
+]
+idle_days = 30
+pressure_idle_days = 14
+
+[[defaults.rules]]
+id = "tmp-evidence-archive"
+why = "Acceptance evidence in tmp/<date>-<task>/ (screenshots, reports, logs) untouched for 14 days: kept, but on LaCie, with a symlink left in place. Runs after the delete rules, so build trees and DB copies are already gone. Dirs holding .git, symlinks, .app bundles or secrets stay local (exFAT)."
+action = "archive"
+when = "daily"
+paths = ["tmp/20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*"]
+age_days = 14
+
+# ── vibench ────────────────────────────────────────────────────────────────
+[projects.vibench]
+root = "~/Code/vibench"
+related = [
+  "~/Code/vibench-live",
+  "~/Code/vibench-kifix2",
+  "~/Code/vibench-old",
+  "~/Code/vibench-backups",
+  "~/Code/vibench-mdev-sandbox",
+  "~/Code/vibench-p6-scratch",
+  "~/Documents/vibench-backups",
+  "~/Library/Application Support/vibench",
+]
+alert_size = "30GiB"
+protect = [
+  # the production database and the host identity backup (kb/docs/deployment.md)
+  "~/Code/vibench-live/.live/data/vibench.sqlite",
+  "~/Code/vibench-live/.live/data/vibench.sqlite-wal",
+  "~/Code/vibench-live/.live/data/vibench.sqlite-shm",
+  "~/Code/vibench-live/.live/backups/identity-*",
+  # a running relay workspace and an experiment HOME with resident gpg-agent
+  "tmp/hosted-pwa-relay",
+  "tmp/2026-10-16-claude-halt",
+]
+
+[[projects.vibench.rules]]
+id = "release-tars"
+why = "tmp/releases/{relay,hosted}: one tar per release (121M for relay). latest.json points at the newest; the two newest stay for a rollback."
+action = "delete"
+when = "daily"
+paths = ["tmp/releases/relay/*.tar", "tmp/releases/hosted/*.tar"]
+age_days = 7
+keep_newest = 2
+
+[[projects.vibench.rules]]
+id = "dev-migration-backups"
+why = "apps/server/data/dev.sqlite.bak-*: the dev server's VACUUM INTO copy before each migration (~70M each). The three newest are enough to back out a bad migration."
+action = "delete"
+when = "daily"
+paths = ["apps/server/data/dev.sqlite.bak-*"]
+age_days = 7
+keep_newest = 3
+
+[[projects.vibench.rules]]
+id = "e2e-run-dirs"
+why = "apps/e2e/tmp/<run>/ and apps/server/tmp/*: per-run e2e output, recreated by every test run."
+action = "delete"
+when = "daily"
+paths = ["apps/e2e/tmp/*", "apps/server/tmp/*"]
+age_days = 7
+keep_newest = 2
+
+[[projects.vibench.rules]]
+id = "live-deploy-snapshots"
+why = "vibench-live/.live/backups/<ts>-<sha>/: the VACUUM INTO snapshot deploy takes before each release (~300-400M). The two newest stay local for a quick restore; older ones live on LaCie, which doubles as the offsite copy. identity-* never matches."
+action = "archive"
+when = "daily"
+paths = ["~/Code/vibench-live/.live/backups/20*", "~/Code/vibench-live/.live/backups/17*"]
+keep_newest = 2
+
+[[projects.vibench.rules]]
+id = "live-migration-backups"
+why = "vibench-live/.live/data/vibench.sqlite.bak-*: the server's copy before each migration. All of them go to LaCie (user decision 2026-11-13); a day of grace keeps clear of a migration in progress."
+action = "archive"
+when = "daily"
+paths = ["~/Code/vibench-live/.live/data/vibench.sqlite.bak-*"]
+age_days = 1
+
+[[projects.vibench.rules]]
+id = "live-db-offsite"
+why = "Daily offsite copy of the production database: the Mac's main DB had no copy off this machine (only the relay's is uploaded to OSS)."
+action = "sqlite-backup"
+when = "daily"
+source = "~/Code/vibench-live/.live/data/vibench.sqlite"
+keep_daily = 7
+keep_weekly = 8
+
+# ── campus_watch ───────────────────────────────────────────────────────────
+[projects.campus_watch]
+root = "~/Code/campus_watch"
+related = ["~/Code/campus_watch-scene-lock"]
+alert_size = "8GiB"
+
+[[projects.campus_watch.rules]]
+id = "db-dumps-archive"
+why = "backend/db-dumps/*.sql: production SQL dumps. The two newest stay local; older ones move to LaCie with a symlink."
+action = "archive"
+when = "daily"
+paths = ["backend/db-dumps/*.sql"]
+age_days = 30
+keep_newest = 2
+
+[[projects.campus_watch.rules]]
+id = "cameraman-old-dist"
+why = "CameraMan arm64 release tarballs (plus .sha256), rebuilt from git by packaging/package_arm64.sh; keep the newest three. Manual: -dirty builds cannot be rebuilt from git."
+action = "delete"
+when = "manual"
+paths = ["cameraman/dist/cameraman-*-linux-arm64.tar.gz"]
+age_days = 14
+keep_newest = 3
+companions = [".sha256"]
+
+[[projects.campus_watch.rules]]
+id = "tmp-downloads"
+why = "Re-downloadable or rebuildable bulk in tmp/: a docker image.tar, downloaded versitygw/frp binaries, a packaging pkg/ dir."
+action = "delete"
+when = "manual"
+paths = ["tmp/*/image.tar", "tmp/*/versitygw-dl", "tmp/*/frp-dl", "tmp/camera-batch-onboarding/pkg"]
+age_days = 14
+
+# ── stickyfingers ──────────────────────────────────────────────────────────
+[projects.stickyfingers]
+root = "~/Code/stickyfingers"
+alert_size = "6GiB"
+# fury kernels the evaluation tooling resolves through kernels/fury/current
+protect = ["tmp/kernel-eval/kernels"]
+
+[[projects.stickyfingers.rules]]
+id = "tmp-dd-dirs"
+why = "-derivedDataPath dirs named dd-* inside tmp/<task>/: Xcode build output, regenerated by a rebuild."
+action = "delete"
+when = "daily"
+paths = ["tmp/*/dd-*", "tmp/*/*/dd-*"]
+age_days = 7
+
+[[projects.stickyfingers.rules]]
+id = "tmp-review-subject-copies"
+why = "Per-round Swift package copies (rN-subject, ~150M each) made by sfp4 review/acceptance runs; the conclusions live in kb/ and the logs."
+action = "delete"
+when = "daily"
+paths = ["tmp/*/sfp4-*/r*-subject"]
+age_days = 7
+
+[[projects.stickyfingers.rules]]
+id = "core-swiftpm-build"
+why = "StickyFingersCore/.build: SwiftPM incremental cache (AGENTS.md lists deleting it as a standard fix). Untouched for a week means nobody is working on it."
+action = "delete"
+when = "daily"
+paths = ["StickyFingersCore/.build"]
+age_days = 7
+idle_days = 7
+
+[[projects.stickyfingers.rules]]
+id = "app-build-products"
+why = ".build/DerivedData and .build/CIUnsigned: make build / CI output, regenerated by make build."
+action = "delete"
+when = "daily"
+paths = [".build/DerivedData", ".build/CIUnsigned"]
+age_days = 14
+idle_days = 14
+
+# ── vocalflow-mac ──────────────────────────────────────────────────────────
+[projects.vocalflow-mac]
+root = "~/Code/vocalflow-mac"
+related = ["~/Library/Application Support/com.vocalflow.app/tauri-plugin-mic-recorder"]
+alert_size = "8GiB"
+
+[[projects.vocalflow-mac.rules]]
+id = "tmp-update-payloads"
+why = "tmp/<task>/upd-*: in-app update test payloads (built app bundles and archives), rebuilt by the release script."
+action = "delete"
+when = "daily"
+paths = ["tmp/*/upd-*"]
+age_days = 7
+
+[[projects.vocalflow-mac.rules]]
+id = "core-swiftpm-out"
+why = "VocalFlowCore/.build/{out,arm64-apple-macosx}: swift build output; costs a full SwiftPM build to regenerate."
+action = "delete"
+when = "daily"
+paths = ["VocalFlowCore/.build/out", "VocalFlowCore/.build/arm64-apple-macosx"]
+age_days = 7
+idle_days = 7
+
+[[projects.vocalflow-mac.rules]]
+id = "main-derived-data"
+why = "The app's DerivedData. Only after 14 idle days; the running Debug app is launched from here (lsof keeps it while it runs)."
+action = "delete"
+when = "daily"
+paths = [".build/DerivedData"]
+age_days = 14
+idle_days = 14
+
+[[projects.vocalflow-mac.rules]]
+id = "old-tauri-recordings"
+why = "WAV recordings left by the 2025 Tauri version (337M); no code reads them. Kept, on LaCie."
+action = "archive"
+when = "manual"
+paths = ["~/Library/Application Support/com.vocalflow.app/tauri-plugin-mic-recorder/*"]
+age_days = 30
+
+# ── feishu-lite ────────────────────────────────────────────────────────────
+[projects.feishu-lite]
+root = "~/Code/feishu-lite"
+alert_size = "3GiB"
+# webhook credentials and the dev profile used by make run-mock
+protect = ["tmp/bot-webhook", "tmp/dev-home"]
+
+[[projects.feishu-lite.rules]]
+id = "mac-build-output"
+why = "mac/.build/{DerivedData,index-build,out}: xcodebuild output (Makefile DERIVED_DATA=.build/DerivedData), regenerated by make build."
+action = "delete"
+when = "daily"
+paths = ["mac/.build/DerivedData", "mac/.build/out"]
+age_days = 7
+
+[[projects.feishu-lite.rules]]
+id = "swiftpm-builds"
+why = "SwiftPM build dirs of FeishuLiteCore and the root package, regenerated by make build/test."
+action = "delete"
+when = "daily"
+paths = ["mac/FeishuLiteCore/.build", ".build"]
+age_days = 7
+
+[[projects.feishu-lite.rules]]
+id = "mock-build"
+why = "tmp/mock-build: separate DerivedData of make run-mock."
+action = "delete"
+when = "daily"
+paths = ["tmp/mock-build"]
+age_days = 7
+
+[[projects.feishu-lite.rules]]
+id = "py-caches"
+why = "ruff/pytest caches, rebuilt in seconds."
+action = "delete"
+when = "daily"
+paths = [".ruff_cache", "mac/.ruff_cache", "backend/.ruff_cache", "backend/.pytest_cache"]
+age_days = 7
+
+[[projects.feishu-lite.rules]]
+id = "old-dmgs"
+why = "Release DMGs, all published on GitHub Releases; keep the newest two locally."
+action = "delete"
+when = "manual"
+paths = ["mac/dist/*.dmg"]
+age_days = 14
+keep_newest = 2
+
+# ── condenser ──────────────────────────────────────────────────────────────
+[projects.condenser]
+root = "~/Code/condenser"
+related = ["~/Code/condenser-backup-2026-08-15.bundle"]
+alert_size = "3GiB"
+# the resident condenser-probe runs from probe/.venv; tmp/condenser.db may be the current dev DB
+protect = ["probe", "tmp/condenser.db", "tmp/condenser.db-wal", "tmp/condenser.db-shm"]
+
+[[projects.condenser.rules]]
+id = "tmp-heavy-copies"
+why = "Whole source and build copies inside acceptance dirs (baseline-source/, clean-current/, baseline.tar); the screenshots and logs are the evidence, not these."
+action = "delete"
+when = "daily"
+paths = ["tmp/20??-??-??-*/baseline-source", "tmp/20??-??-??-*/clean-current", "tmp/20??-??-??-*/baseline.tar"]
+age_days = 7
+
+[[projects.condenser.rules]]
+id = "ios-derived-data"
+why = "ios/.build/DerivedData: xcodebuild output, rebuilt with the commands in ios/AGENTS.md."
+action = "delete"
+when = "daily"
+paths = ["ios/.build/DerivedData"]
+age_days = 7
+idle_days = 7
+
+[[projects.condenser.rules]]
+id = "tmp-db-snapshots"
+why = "Dev/prod snapshot databases at the top of tmp/ from past investigations; the prod ones hold real user data and are a privacy liability."
+action = "delete"
+when = "daily"
+paths = ["tmp/prod-*.db*", "tmp/step*-dev.db*", "tmp/rss-fixes-dev.db*", "tmp/smoke.db", "tmp/author-e2e.db", "tmp/condenser.db.bak-*"]
+age_days = 30
+
+[[projects.condenser.rules]]
+id = "frontend-node-modules"
+why = "frontend/node_modules (pnpm, with a lockfile): ~1 minute to reinstall."
+action = "delete"
+when = "manual"
+paths = ["frontend/node_modules"]
+age_days = 7
+idle_days = 7
+
+# ── agent-session-manager ──────────────────────────────────────────────────
+# Its big item, index copies in tmp/<task>/, is covered by the tmp-db-copies default.
+[projects.agent-session-manager]
+root = "~/Code/agent-session-manager"
+alert_size = "2GiB"
+
+[[projects.agent-session-manager.rules]]
+id = "sparkle-tools"
+why = ".build/SparkleTools: release tooling, re-downloaded by sparkle-tools.sh when missing; only used when releasing."
+action = "delete"
+when = "manual"
+paths = [".build/SparkleTools"]
+age_days = 30
+
+# ── cw_edge ────────────────────────────────────────────────────────────────
+# Cleans itself (its own session owns that); listed only so the monitor knows its size limit.
+[projects.cw_edge]
+root = "~/Code/cw_edge"
+alert_size = "8GiB"
+skip_defaults = ["*"]
+
+# ── Monitoring ─────────────────────────────────────────────────────────────
+[watch]
+free_warn = "40GiB"
+free_critical = "15GiB"
+default_alert_size = "3GiB"
+growth_alert = "3GiB"
+realert_days = 3
+backup_stale_days = 3
+agent_cooldown_days = 14
+agent_max_per_run = 2
+agent_timeout_minutes = 20
+
+# Budgets are du (APFS clones counted in full), so they read high; they flag trends, not real use.
+[watch.caches]
+uv = { path = "~/.cache/uv", budget = "12GiB" }
+pnpm-store = { path = "~/Library/pnpm", budget = "12GiB" }
+pnpm-cache = { path = "~/Library/Caches/pnpm", budget = "3GiB" }
+npm = { path = "~/.npm", budget = "2GiB" }
+go-mod = { path = "~/go/pkg/mod", budget = "4GiB" }
+cargo-target = { path = "~/Library/Caches/cargo-target", budget = "20GiB" }
+codex = { path = "~/.codex", budget = "6GiB" }
+core-simulator = { path = "~/Library/Developer/CoreSimulator/Devices", budget = "12GiB" }
+ios-device-support = { path = "~/Library/Developer/Xcode/iOS DeviceSupport", budget = "8GiB" }
+playwright = { path = "~/Library/Caches/ms-playwright", budget = "3GiB" }
+bun = { path = "~/.bun", budget = "4GiB" }

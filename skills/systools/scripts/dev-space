@@ -1,0 +1,1514 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# ///
+"""Keep dev directories in check: per-project cleanup rules, archiving to an external drive,
+offsite SQLite backups, and daily monitoring with alerts and agent-written rule proposals.
+
+Rules live in ../config/dev-space.toml: a set of defaults applied to every git project under
+the code root, plus rules per project. A rule deletes, archives (moves to the archive volume
+and leaves a symlink) or backs up a SQLite database. Whatever a rule says, the engine never
+touches a path that git tracks, that is not git-ignored, that a process has open, that is a
+symlink or lies outside its project, or that the config protects.
+
+Commands:
+  clean      run the rules (daily tier by default; --scheduled adds the pressure tier when
+             the disk runs low; --tier manual runs everything)
+  restore    bring an archived path back from the archive volume
+  rules      print the rules that apply to a project
+  scan       measure projects and global caches
+  watch      scan, record history, alert, and (--agent) ask codex for rule proposals
+  proposals  list the proposals codex wrote
+
+`mac-dev-cleanup` runs `clean --scheduled` and `watch --agent` every day at 06:00.
+"""
+
+import argparse
+import bisect
+import ctypes
+import datetime as dt
+import errno
+import fnmatch
+import gzip
+import hashlib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import struct
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, TextIO
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_CONFIG = SCRIPT_DIR.parent / "config" / "dev-space.toml"
+ANALYSIS_BRIEF = SCRIPT_DIR.parent / "references" / "dev-space-analysis.md"
+
+DAY = 86400
+DANGER = "⚠️"
+ACTIONS = ("delete", "archive", "sqlite-backup")
+WHENS = ("daily", "pressure", "manual")
+TIER_WHENS = {"daily": {"daily"}, "pressure": {"daily", "pressure"}, "manual": set(WHENS)}
+
+SETTINGS_KEYS = {"code_root", "archive_root", "state_dir", "pressure_free", "defaults_exclude", "protect"}
+PROJECT_KEYS = {"root", "related", "alert_size", "skip_defaults", "protect", "rules"}
+RULE_KEYS = {
+    "id", "why", "action", "when", "paths", "exclude", "age_days", "pressure_age_days", "keep_newest",
+    "idle_days", "pressure_idle_days", "companions", "source", "keep_daily", "keep_weekly",
+}
+WATCH_KEYS = {
+    "free_warn", "free_critical", "default_alert_size", "growth_alert", "realert_days", "backup_stale_days",
+    "agent_cooldown_days", "agent_max_per_run", "agent_timeout_minutes", "caches",
+}
+
+# exFAT keeps no symlinks, permissions or these characters in names; secrets would sit there
+# world-readable on an unencrypted drive.
+EXFAT_BAD_CHARS = set(':*?"<>|\\')
+SECRET_NAMES = {".env", ".gnupg", ".ssh", ".netrc", ".pgpass", "id_rsa", "id_ed25519", "id_ecdsa"}
+SECRET_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keychain", ".keychain-db")
+SECRET_OK = {".env.example", ".env.sample", ".env.template"}
+BACKUP_STAMP = "%Y%m%dT%H%M%SZ"
+BACKUP_RE = re.compile(r"-(\d{8}T\d{6}Z)\.sqlite\.gz$")
+
+
+class ConfigError(Exception):
+    pass
+
+
+# ── Sizes ───────────────────────────────────────────────────
+_UNITS = {"": 1, "B": 1, "KIB": 1024, "MIB": 1024**2, "GIB": 1024**3, "TIB": 1024**4}
+
+
+def parse_size(text: str) -> int:
+    m = re.fullmatch(r"\s*([\d.]+)\s*([A-Za-z]*)\s*", str(text))
+    if not m or m.group(2).upper() not in _UNITS:
+        raise ConfigError(f"bad size {text!r} (use B, KiB, MiB, GiB or TiB)")
+    return int(float(m.group(1)) * _UNITS[m.group(2).upper()])
+
+
+def human(size: float) -> str:
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if abs(size) < 1024:
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TiB"
+
+
+# ── Config ──────────────────────────────────────────────────
+@dataclass
+class Rule:
+    id: str
+    why: str
+    action: str
+    when: str = "manual"
+    paths: list[str] = field(default_factory=list)
+    exclude: list[str] = field(default_factory=list)
+    age_days: float = 0
+    pressure_age_days: float | None = None
+    keep_newest: int = 0
+    idle_days: float = 0
+    pressure_idle_days: float | None = None
+    companions: list[str] = field(default_factory=list)
+    source: str | None = None
+    keep_daily: int = 7
+    keep_weekly: int = 8
+    is_default: bool = False
+
+    def age_for(self, tier: str) -> float:
+        return self.pressure_age_days if tier == "pressure" and self.pressure_age_days is not None else self.age_days
+
+    def idle_for(self, tier: str) -> float:
+        return self.pressure_idle_days if tier == "pressure" and self.pressure_idle_days is not None else self.idle_days
+
+
+@dataclass
+class Project:
+    name: str
+    root: Path
+    related: list[Path] = field(default_factory=list)
+    alert_size: int | None = None
+    skip_defaults: list[str] = field(default_factory=list)
+    protect: list[str] = field(default_factory=list)
+    rules: list[Rule] = field(default_factory=list)
+    configured: bool = True
+
+    @property
+    def dirs(self) -> list[Path]:
+        return [self.root, *self.related]
+
+
+@dataclass
+class Settings:
+    code_root: Path
+    archive_root: Path
+    state_dir: Path
+    pressure_free: int
+    defaults_exclude: list[Path]
+    protect: list[str]
+
+
+@dataclass
+class Watch:
+    free_warn: int = 40 * 1024**3
+    free_critical: int = 15 * 1024**3
+    default_alert_size: int = 3 * 1024**3
+    growth_alert: int = 3 * 1024**3
+    realert_days: float = 3
+    backup_stale_days: float = 3
+    agent_cooldown_days: float = 14
+    agent_max_per_run: int = 2
+    agent_timeout_minutes: float = 20
+    caches: dict[str, tuple[Path, int]] = field(default_factory=dict)
+
+
+@dataclass
+class Config:
+    settings: Settings
+    defaults: list[Rule]
+    projects: dict[str, Project]
+    watch: Watch
+    home: Path
+    path: Path
+
+
+def _expand(text: str, home: Path) -> Path:
+    if text == "~" or text.startswith("~/"):
+        return home / text[2:] if text != "~" else home
+    return Path(text)
+
+
+def _check_keys(table: dict, allowed: set[str], where: str) -> None:
+    unknown = sorted(set(table) - allowed)
+    if unknown:
+        raise ConfigError(f"{where}: unknown key(s) {', '.join(unknown)}")
+
+
+def _parse_rule(raw: dict, where: str, is_default: bool) -> Rule:
+    _check_keys(raw, RULE_KEYS, where)
+    for key in ("id", "why", "action"):
+        if not raw.get(key):
+            raise ConfigError(f"{where}: missing {key}")
+    rule = Rule(**raw, is_default=is_default)
+    where = f"{where} rule {rule.id}"
+    if rule.action not in ACTIONS:
+        raise ConfigError(f"{where}: unknown action {rule.action!r} (one of {', '.join(ACTIONS)})")
+    if rule.when not in WHENS:
+        raise ConfigError(f"{where}: unknown when {rule.when!r} (one of {', '.join(WHENS)})")
+    if rule.action == "sqlite-backup" and not rule.source:
+        raise ConfigError(f"{where}: sqlite-backup needs source")
+    if rule.action != "sqlite-backup" and not rule.paths:
+        raise ConfigError(f"{where}: {rule.action} needs paths")
+    return rule
+
+
+def _parse_rules(raws: list, where: str, is_default: bool) -> list[Rule]:
+    rules = [_parse_rule(raw, where, is_default) for raw in raws]
+    ids = [r.id for r in rules]
+    dups = sorted({i for i in ids if ids.count(i) > 1})
+    if dups:
+        raise ConfigError(f"{where}: duplicate rule id(s) {', '.join(dups)}")
+    return rules
+
+
+def load_config(path: Path, home: Path | None = None) -> Config:
+    home = home or Path.home()
+    try:
+        data = tomllib.loads(Path(path).read_text())
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise ConfigError(f"{path}: {e}") from e
+    _check_keys(data, {"settings", "defaults", "projects", "watch"}, str(path))
+
+    raw = data.get("settings", {})
+    _check_keys(raw, SETTINGS_KEYS, "settings")
+    settings = Settings(
+        code_root=_expand(raw.get("code_root", "~/Code"), home),
+        archive_root=_expand(raw.get("archive_root", "/Volumes/LaCie/DevArchive"), home),
+        state_dir=_expand(raw.get("state_dir", "~/.local/state/dev-space"), home),
+        pressure_free=parse_size(raw.get("pressure_free", "15GiB")),
+        defaults_exclude=[_expand(p, home) for p in raw.get("defaults_exclude", [])],
+        protect=list(raw.get("protect", [])),
+    )
+
+    raw_defaults = data.get("defaults", {})
+    _check_keys(raw_defaults, {"rules"}, "defaults")
+    defaults = _parse_rules(raw_defaults.get("rules", []), "defaults", is_default=True)
+
+    projects = {}
+    for name, raw in data.get("projects", {}).items():
+        where = f"projects.{name}"
+        _check_keys(raw, PROJECT_KEYS, where)
+        if "root" not in raw:
+            raise ConfigError(f"{where}: missing root")
+        projects[name] = Project(
+            name=name,
+            root=_expand(raw["root"], home),
+            related=[_expand(p, home) for p in raw.get("related", [])],
+            alert_size=parse_size(raw["alert_size"]) if "alert_size" in raw else None,
+            skip_defaults=list(raw.get("skip_defaults", [])),
+            protect=list(raw.get("protect", [])),
+            rules=_parse_rules(raw.get("rules", []), where, is_default=False),
+        )
+
+    raw = data.get("watch", {})
+    _check_keys(raw, WATCH_KEYS, "watch")
+    watch = Watch()
+    for key in ("free_warn", "free_critical", "default_alert_size", "growth_alert"):
+        if key in raw:
+            setattr(watch, key, parse_size(raw[key]))
+    for key in ("realert_days", "backup_stale_days", "agent_cooldown_days", "agent_max_per_run", "agent_timeout_minutes"):
+        if key in raw:
+            setattr(watch, key, raw[key])
+    for name, cache in raw.get("caches", {}).items():
+        _check_keys(cache, {"path", "budget"}, f"watch.caches.{name}")
+        watch.caches[name] = (_expand(cache["path"], home), parse_size(cache["budget"]))
+    return Config(settings, defaults, projects, watch, home, Path(path))
+
+
+# ── Projects ────────────────────────────────────────────────
+def is_git_dir(path: Path) -> bool:
+    return (path / ".git").exists()
+
+
+def _real(path: Path) -> str:
+    return os.path.realpath(path)
+
+
+def discover_projects(cfg: Config) -> list[Project]:
+    """Configured projects, then every other git dir directly under the code root."""
+    projects = list(cfg.projects.values())
+    claimed = {_real(d) for p in projects for d in p.dirs}
+    root = cfg.settings.code_root
+    for entry in sorted(root.iterdir()) if root.is_dir() else []:
+        if entry.is_dir() and not entry.is_symlink() and _real(entry) not in claimed and is_git_dir(entry):
+            projects.append(Project(name=entry.name, root=entry, configured=False))
+    return projects
+
+
+def top_level_dirs(cfg: Config) -> list[Path]:
+    root = cfg.settings.code_root
+    return [e for e in sorted(root.iterdir()) if e.is_dir() and not e.is_symlink()] if root.is_dir() else []
+
+
+def default_bases(cfg: Config, project: Project) -> list[Path]:
+    excluded = {_real(p) for p in cfg.settings.defaults_exclude}
+    return [d for d in project.dirs if d.is_dir() and is_git_dir(d) and _real(d) not in excluded]
+
+
+@dataclass
+class Job:
+    project: Project
+    rule: Rule
+    bases: list[Path]  # where relative patterns resolve
+
+
+def plan_jobs(cfg: Config, tier: str, projects: list[str] | None = None, rule_ids: list[str] | None = None) -> list[Job]:
+    whens = TIER_WHENS[tier]
+    jobs = []
+    for project in discover_projects(cfg):
+        if projects and project.name not in projects:
+            continue
+        entries = []
+        if "*" not in project.skip_defaults:
+            bases = default_bases(cfg, project)
+            if bases:
+                entries += [(r, bases) for r in cfg.defaults if r.id not in project.skip_defaults]
+        entries += [(r, [project.root]) for r in project.rules]
+        entries = [(r, b) for r, b in entries if r.when in whens and (not rule_ids or r.id in rule_ids)]
+        # delete first so archives carry less; defaults before project rules; file order after that
+        entries.sort(key=lambda e: (ACTIONS.index(e[0].action), not e[0].is_default))
+        jobs += [Job(project, r, b) for r, b in entries]
+    return jobs
+
+
+def scheduled_tier(free: int, pressure_free: int) -> str:
+    return "pressure" if free < pressure_free else "daily"
+
+
+# ── Glob matching ───────────────────────────────────────────
+GLOB_CHARS = set("*?[")
+# Matched as units, never searched: walking a node_modules or DerivedData tree to look for
+# `**/.next/cache` costs minutes per project and finds nothing worth a rule.
+NO_DESCEND = {".git", "node_modules", "DerivedData", ".venv", "__pycache__"}
+
+
+def split_pattern(pattern: str, home: Path | None = None) -> tuple[Path, str]:
+    """Split an absolute pattern into its literal base dir and the glob below it."""
+    path = _expand(pattern, home or Path.home())
+    parts = path.parts
+    i = next((k for k, part in enumerate(parts) if GLOB_CHARS & set(part)), len(parts) - 1)
+    i = max(i, 1)
+    return Path(*parts[:i]), "/".join(parts[i:])
+
+
+def _full(p: tuple, i: int, s: tuple, j: int) -> bool:
+    if i == len(p):
+        return j == len(s)
+    if p[i] == "**":
+        return any(_full(p, i + 1, s, k) for k in range(j, len(s) + 1))
+    return j < len(s) and fnmatch.fnmatchcase(s[j], p[i]) and _full(p, i + 1, s, j + 1)
+
+
+def _prefix(p: tuple, i: int, s: tuple, j: int) -> bool:
+    """Whether some path below s (one or more segments deeper) could still match p."""
+    if j == len(s):
+        return i < len(p)
+    if i == len(p):
+        return False
+    if p[i] == "**":
+        return True
+    return fnmatch.fnmatchcase(s[j], p[i]) and _prefix(p, i + 1, s, j + 1)
+
+
+def _segments(pattern: str) -> tuple:
+    return tuple(seg for seg in pattern.strip("/").split("/") if seg and seg != ".")
+
+
+def match_units(base: Path, patterns: list[str]) -> list[Path]:
+    """Paths under base matching any pattern. A match is not descended into (outermost wins);
+    .git, symlinked dirs and NO_DESCEND trees are never entered."""
+    pats = [_segments(p) for p in patterns]
+    found: list[Path] = []
+
+    def walk(directory: Path, segs: tuple) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda e: e.name)
+        except OSError:
+            return
+        for entry in entries:
+            if entry.name == ".git":
+                continue
+            child = (*segs, entry.name)
+            if any(_full(p, 0, child, 0) for p in pats):
+                found.append(Path(entry.path))
+            elif (
+                entry.name not in NO_DESCEND
+                and entry.is_dir(follow_symlinks=False)
+                and any(_prefix(p, 0, child, 0) for p in pats)
+            ):
+                walk(Path(entry.path), child)
+
+    if base.is_dir() and not base.is_symlink():
+        walk(base, ())
+    return found
+
+
+class PathMatcher:
+    """Answers whether an absolute path matches one of a set of (relative or absolute) globs."""
+
+    def __init__(self, patterns: list[str], bases: list[Path], home: Path):
+        self.rules: list[tuple[str, tuple]] = []
+        for pattern in patterns:
+            if pattern.startswith(("/", "~")):
+                base, rel = split_pattern(pattern, home)
+                self.rules.append((_real(base), _segments(rel)))
+            else:
+                self.rules += [(_real(b), _segments(pattern)) for b in bases]
+
+    def hit(self, path: str) -> bool:
+        for base, segs in self.rules:
+            if path.startswith(base + "/"):
+                if _full(segs, 0, tuple(path[len(base) + 1 :].split("/")), 0):
+                    return True
+        return False
+
+    def hit_self_or_parent(self, path: str, stop: str) -> bool:
+        while True:
+            if self.hit(path):
+                return True
+            parent = os.path.dirname(path)
+            if path == stop or parent == path or not parent.startswith(stop):
+                return False
+            path = parent
+
+
+# ── Measuring ───────────────────────────────────────────────
+def iter_tree(path: Path):
+    """Yield (path, lstat) for path and everything under it, without following symlinks."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return
+    yield str(path), st
+    if not os.path.isdir(path) or os.path.islink(path):
+        return
+    for dirpath, dirs, files in os.walk(path):
+        for name in dirs + files:
+            full = os.path.join(dirpath, name)
+            try:
+                yield full, os.lstat(full)
+            except OSError:
+                continue
+
+
+def newest_mtime(path: Path, stop_after: float | None = None) -> float:
+    """Newest mtime of the files (and symlinks) under path; the dir's own mtime when it holds none.
+    Directory mtimes are ignored: removing a subdir must not make its parent look fresh.
+    Stops early once something newer than stop_after turns up."""
+    newest = None
+    own = 0.0
+    for full, st in iter_tree(path):
+        if os.path.isdir(full) and not os.path.islink(full):
+            if full == str(path):
+                own = st.st_mtime
+            continue
+        newest = st.st_mtime if newest is None else max(newest, st.st_mtime)
+        if stop_after is not None and newest > stop_after:
+            return newest
+    return own if newest is None else newest
+
+
+_libc = ctypes.CDLL(None, use_errno=True) if sys.platform == "darwin" else None
+
+
+class _AttrList(ctypes.Structure):
+    _fields_ = [
+        ("bitmapcount", ctypes.c_ushort), ("reserved", ctypes.c_ushort), ("commonattr", ctypes.c_uint32),
+        ("volattr", ctypes.c_uint32), ("dirattr", ctypes.c_uint32), ("fileattr", ctypes.c_uint32),
+        ("forkattr", ctypes.c_uint32),
+    ]
+
+
+def _ext_attr(path: str, bit: int, fmt: str) -> int:
+    if _libc is None:
+        return 0
+    al = _AttrList(5, 0, 0, 0, 0, 0, bit)
+    buf = ctypes.create_string_buffer(32)
+    # FSOPT_NOFOLLOW | FSOPT_ATTR_CMN_EXTENDED; the extended common attrs sit in the fork slot
+    if _libc.getattrlist(path.encode(), ctypes.byref(al), buf, 32, 0x1 | 0x20) != 0:
+        return 0
+    return struct.unpack_from(fmt, buf.raw, 4)[0]
+
+
+def clone_info(path: str) -> tuple[int, int]:
+    """(clone id, number of inodes sharing that data stream) on APFS: ATTR_CMNEXT_CLONEID and
+    ATTR_CMNEXT_CLONE_REFCNT. 1 = not cloned; hard links share an inode and don't count.
+    (0x200 next to them is EXT_FLAGS, a bitmask — reading it as the count is a trap.)"""
+    return _ext_attr(path, 0x100, "<Q"), _ext_attr(path, 0x1000, "<I")
+
+
+def measure(paths: list[Path]) -> tuple[int, int]:
+    """(du bytes, bytes deleting all of paths would really free). A hard-linked inode counts
+    only when all its links are in the set, an APFS clone group only when all its members are."""
+    inodes: dict[int, list] = {}  # ino -> [stat, links seen, a path]
+    for root in paths:
+        for full, st in iter_tree(Path(root)):
+            rec = inodes.setdefault(st.st_ino, [st, 0, full])
+            rec[1] += 1
+    du = real = 0
+    groups: dict[int, list] = {}  # clone id -> [refcnt, members seen, bytes]
+    for st, seen, full in inodes.values():
+        size = st.st_blocks * 512
+        du += size
+        is_dir = os.path.isdir(full) and not os.path.islink(full)
+        if not is_dir and seen < st.st_nlink:
+            continue  # another hard link outside the set keeps it
+        if is_dir or os.path.islink(full) or not size:
+            real += size
+            continue
+        cid, ref = clone_info(full)
+        if ref <= 1:
+            real += size
+        else:
+            g = groups.setdefault(cid, [ref, 0, size])
+            g[1] += 1
+    real += sum(size for ref, n, size in groups.values() if n >= ref)
+    return du, real
+
+
+def volume_free(path: Path) -> int:
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize
+
+
+# ── Git ─────────────────────────────────────────────────────
+def run(cmd: list[str], timeout: float = 120, **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, **kw)
+
+
+class GitInfo:
+    """Per-run cache of worktree lookups, idle times, tracked and ignored state."""
+
+    def __init__(self, now: float):
+        self.now = now
+        self._wt: dict[str, str | None] = {}
+        self._idle: dict[str, float] = {}
+
+    def worktree(self, path: Path) -> str | None:
+        """The git worktree containing path (searched from its parent up), or None."""
+        d = os.path.dirname(str(path))
+        chain = []
+        while True:
+            if d in self._wt:
+                found = self._wt[d]
+                break
+            chain.append(d)
+            if os.path.exists(os.path.join(d, ".git")):
+                found = d
+                break
+            parent = os.path.dirname(d)
+            if parent == d:
+                found = None
+                break
+            d = parent
+        for c in chain:
+            self._wt[c] = found
+        return found
+
+    def idle_seconds(self, wt: str) -> float:
+        """Seconds since the last commit or the newest uncommitted change, whichever is later."""
+        if wt in self._idle:
+            return self._idle[wt]
+        last = 0.0
+        log = run(["git", "-C", wt, "log", "-1", "--format=%ct"])
+        if log.returncode == 0 and log.stdout.strip().isdigit():
+            last = float(log.stdout.strip())
+        status = run(["git", "-C", wt, "status", "--porcelain", "-z", "--untracked-files=normal"])
+        entries = status.stdout.split("\0")
+        i = 0
+        while i < len(entries):
+            entry = entries[i]
+            i += 1
+            if len(entry) < 4:
+                continue
+            if entry[0] in "RC":
+                i += 1  # the rename source follows
+            try:
+                last = max(last, os.lstat(os.path.join(wt, entry[3:].rstrip("/"))).st_mtime)
+            except OSError:
+                pass
+        self._idle[wt] = self.now - last
+        return self._idle[wt]
+
+    def blockers(self, units: list[Path]) -> dict[str, str]:
+        """unit -> 'tracked' / 'not ignored' for units git would object to."""
+        by_wt: dict[str, list[Path]] = {}
+        for u in units:
+            wt = self.worktree(u)
+            if wt:
+                by_wt.setdefault(wt, []).append(u)
+        out: dict[str, str] = {}
+        for wt, us in by_wt.items():
+            rels = [os.path.relpath(u, wt) for u in us]
+            tracked: list[str] = []
+            for k in range(0, len(rels), 400):
+                res = run(["git", "-C", wt, "ls-files", "-z", "--", *rels[k : k + 400]])
+                tracked += [t for t in res.stdout.split("\0") if t]
+            tracked.sort()
+            ignored = set(run(["git", "-C", wt, "check-ignore", "-z", "--stdin"], input="\0".join(rels)).stdout.split("\0"))
+            for u, rel in zip(us, rels):
+                i = bisect.bisect_left(tracked, rel)
+                if i < len(tracked) and (tracked[i] == rel or tracked[i].startswith(rel + "/")):
+                    out[str(u)] = "tracked by git"
+                elif rel not in ignored:
+                    j = bisect.bisect_left(tracked, rel + "/")
+                    if j < len(tracked) and tracked[j].startswith(rel + "/"):
+                        out[str(u)] = "tracked by git"
+                    else:
+                        out[str(u)] = "not ignored by git: may be work in progress"
+        return out
+
+
+# ── Processes ───────────────────────────────────────────────
+def lsof_open_paths() -> dict[str, str]:
+    """Every path a process of this user has open, as cwd, executable or file -> command name."""
+    res = run(["lsof", "-nP", "-w", "-F", "pcn", "-u", str(os.getuid())], timeout=300)
+    if res.returncode not in (0, 1) or not res.stdout:
+        raise RuntimeError(f"lsof failed: {res.stderr.strip()[:200]}")
+    paths: dict[str, str] = {}
+    command = "?"
+    for line in res.stdout.splitlines():
+        if line.startswith("c"):
+            command = line[1:]
+        elif line.startswith("n/"):
+            paths.setdefault(line[1:], command)
+    return paths
+
+
+class OpenFiles:
+    def __init__(self, paths: dict[str, str]):
+        self.paths = paths
+        self.keys = sorted(paths)
+
+    def user_of(self, unit: str) -> str | None:
+        if unit in self.paths:
+            return self.paths[unit]
+        i = bisect.bisect_left(self.keys, unit + "/")
+        if i < len(self.keys) and self.keys[i].startswith(unit + "/"):
+            return self.paths[self.keys[i]]
+        return None
+
+
+# ── Archive volume ──────────────────────────────────────────
+def archive_available(root: Path) -> bool:
+    """The archive root is usable: under /Volumes/<vol> that volume must be mounted (else we would
+    write into an empty folder on the system disk); elsewhere the dir must exist."""
+    parts = Path(root).parts
+    if len(parts) >= 3 and parts[1] == "Volumes":
+        volume = Path("/", "Volumes", parts[2])
+        return os.path.ismount(volume) and os.access(volume, os.W_OK)
+    return Path(root).is_dir()
+
+
+def exfat_problem(unit: Path) -> str | None:
+    """Why unit cannot go to an exFAT archive, or None."""
+    for full, st in iter_tree(unit):
+        rel = os.path.relpath(full, unit.parent)
+        name = os.path.basename(full)
+        if os.path.islink(full):
+            return f"not exFAT-safe: contains symlink {rel}"
+        if name == ".git":
+            return f"not exFAT-safe: contains .git ({rel})"
+        if name.endswith(".app") and os.path.isdir(full):
+            return f"not exFAT-safe: contains .app bundle {rel}"
+        if EXFAT_BAD_CHARS & set(name):
+            return f"not exFAT-safe: name {rel}"
+        if name not in SECRET_OK and (
+            name in SECRET_NAMES or name.startswith(".env.") or name.endswith(SECRET_SUFFIXES) or name.lower().startswith("credentials")
+        ):
+            return f"secret inside: {rel} (exFAT has no permissions)"
+    return None
+
+
+def _hash_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def copy_verified(src: Path, dest: Path) -> tuple[int, int]:
+    """Copy src (file or dir) to dest, keeping mtimes, then read every file back and compare
+    hashes. Returns (files, bytes). Raises on any mismatch, leaving dest for inspection."""
+    files = size = 0
+    hashes: dict[str, str] = {}
+    if src.is_dir():
+        for dirpath, dirs, names in os.walk(src):
+            rel = os.path.relpath(dirpath, src)
+            target = dest / rel if rel != "." else dest
+            target.mkdir(parents=True, exist_ok=True)
+            present = set(names) | set(dirs)
+            for name in names:
+                if name.startswith("._") and name[2:] in present:
+                    continue  # AppleDouble: exFAT's stand-in for the xattrs of its sibling
+
+                s, d = os.path.join(dirpath, name), str(target / name)
+                hashes[d] = _copy_one(s, d)
+                files += 1
+                size += os.path.getsize(s)
+        for dirpath, dirs, _names in os.walk(src, topdown=False):
+            rel = os.path.relpath(dirpath, src)
+            st = os.stat(dirpath)
+            os.utime(dest / rel if rel != "." else dest, (st.st_atime, st.st_mtime))
+    else:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        hashes[str(dest)] = _copy_one(str(src), str(dest))
+        files, size = 1, src.stat().st_size
+    for d, digest in hashes.items():
+        if _hash_file(d) != digest:
+            raise RuntimeError(f"verify failed: {d} differs from its source")
+    return files, size
+
+
+def _copy_one(src: str, dest: str) -> str:
+    h = hashlib.sha256()
+    with open(src, "rb") as fi, open(dest, "wb") as fo:
+        for chunk in iter(lambda: fi.read(1 << 20), b""):
+            h.update(chunk)
+            fo.write(chunk)
+    st = os.stat(src)
+    os.utime(dest, (st.st_atime, st.st_mtime))
+    return h.hexdigest()
+
+
+def archive_dest(cfg: Config, project: str, unit: Path) -> Path:
+    try:
+        rel = unit.relative_to(cfg.home)
+    except ValueError:
+        rel = Path(*unit.parts[1:])
+    return cfg.settings.archive_root / project / rel
+
+
+def _append_jsonl(path: Path, record: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def _rmtree(path: Path) -> None:
+    def fix(func, p, _exc):
+        os.chmod(os.path.dirname(p), 0o755)
+        if os.path.isdir(p) and not os.path.islink(p):
+            os.chmod(p, 0o755)
+        func(p)
+
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, onerror=fix)
+    else:
+        path.unlink(missing_ok=True)
+
+
+# ── SQLite backups ──────────────────────────────────────────
+def backups_to_keep(stamps: list[float], keep_daily: int, keep_weekly: int) -> set[float]:
+    """Newest backup of each of the last keep_daily days that have one, plus the newest of each
+    of the last keep_weekly ISO weeks. Other backups of a kept day are dropped."""
+    newest_of_day: dict[dt.date, float] = {}
+    for s in stamps:
+        day = dt.datetime.fromtimestamp(s, dt.timezone.utc).date()
+        newest_of_day[day] = max(newest_of_day.get(day, s), s)
+    dailies = sorted(newest_of_day.values(), reverse=True)
+    keep = set(dailies[:keep_daily])
+    weeks: list[float] = []
+    seen: set[tuple] = set()
+    for s in dailies:
+        week = dt.datetime.fromtimestamp(s, dt.timezone.utc).isocalendar()[:2]
+        if week not in seen:
+            seen.add(week)
+            weeks.append(s)
+    return keep | set(weeks[:keep_weekly])
+
+
+def _stamp_of(name: str) -> float | None:
+    m = BACKUP_RE.search(name)
+    if not m:
+        return None
+    return dt.datetime.strptime(m.group(1), BACKUP_STAMP).replace(tzinfo=dt.timezone.utc).timestamp()
+
+
+# ── Clean ───────────────────────────────────────────────────
+@dataclass
+class Outcome:
+    project: str
+    rule: str
+    action: str
+    path: Path
+    du: int
+    dest: Path | None = None
+
+
+@dataclass
+class Skip:
+    project: str
+    rule: str
+    path: Path
+    reason: str
+
+
+@dataclass
+class CleanResult:
+    done: list[Outcome] = field(default_factory=list)
+    skipped: list[Skip] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    du: int = 0
+    real: int = 0
+
+
+class Runner:
+    def __init__(
+        self,
+        cfg: Config,
+        tier: str = "daily",
+        dry_run: bool = False,
+        verbose: bool = False,
+        now: float | None = None,
+        open_paths: dict[str, str] | None = None,
+        out: TextIO = sys.stdout,
+    ):
+        self.cfg = cfg
+        self.tier = tier
+        self.dry_run = dry_run
+        self.verbose = verbose
+        self.now = now or time.time()
+        self._open_paths = open_paths
+        self._open: OpenFiles | None = None
+        self.out = out
+        self.git = GitInfo(self.now)
+        self.result = CleanResult()
+        self._archive_ok: bool | None = None
+        self._trash: Path | None = None
+        self._header: str | None = None
+
+    def p(self, line: str = "") -> None:
+        # a project's name is printed with its first line, so projects with nothing to say stay silent
+        if self._header:
+            print(self._header, file=self.out)
+            self._header = None
+        print(line, file=self.out)
+
+    @property
+    def open_files(self) -> OpenFiles:
+        if self._open is None:
+            self._open = OpenFiles(self._open_paths if self._open_paths is not None else lsof_open_paths())
+        return self._open
+
+    def archive_ok(self) -> bool:
+        if self._archive_ok is None:
+            root = self.cfg.settings.archive_root
+            self._archive_ok = archive_available(root)
+            if self._archive_ok and not self.dry_run:
+                root.mkdir(parents=True, exist_ok=True)
+        return self._archive_ok
+
+    def trash(self) -> Path:
+        if self._trash is None:
+            base = self.cfg.settings.state_dir / "trash"
+            base.mkdir(parents=True, exist_ok=True)
+            self._trash = Path(tempfile.mkdtemp(prefix=time.strftime("%Y%m%d-%H%M%S-"), dir=base))
+        return self._trash
+
+    # ── entry ──
+    def clean(self, projects: list[str] | None = None, rule_ids: list[str] | None = None) -> CleanResult:
+        jobs = plan_jobs(self.cfg, self.tier, projects, rule_ids)
+        free_before = volume_free(self.cfg.settings.code_root)
+        mode = " [dry-run]" if self.dry_run else ""
+        self.p(f"── dev-space clean · tier {self.tier}{mode} · free {human(free_before)} ──")
+        current = None
+        for job in jobs:
+            if job.project.name != current:
+                current = job.project.name
+                self._header = current
+                if self.verbose:
+                    print(current, file=self.out)
+                    self._header = None
+            try:
+                if job.rule.action == "sqlite-backup":
+                    self.run_backup(job)
+                else:
+                    self.run_paths(job)
+            except Exception as e:  # noqa: BLE001 — one rule failing must not stop the others
+                msg = f"{job.project.name}/{job.rule.id}: {e!r}"
+                self.result.errors.append(msg)
+                self.p(f"  {DANGER} {job.rule.id} failed: {e!r}")
+        if self._trash is not None:
+            _rmtree(self._trash)
+        r = self.result
+        line = f"total: {len(r.done)} item(s), {human(r.du)} by du, {human(r.real)} real"
+        if not self.dry_run:
+            line += f"; volume free {human(free_before)} → {human(volume_free(self.cfg.settings.code_root))}"
+        self.p(line)
+        return r
+
+    # ── delete / archive ──
+    def candidates(self, job: Job) -> list[Path]:
+        rule, tier = job.rule, self.tier
+        idle = rule.idle_for(tier)
+        units: dict[str, Path] = {}
+        rel = [p for p in rule.paths if not p.startswith(("/", "~"))]
+        for base in job.bases:
+            # cheap pre-check: a busy worktree rules out everything under it, skip the walk
+            if idle and is_git_dir(base) and self.git.idle_seconds(str(base)) < idle * DAY:
+                continue
+            for u in match_units(base, rel):
+                units.setdefault(str(u), u)
+        for pattern in rule.paths:
+            if pattern.startswith(("/", "~")):
+                base, sub = split_pattern(pattern, self.cfg.home)
+                for u in match_units(base, [sub]):
+                    units.setdefault(str(u), u)
+        return [units[k] for k in sorted(units)]
+
+    def run_paths(self, job: Job) -> None:
+        rule, project = job.rule, job.project
+        if rule.action == "archive" and not self.archive_ok():
+            self.p(f"  archive {rule.id}: archive volume not mounted ({self.cfg.settings.archive_root}), skipped")
+            return
+        allowed = [_real(d) for d in project.dirs if d.exists()]
+        protect = PathMatcher(self.cfg.settings.protect + project.protect, [project.root], self.cfg.home)
+        exclude = PathMatcher(rule.exclude, [project.root], self.cfg.home)
+        skipped: list[Skip] = []
+
+        def skip(unit: Path, reason: str) -> None:
+            skipped.append(Skip(project.name, rule.id, unit, reason))
+
+        # 1. cheap guards
+        units = []
+        for unit in self.candidates(job):
+            s = str(unit)
+            if unit.is_symlink():
+                skip(unit, "symlink: archived or points elsewhere")
+            elif not any(_real(unit) == a or _real(unit).startswith(a + "/") for a in allowed):
+                skip(unit, "outside the project")
+            elif protect.hit_self_or_parent(s, "/"):
+                skip(unit, "protected")
+            elif exclude.hit_self_or_parent(s, "/"):
+                skip(unit, "excluded by rule")
+            else:
+                units.append(unit)
+
+        # 2. time: keep_newest, age, idle
+        cutoff = self.now - rule.age_for(self.tier) * DAY
+        if rule.keep_newest:
+            stamped = sorted(((newest_mtime(u), u) for u in units), key=lambda t: t[0], reverse=True)
+            kept_newest = len(stamped[: rule.keep_newest])
+            stamped = stamped[rule.keep_newest :]
+            due = [u for m, u in stamped if not rule.age_for(self.tier) or m <= cutoff]
+        else:
+            kept_newest = 0
+            due = [u for u in units if not rule.age_for(self.tier) or newest_mtime(u, stop_after=cutoff) <= cutoff]
+        idle = rule.idle_for(self.tier)
+        if idle:
+            due = [u for u in due if (wt := self.git.worktree(u)) is None or self.git.idle_seconds(wt) >= idle * DAY]
+        not_due = len(units) - len(due)
+
+        # 3. full scans: what the unit contains
+        ready = []
+        for unit in due:
+            reason = self.content_problem(unit, rule, protect, exclude)
+            if reason:
+                skip(unit, reason)
+            else:
+                ready.append(unit)
+
+        # 4. git and processes
+        blocked = self.git.blockers(ready)
+        final = []
+        for unit in ready:
+            user = self.open_files.user_of(str(unit))
+            if str(unit) in blocked:
+                skip(unit, blocked[str(unit)])
+            elif user:
+                skip(unit, f"in use: {user}")
+            else:
+                final.append(unit)
+
+        self.act(job, final, skipped, not_due, kept_newest)
+
+    def content_problem(self, unit: Path, rule: Rule, protect: PathMatcher, exclude: PathMatcher) -> str | None:
+        if unit.is_dir():
+            for full, _st in iter_tree(unit):
+                if full == str(unit):
+                    continue
+                if protect.hit(full):
+                    return f"protected: contains {os.path.relpath(full, unit.parent)}"
+                if exclude.hit(full):
+                    return f"excluded by rule: contains {os.path.relpath(full, unit.parent)}"
+        if rule.action == "archive":
+            return exfat_problem(unit)
+        return None
+
+    def act(self, job: Job, units: list[Path], skipped: list[Skip], not_due: int, kept_newest: int) -> None:
+        rule, project = job.rule, job.project
+        companions = [Path(str(u) + suffix) for u in units for suffix in rule.companions]
+        companions = [c for c in companions if c.exists() and not c.is_symlink()]
+        du, real = measure(units + companions) if units else (0, 0)
+        label = f"  {rule.action:<7} {rule.id:<30}"
+        if units:
+            self.p(f"{label} {len(units):>5}  {human(du):>10}  (real {human(real)})")
+        elif self.verbose or skipped:
+            self.p(f"{label}     0")
+        if skipped:
+            counts: dict[str, int] = {}
+            for s in skipped:
+                key = s.reason.split(":")[0]
+                counts[key] = counts.get(key, 0) + 1
+            self.p("          skipped: " + ", ".join(f"{n} {k}" for k, n in counts.items()))
+        if self.verbose:
+            if not_due or kept_newest:
+                self.p(f"          not due: {not_due}" + (f" (incl. {kept_newest} kept as newest)" if kept_newest else ""))
+            for s in skipped:
+                self.p(f"        · {self._show(s.path)}: {s.reason}")
+            for u in units:
+                age = (self.now - newest_mtime(u)) / DAY
+                self.p(f"        - {self._show(u)}  {human(measure([u])[0])}  {age:.0f}d")
+        self.result.skipped += skipped
+        for unit in units:
+            unit_du = measure([unit])[0] if not self.dry_run else 0
+            dest = archive_dest(self.cfg, project.name, unit) if rule.action == "archive" else None
+            if not self.dry_run:
+                if rule.action == "delete":
+                    self.delete(unit, [c for c in companions if str(c).startswith(str(unit))])
+                else:
+                    dest = self.archive(project, rule, unit, dest)
+                _append_jsonl(
+                    self.cfg.settings.state_dir / "actions.jsonl",
+                    {
+                        "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"),
+                        "project": project.name, "rule": rule.id, "action": rule.action,
+                        "path": str(unit), "dest": str(dest) if dest else None, "du_bytes": unit_du,
+                    },
+                )
+            self.result.done.append(Outcome(project.name, rule.id, rule.action, unit, unit_du, dest))
+        self.result.du += du
+        self.result.real += real
+
+    def _show(self, path: Path) -> str:
+        try:
+            return "~/" + str(path.relative_to(self.cfg.home))
+        except ValueError:
+            return str(path)
+
+    def delete(self, unit: Path, companions: list[Path]) -> None:
+        for path in [unit, *companions]:
+            try:
+                path.rename(self.trash() / f"{len(os.listdir(self.trash()))}-{path.name}")
+            except OSError as e:
+                if e.errno != errno.EXDEV:
+                    raise
+                _rmtree(path)
+
+    def archive(self, project: Project, rule: Rule, unit: Path, dest: Path) -> Path:
+        if dest.exists() or dest.is_symlink():
+            # an earlier archive of the same path, restored since: keep it, archive beside it
+            dest = dest.with_name(f"{dest.name}.{time.strftime('%Y%m%dT%H%M%S')}")
+            if dest.exists():
+                raise RuntimeError(f"archive destination already exists: {dest}")
+        partial = dest.with_name(f"{dest.name}.partial-{os.getpid()}")
+        if partial.exists():
+            _rmtree(partial)
+        files, size = copy_verified(unit, partial)
+        partial.rename(dest)
+        parked = self.trash() / f"{len(os.listdir(self.trash()))}-{unit.name}"
+        unit.rename(parked)
+        try:
+            unit.symlink_to(dest)
+        except OSError:
+            parked.rename(unit)
+            raise
+        record = {
+            "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "event": "archive",
+            "project": project.name, "rule": rule.id, "src": str(unit), "dest": str(dest), "files": files, "bytes": size,
+        }
+        _append_jsonl(self.cfg.settings.archive_root / "MANIFEST.jsonl", record)
+        _append_jsonl(self.cfg.settings.state_dir / "archive-manifest.jsonl", record)
+        return dest
+
+    # ── sqlite backup ──
+    def run_backup(self, job: Job) -> None:
+        rule, project = job.rule, job.project
+        source = _expand(rule.source, self.cfg.home)
+        if not source.is_absolute():
+            source = project.root / source
+        label = f"  backup  {rule.id:<30}"
+        if not source.exists():
+            self.p(f"{label} {DANGER} source missing: {source}")
+            self.result.errors.append(f"{project.name}/{rule.id}: source missing")
+            return
+        if not self.archive_ok():
+            self.p(f"{label} archive volume not mounted ({self.cfg.settings.archive_root}), skipped")
+            return
+        dest_dir = self.cfg.settings.archive_root / project.name / "sqlite-backups" / rule.id
+        today = dt.datetime.fromtimestamp(self.now, dt.timezone.utc).date()
+        existing = {p: s for p in dest_dir.glob("*.sqlite.gz") if (s := _stamp_of(p.name)) is not None} if dest_dir.is_dir() else {}
+        if any(dt.datetime.fromtimestamp(s, dt.timezone.utc).date() == today for s in existing.values()):
+            self.p(f"{label} already backed up today")
+            return
+        stamp = dt.datetime.fromtimestamp(self.now, dt.timezone.utc).strftime(BACKUP_STAMP)
+        final = dest_dir / f"{source.name.split('.')[0]}-{stamp}.sqlite.gz"
+        if self.dry_run:
+            self.p(f"{label} would back up {self._show(source)} ({human(source.stat().st_size)}) → {final}")
+            return
+        work = self.cfg.settings.state_dir / "tmp"
+        work.mkdir(parents=True, exist_ok=True)
+        snapshot = work / f"{rule.id}-{stamp}.sqlite"
+        snapshot.unlink(missing_ok=True)
+        try:
+            src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+            try:
+                src.execute("VACUUM INTO ?", (str(snapshot),))
+            finally:
+                src.close()
+            check = sqlite3.connect(snapshot)
+            try:
+                result = check.execute("pragma integrity_check").fetchone()[0]
+            finally:
+                check.close()
+            if result != "ok":
+                raise RuntimeError(f"integrity_check of the snapshot: {result}")
+            digest = _hash_file(str(snapshot))
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            partial = final.with_name(final.name + ".partial")
+            with open(snapshot, "rb") as fi, gzip.open(partial, "wb", compresslevel=6) as fo:
+                shutil.copyfileobj(fi, fo, 1 << 20)
+            h = hashlib.sha256()
+            with gzip.open(partial, "rb") as f:
+                for chunk in iter(lambda: f.read(1 << 20), b""):
+                    h.update(chunk)
+            if h.hexdigest() != digest:
+                raise RuntimeError("compressed backup does not read back identical")
+            partial.rename(final)
+        finally:
+            snapshot.unlink(missing_ok=True)
+        size = final.stat().st_size
+        self.p(f"{label}     1  {human(size):>10}  {final.name}")
+        existing[final] = _stamp_of(final.name)
+        keep = backups_to_keep(list(existing.values()), rule.keep_daily, rule.keep_weekly)
+        dropped = [p for p, s in existing.items() if s not in keep]
+        for p in dropped:
+            p.unlink()
+        if dropped:
+            self.p(f"          rotated out {len(dropped)} old backup(s)")
+        _append_jsonl(
+            self.cfg.settings.state_dir / "actions.jsonl",
+            {
+                "ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "project": project.name,
+                "rule": rule.id, "action": "sqlite-backup", "path": str(source), "dest": str(final), "du_bytes": size,
+            },
+        )
+        self.result.done.append(Outcome(project.name, rule.id, "sqlite-backup", source, size, final))
+
+
+# ── Restore ─────────────────────────────────────────────────
+def restore(cfg: Config, path: Path, dry_run: bool, out: TextIO = sys.stdout) -> int:
+    path = Path(os.path.abspath(path))
+    root = _real(cfg.settings.archive_root)
+    if not path.is_symlink():
+        print(f"{path} is not an archived symlink", file=out)
+        return 1
+    target = Path(os.readlink(path))
+    if not _real(target).startswith(root + "/"):
+        print(f"{path} points to {target}, outside the archive root {root}", file=out)
+        return 1
+    if not target.exists():
+        print(f"{target} is not reachable (archive volume not mounted?)", file=out)
+        return 1
+    if dry_run:
+        print(f"[dry-run] would copy {target} back to {path}", file=out)
+        return 0
+    staging = path.with_name(f"{path.name}.restoring-{os.getpid()}")
+    files, size = copy_verified(target, staging)
+    path.unlink()
+    staging.rename(path)
+    record = {"ts": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "event": "restore", "src": str(target), "dest": str(path), "files": files, "bytes": size}
+    _append_jsonl(cfg.settings.archive_root / "MANIFEST.jsonl", record)
+    _append_jsonl(cfg.settings.state_dir / "archive-manifest.jsonl", record)
+    print(f"✅ restored {path} ({files} file(s), {human(size)}); the archive copy stays at {target}", file=out)
+    return 0
+
+
+# ── Rules listing ───────────────────────────────────────────
+def print_rules(cfg: Config, name: str | None, out: TextIO = sys.stdout) -> int:
+    projects = [p for p in discover_projects(cfg) if name in (None, p.name)]
+    if name and not projects:
+        print(f"no project {name!r} (not configured and not a git dir under {cfg.settings.code_root})", file=out)
+        return 1
+    for project in projects:
+        kind = "" if project.configured else " (defaults only)"
+        print(f"{project.name}{kind}  {project.root}", file=out)
+        for d in project.related:
+            print(f"  related: {d}", file=out)
+        for job in plan_jobs(cfg, "manual", [project.name]):
+            r = job.rule
+            what = r.source if r.action == "sqlite-backup" else ", ".join(r.paths)
+            cond = [f"age>{r.age_days:g}d" if r.age_days else "", f"idle>{r.idle_days:g}d" if r.idle_days else "", f"keep {r.keep_newest}" if r.keep_newest else ""]
+            src = "default" if r.is_default else "project"
+            print(f"  [{r.when:<8}] {r.action:<13} {r.id:<30} {src:<7} {what}  {' '.join(c for c in cond if c)}", file=out)
+    return 0
+
+
+# ── Watch ───────────────────────────────────────────────────
+@dataclass
+class Snapshot:
+    ts: float
+    free: int
+    items: dict[str, int]
+
+
+@dataclass
+class Alert:
+    key: str
+    level: str  # warn | critical
+    message: str
+    project: str | None = None
+    needs_agent: bool = False
+
+
+LEVELS = {"warn": 1, "critical": 2}
+
+
+def du_bytes(path: Path) -> int:
+    if not path.exists():
+        return 0
+    res = run(["du", "-sk", str(path)], timeout=1800)
+    first = res.stdout.split("\t", 1)[0].strip()
+    return int(first) * 1024 if first.isdigit() else 0
+
+
+def measure_all(cfg: Config) -> Snapshot:
+    """du of every project (root + related) and every watched cache."""
+    groups: dict[str, list[Path]] = {}
+    owner = {_real(d): p.name for p in cfg.projects.values() for d in p.dirs}
+    for p in cfg.projects.values():
+        groups[f"project:{p.name}"] = [d for d in p.dirs if d.exists()]
+    for d in top_level_dirs(cfg):
+        if _real(d) not in owner:
+            groups[f"project:{d.name}"] = [d]
+    for name, (path, _budget) in cfg.watch.caches.items():
+        groups[f"cache:{name}"] = [path] if path.exists() else []
+    flat = [(key, path) for key, paths in groups.items() for path in paths]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        sizes = list(pool.map(lambda kp: du_bytes(kp[1]), flat))
+    items = dict.fromkeys(groups, 0)
+    for (key, _path), size in zip(flat, sizes):
+        items[key] += size
+    return Snapshot(ts=time.time(), free=volume_free(cfg.settings.code_root), items=items)
+
+
+def read_history(cfg: Config) -> list[dict]:
+    path = cfg.settings.state_dir / "history.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def history_delta(history: list[dict], key: str, current: int, now: float, days: float = 7) -> int | None:
+    """Growth since the newest record at least `days` old; None without such a record."""
+    old = [h for h in history if h["ts"] <= now - days * DAY and key in h.get("items", {})]
+    if not old:
+        return None
+    return current - max(old, key=lambda h: h["ts"])["items"][key]
+
+
+def last_backup_times(cfg: Config) -> dict[str, float]:
+    """'project/rule' -> time of the last successful sqlite backup, from the action log."""
+    path = cfg.settings.state_dir / "actions.jsonl"
+    found: dict[str, float] = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            entry = json.loads(line)
+            if entry.get("action") == "sqlite-backup":
+                found[f"{entry['project']}/{entry['rule']}"] = dt.datetime.fromisoformat(entry["ts"]).timestamp()
+    return found
+
+
+def evaluate(snap: Snapshot, history: list[dict], cfg: Config, now: float, last_backups: dict[str, float]) -> list[Alert]:
+    w = cfg.watch
+    alerts: list[Alert] = []
+    if snap.free < w.free_critical:
+        alerts.append(Alert("free", "critical", f"only {human(snap.free)} free on the data volume"))
+    elif snap.free < w.free_warn:
+        alerts.append(Alert("free", "warn", f"{human(snap.free)} free on the data volume"))
+    for key, size in sorted(snap.items.items(), key=lambda kv: -kv[1]):
+        kind, name = key.split(":", 1)
+        if kind == "project":
+            project = cfg.projects.get(name)
+            limit = project.alert_size if project and project.alert_size else w.default_alert_size
+            if size > limit:
+                why = "still over its alert size after cleanup" if project else "has no rules yet"
+                alerts.append(Alert(f"{key}:size", "warn", f"{name} is {human(size)} (> {human(limit)}), {why}", name, needs_agent=True))
+        elif kind == "cache" and name in w.caches:
+            budget = w.caches[name][1]
+            if size > budget:
+                alerts.append(Alert(f"{key}:size", "warn", f"cache {name} is {human(size)} (> {human(budget)})"))
+        growth = history_delta(history, key, size, now)
+        if growth is not None and growth > w.growth_alert:
+            alerts.append(
+                Alert(f"{key}:growth", "warn", f"{name} grew {human(growth)} in 7 days", name if kind == "project" else None, needs_agent=kind == "project")
+            )
+    for project in cfg.projects.values():
+        for rule in project.rules:
+            if rule.action != "sqlite-backup":
+                continue
+            key = f"{project.name}/{rule.id}"
+            last = last_backups.get(key)
+            if last is None or now - last > w.backup_stale_days * DAY:
+                age = "never" if last is None else f"{(now - last) / DAY:.0f} days ago"
+                alerts.append(Alert(f"backup:{key}", "warn", f"offsite backup {key} last ran {age} (archive volume unplugged?)"))
+    return alerts
+
+
+def dedupe(alerts: list[Alert], state: dict, now: float, realert_days: float) -> list[Alert]:
+    """Alerts worth a notification: new, escalated, or last notified realert_days ago. Updates state."""
+    fresh = []
+    for a in alerts:
+        prev = state.get(a.key)
+        if prev and LEVELS[a.level] <= LEVELS[prev["level"]] and now - prev["ts"] < realert_days * DAY:
+            continue
+        state[a.key] = {"level": a.level, "ts": now}
+        fresh.append(a)
+    return fresh
+
+
+def notify(title: str, body: str) -> None:
+    def esc(s: str) -> str:
+        return s.replace("\\", "\\\\").replace('"', '\\"')
+
+    run(["osascript", "-e", f'display notification "{esc(body)}" with title "{esc(title)}"'], timeout=30)
+
+
+def analysis_prompt(cfg: Config, project: str, dirs: list[Path], alert: Alert) -> str:
+    brief = ANALYSIS_BRIEF.read_text() if ANALYSIS_BRIEF.exists() else ""
+    rules = io_capture(lambda out: print_rules(cfg, project, out))
+    return (
+        f"{brief}\n\n## This run\n\nProject: `{project}`. Directories: {', '.join(str(d) for d in dirs)}.\n"
+        f"Why you were called: {alert.message}.\n\nRules that apply today (from `dev-space rules {project}`):\n\n```\n{rules}```\n\n"
+        f"Your final message is saved verbatim as the proposal file, so make it the complete report."
+    )
+
+
+def io_capture(fn: Callable[[TextIO], object]) -> str:
+    import io
+
+    buf = io.StringIO()
+    fn(buf)
+    return buf.getvalue()
+
+
+def dispatch_proposals(
+    alerts: list[Alert], cfg: Config, now: float, codex: str | None, out: TextIO = sys.stdout, notify: Callable = notify
+) -> list[Path]:
+    """Ask a read-only codex for rule proposals on flagged projects, within cooldown and cap."""
+    w = cfg.watch
+    folder = cfg.settings.state_dir / "proposals"
+    folder.mkdir(parents=True, exist_ok=True)
+    state_path = folder / "agents.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    picks: dict[str, Alert] = {}
+    for a in sorted(alerts, key=lambda a: -LEVELS[a.level]):
+        if a.needs_agent and a.project and a.project not in picks and now - state.get(a.project, 0) >= w.agent_cooldown_days * DAY:
+            picks[a.project] = a
+    made = []
+    for name, alert in list(picks.items())[: w.agent_max_per_run]:
+        project = cfg.projects.get(name)
+        dirs = project.dirs if project else [cfg.settings.code_root / name]
+        target = folder / f"{dt.datetime.fromtimestamp(now).strftime('%Y-%m-%d')}-{name}.md"
+        if not codex:
+            print(f"  codex not found, no proposal for {name}", file=out)
+            continue
+        cmd = [codex, "exec", "--ephemeral", "-s", "read-only", "--skip-git-repo-check", "-C", str(dirs[0]), "-o", str(target), analysis_prompt(cfg, name, dirs, alert)]
+        print(f"  asking codex for a rule proposal on {name} …", file=out)
+        try:
+            res = run(cmd, timeout=w.agent_timeout_minutes * 60)
+        except subprocess.TimeoutExpired:
+            print(f"  {DANGER} codex timed out after {w.agent_timeout_minutes:g} min on {name}", file=out)
+            continue
+        if res.returncode != 0 or not target.exists():
+            print(f"  {DANGER} codex failed on {name}: {(res.stderr or res.stdout).strip()[-300:]}", file=out)
+            continue
+        state[name] = now
+        made.append(target)
+        print(f"  proposal: {target}", file=out)
+    state_path.write_text(json.dumps(state, indent=1))
+    if made:
+        notify("dev-space: rule proposal ready", f"{len(made)} proposal(s), see dev-space proposals")
+    return made
+
+
+def print_scan(snap: Snapshot, history: list[dict], cfg: Config, out: TextIO = sys.stdout) -> None:
+    print(f"free {human(snap.free)}", file=out)
+    print(f"{'item':<44} {'size':>10} {'7d':>10} {'limit':>10}", file=out)
+    for key, size in sorted(snap.items.items(), key=lambda kv: -kv[1]):
+        kind, name = key.split(":", 1)
+        if kind == "project":
+            p = cfg.projects.get(name)
+            limit = p.alert_size if p and p.alert_size else cfg.watch.default_alert_size
+        else:
+            limit = cfg.watch.caches[name][1] if name in cfg.watch.caches else None
+        delta = history_delta(history, key, size, snap.ts)
+        flag = " ‼" if limit and size > limit else ""
+        d = "" if delta is None else (("+" if delta >= 0 else "-") + human(abs(delta)))
+        print(f"{key:<44} {human(size):>10} {d:>10} {human(limit) if limit else '':>10}{flag}", file=out)
+
+
+def cmd_watch(cfg: Config, agent: bool, record: bool, notify_on: bool, out: TextIO = sys.stdout) -> int:
+    now = time.time()
+    if not out.isatty():
+        print(f"═══ dev-space watch {time.strftime('%Y-%m-%d %H:%M:%S')} ═══", file=out)
+    history = read_history(cfg)
+    snap = measure_all(cfg)
+    print_scan(snap, history, cfg, out)
+    if record:
+        _append_jsonl(cfg.settings.state_dir / "history.jsonl", {"ts": snap.ts, "free": snap.free, "items": snap.items})
+    alerts = evaluate(snap, history, cfg, now, last_backup_times(cfg))
+    for a in alerts:
+        print(f"  {DANGER if a.level == 'critical' else '·'} [{a.level}] {a.message}", file=out)
+    if not alerts:
+        print("no alerts", file=out)
+    state_path = cfg.settings.state_dir / "alerts.json"
+    state = json.loads(state_path.read_text()) if state_path.exists() else {}
+    fresh = dedupe(alerts, state, now, cfg.watch.realert_days)
+    if record:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps(state, indent=1))
+    if fresh and notify_on:
+        worst = max(fresh, key=lambda a: LEVELS[a.level])
+        more = f" (+{len(fresh) - 1} more)" if len(fresh) > 1 else ""
+        notify(f"dev-space: {len(fresh)} disk alert(s)", worst.message + more)
+    if agent:
+        dispatch_proposals(alerts, cfg, now, shutil.which("codex"), out)
+    return 0
+
+
+def cmd_proposals(cfg: Config, out: TextIO = sys.stdout) -> int:
+    folder = cfg.settings.state_dir / "proposals"
+    files = sorted(folder.glob("*.md"), reverse=True) if folder.is_dir() else []
+    if not files:
+        print("no proposals", file=out)
+    for f in files:
+        print(f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(f.stat().st_mtime))}  {f}", file=out)
+    return 0
+
+
+# ── Main ────────────────────────────────────────────────────
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0], formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help=f"rules file (default: {DEFAULT_CONFIG})")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("clean", help="run the cleanup rules")
+    c.add_argument("-n", "--dry-run", action="store_true", help="report only; exit 1 when something is due")
+    c.add_argument("-v", "--verbose", action="store_true", help="list every path, skip reason and not-due count")
+    tier = c.add_mutually_exclusive_group()
+    tier.add_argument("--tier", choices=list(TIER_WHENS), default="daily", help="daily (default), pressure (adds pressure rules, shorter ages), manual (everything)")
+    tier.add_argument("--scheduled", action="store_true", help="daily, or pressure when free space is below settings.pressure_free")
+    c.add_argument("-p", "--project", action="append", help="only this project (repeatable)")
+    c.add_argument("-r", "--rule", action="append", help="only this rule id (repeatable)")
+
+    r = sub.add_parser("restore", help="copy an archived path back from the archive volume")
+    r.add_argument("path", type=Path)
+    r.add_argument("-n", "--dry-run", action="store_true")
+
+    ru = sub.add_parser("rules", help="print the rules that apply to a project (default: all)")
+    ru.add_argument("project", nargs="?")
+
+    s = sub.add_parser("scan", help="measure projects and caches")
+    s.add_argument("--json", action="store_true")
+
+    w = sub.add_parser("watch", help="scan, record, alert; --agent asks codex for rule proposals")
+    w.add_argument("--agent", action="store_true")
+    w.add_argument("--no-record", action="store_true", help="don't write history or alert state")
+    w.add_argument("--no-notify", action="store_true")
+
+    sub.add_parser("proposals", help="list rule proposals written by codex")
+    args = parser.parse_args()
+
+    try:
+        cfg = load_config(args.config)
+    except ConfigError as e:
+        print(f"config error: {e}", file=sys.stderr)
+        return 2
+
+    if args.cmd == "clean":
+        if not sys.stdout.isatty():
+            print(f"═══ dev-space clean {time.strftime('%Y-%m-%d %H:%M:%S')} ═══")
+        tier_name = scheduled_tier(volume_free(cfg.settings.code_root), cfg.settings.pressure_free) if args.scheduled else args.tier
+        result = Runner(cfg, tier=tier_name, dry_run=args.dry_run, verbose=args.verbose).clean(args.project, args.rule)
+        if result.errors:
+            return 2
+        return 1 if args.dry_run and result.done else 0
+    if args.cmd == "restore":
+        return restore(cfg, args.path, args.dry_run)
+    if args.cmd == "rules":
+        return print_rules(cfg, args.project)
+    if args.cmd == "scan":
+        snap = measure_all(cfg)
+        if args.json:
+            print(json.dumps({"ts": snap.ts, "free": snap.free, "items": snap.items}, indent=1))
+        else:
+            print_scan(snap, read_history(cfg), cfg)
+        return 0
+    if args.cmd == "watch":
+        return cmd_watch(cfg, args.agent, not args.no_record, not args.no_notify)
+    if args.cmd == "proposals":
+        return cmd_proposals(cfg)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
