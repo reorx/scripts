@@ -1997,6 +1997,22 @@ def plan_codex_releases(home: Path, ps_output: str) -> list[Path]:
     ]
 
 
+def delete_codex_threads(codex: str, threads: list[CodexThread]) -> tuple[int, list[str]]:
+    """`codex delete --force` each thread within the time budget. Returns (deleted, refusals).
+    Deleting a parent removes its spawned children too, so a child's own delete then fails:
+    a refusal whose rollout is already gone counts as deleted."""
+    deleted, refused, started = 0, [], time.monotonic()
+    for t in threads:
+        if time.monotonic() - started > CODEX_DELETE_BUDGET:
+            break
+        result = run([codex, "delete", "--force", t.id], timeout=60)
+        if result.returncode == 0 or (t.file is not None and not t.file.exists()):
+            deleted += 1
+        else:
+            refused.append(f"{t.id}: {((result.stderr or result.stdout).strip().splitlines() or ['?'])[-1][:120]}")
+    return deleted, refused
+
+
 def cleanup_codex(compress_days: int, delete_days: int, dry_run: bool) -> int:
     """Compress and delete expired codex sessions, drop unused releases. Returns bytes freed (or that would be)."""
     print("── codex sessions ─────────────────────────────────")
@@ -2054,15 +2070,7 @@ def cleanup_codex(compress_days: int, delete_days: int, dry_run: bool) -> int:
         if sizes is not None:
             compressed += 1
             comp_freed += sizes[0] - sizes[1]
-    deleted, refused, started = 0, [], time.monotonic()
-    for t in deletable[:CODEX_DELETE_MAX]:
-        if time.monotonic() - started > CODEX_DELETE_BUDGET:
-            break
-        result = run([codex, "delete", "--force", t.id], timeout=60)
-        if result.returncode == 0:
-            deleted += 1
-        else:
-            refused.append(f"{t.id}: {((result.stderr or result.stdout).strip().splitlines() or ['?'])[-1][:120]}")
+    deleted, refused = delete_codex_threads(codex, deletable[:CODEX_DELETE_MAX])
     for line in refused:
         print(f"  codex refused {line}")
     if releases:
@@ -2785,6 +2793,17 @@ def selftest_codex() -> None:
         sqlite3.connect(bad / "state_5.sqlite").execute("create table threads(id text)").connection.close()
         check("SAFETY: an unknown state schema → skip the section", load_codex_threads(bad), None)
         check("SAFETY: a renamed state db (new codex) → skip the section", load_codex_threads(home / "packages"), None)
+
+        # `codex delete` of a parent takes its spawned children along; their own delete then fails
+        fake = _write(home / "bin/codex", '#!/bin/sh\ncase "$3" in ok) rm -f "$FAKE_DIR/ok" ;; *) echo "Error: failed to delete session" >&2; exit 1 ;; esac\n')
+        fake.chmod(0o755)
+        files = {tid: _write(home / "del" / tid, "x") for tid in ("ok", "kept")}
+        batch = [CodexThread(tid, files.get(tid, home / "del" / tid), now, False, file=home / "del" / tid) for tid in ("ok", "cascaded", "kept")]
+        batch.append(CodexThread("dangling", home / "del/dangling", now, False))
+        os.environ["FAKE_DIR"] = str(home / "del")
+        deleted, refused = delete_codex_threads(str(fake), batch)
+        check("a refusal whose rollout is already gone counts as deleted (removed with its parent)", deleted, 2)
+        check("real refusals are reported, dangling rows included", [r.split(":")[0] for r in refused], ["kept", "dangling"])
 
 
 def selftest_dev_space() -> None:

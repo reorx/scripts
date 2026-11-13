@@ -109,12 +109,39 @@ tags:
 
 ### 实施步骤
 
-- [ ] ① [项目规则引擎](2026-11-13-dev-space-rules-spec.md)
-- [ ] ② [全局缓存清理段](2026-11-13-global-cache-sections-spec.md)（与 ① 并行）
-- [ ] ③ [监控与告警](2026-11-13-dev-space-watch-spec.md)
-- [ ] 联调：`mac-dev-cleanup --dry-run` 全流程；向用户展示 dry-run 结果，批准后首次真实运行，用 `df` 核对
-- [ ] 一次性清单：整理各报告里的一次性动作，用户逐项批准后执行
-- [ ] 文档：`SKILL.md`、`AGENTS.md`、`kb/known-issues.md`、`kb/next-up.md`（首周观察日志），然后提交
+- [x] ① [项目规则引擎](2026-11-13-dev-space-rules-spec.md)
+- [x] ② [全局缓存清理段](2026-11-13-global-cache-sections-spec.md)（与 ① 并行）
+- [ ] ③ [监控与告警](2026-11-13-dev-space-watch-spec.md)：代码完成；实机的 3.5 GiB 测试目录走一遍 watch 加 `--agent` 还没做
+- [x] 联调：`mac-dev-cleanup --dry-run` 全流程；向用户展示 dry-run 结果，批准后首次真实运行，用 `df` 核对
+- [x] 一次性清单：整理各报告里的一次性动作，用户逐项批准后执行
+- [x] 文档：`SKILL.md`、`AGENTS.md`、`kb/known-issues.md`、`kb/next-up.md`（首周观察日志），然后提交
+
+### 首次真实运行（2026-11-13 10:30–10:47）
+
+剩余空间 7.0 GiB → 53.5 GiB，加上一次性清单后 56.4 GiB。日志在 `tmp/2026-11-13-dev-cleanup/`（`first-run.log`、`rerun-cargo-uv.log`、`onetime-apply.log`）。
+
+| 段 | 结果 |
+|---|---|
+| 项目规则 `dev-space clean --scheduled` | 1648 项，du 36.8 GiB，real 27.4 GiB；其中 vibench-live 的部署快照、迁移备份和各项目 14 天前的 tmp 证据归档到 LaCie |
+| go | 删 632 个模块版本，+5.3 GiB |
+| pnpm | dlx、未引用的 store 包、旧元数据，+8.7 GiB |
+| npm | `_cacache` 和 48 个 `_npx` 包，+3.3 GiB |
+| codex | 压缩 427 个会话（省 815 MiB），删 200 个（上限），删 1 个旧 release，+1.3 GiB；剩 77 个过期会话留给下一次 |
+| uv | 14.2 → 9.1 GiB（du），real 约 1 GiB |
+| cargo | 1362 个编译单元都在 7 天内用过，0 清理 |
+| 一次性清单 | 4.3 GiB（`tmp/2026-11-13-dev-cleanup/onetime-targets.txt`） |
+
+首次运行暴露并修掉的问题：
+
+- tinyhost 的 `tmp-db-copies` 匹配到测试 HOME 里 Go 模块缓存 testdata 的 `*.db`，目录只读，挪不动，整条规则失败、退出码 2。现在匹配不进入只读目录（规则 spec 的「方案」一节）。
+- codex 段报 10 个 `codex delete` 被拒，实际是父会话删除时一并带走的子会话。现在 rollout 已经不在的拒绝计为已删。
+
+清理后的检查：vibench 离线 `pnpm install --frozen-lockfile` 通过；tinyhost 离线 `go list -deps -test` 通过；ansible、condenser 在已有 `.venv` 上离线 `uv sync` 都无需下载；通过 `codex app-server` 的 `thread/read` 读一个 `.jsonl.zst` 会话，读出 77 条记录，文件没动。
+
+两个和这次清理无关、但检查时看到的现象：
+
+- uv 缓存里约 1300 个 wheel 指针（`.http`）指向的 archive 早已不存在，大多是 8 月以前的。这次清理最多删了 232 个 archive，而且活跃项目锁定的 wheel 会保留，所以它们不是这次删的。uv 遇到这种指针会重新下载，只是新建 venv 时要联网。
+- tinyhost 的 `go.mod` 要求 go1.27.0，本机此前从没下载过这个工具链（缓存里没有更早的 `.lock` 残留），检查时第一次下载。
 
 ### 各期都要更新的文档
 

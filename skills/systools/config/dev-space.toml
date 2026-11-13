@@ -75,13 +75,9 @@ age_days = 14
 [projects.vibench]
 root = "~/Code/vibench"
 related = [
+  # worktrees named ~/Code/vibench-<branch> belong here too; add them while they exist
   "~/Code/vibench-live",
-  "~/Code/vibench-kifix2",
-  "~/Code/vibench-old",
   "~/Code/vibench-backups",
-  "~/Code/vibench-mdev-sandbox",
-  "~/Code/vibench-p6-scratch",
-  "~/Documents/vibench-backups",
   "~/Library/Application Support/vibench",
 ]
 alert_size = "30GiB"

@@ -156,6 +156,18 @@ class TestGlob(Sandbox):
         self.assertEqual(got, ['web/.next/cache'])
         self.assertEqual([p.name for p in ds.match_units(base, ['node_modules'])], ['node_modules'])
 
+    def test_read_only_dirs_are_matched_but_never_searched(self):
+        # a Go module cache in a test HOME: read-only trees whose testdata holds *.db files
+        base = self.home / 'p'
+        mod = base / 'tmp/cleanhome/go/pkg/mod/modernc.org/sqlite@v1.61.1'
+        write(mod / 'testdata/fuzz.db')
+        write(base / 'tmp/run/data/app.db')
+        for d in (mod / 'testdata', mod):
+            d.chmod(0o555)
+        got = sorted(str(p.relative_to(base)) for p in ds.match_units(base, ['tmp/*/**/*.db']))
+        self.assertEqual(got, ['tmp/run/data/app.db'])
+        self.assertEqual([p.name for p in ds.match_units(base, ['tmp/*/go/pkg/mod/*/*'])], ['sqlite@v1.61.1'])
+
     def test_absolute_pattern_splits_literal_base(self):
         write(self.home / 'live/backups/20261101T000000Z-abc/vibench.sqlite')
         write(self.home / 'live/backups/identity-x/key')

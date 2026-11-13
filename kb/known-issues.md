@@ -42,6 +42,12 @@
 - 记录：2026-09-29
 - 只清 `~/.cargo/config.toml` 里 `build.target-dir` 指向的那个目录。项目用 `.cargo/config.toml` 改回本地 `target/` 的不在范围内。要覆盖它们，可以用 cargo-sweep 的 `-r` 扫 `~/Code`，但那会逐个跑 `cargo metadata`，更慢，也更容易误伤。
 
+## dev-space：LaCie 未加密，上面有生产库备份和生产 SQL dump
+
+- 记录：2026-11-13（首次真实运行后；`kb/plans/2026-11-13-dev-disk-cleanup.md`）
+- `/Volumes/LaCie` 是 exFAT，没有加密。`dev-space` 每天把 vibench-live 主库备份写到 `DevArchive/vibench/sqlite-backups/`，还把 vibench-live 的部署快照和迁移备份、各项目的 tmp 证据归档上去，其中有 `campus_watch/backend/db-dumps/*.prod.sql`。盘丢了或被别人接上，这些数据就能直接读出来。
+- 处理方向：在 LaCie 上建一个加密的 APFS sparsebundle 或加密卷，把 `archive_root` 指过去（`archive_available` 已经要求挂载点存在，卷没解锁时会跳过归档和备份，并由 watch 报备份过期）；已归档的内容迁移过去。需要用户决定，涉及解锁方式（钥匙串自动解锁还是手动）。
+
 ## com.reorx.mac-dev-cleanup.plist 注释里有 `--`，严格 XML 解析器读不了
 
 - 记录：2026-09-29（早就存在，这次才发现）

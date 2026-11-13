@@ -372,7 +372,9 @@ def _segments(pattern: str) -> tuple:
 
 def match_units(base: Path, patterns: list[str]) -> list[Path]:
     """Paths under base matching any pattern. A match is not descended into (outermost wins);
-    .git, symlinked dirs and NO_DESCEND trees are never entered."""
+    .git, symlinked dirs, NO_DESCEND trees and read-only dirs are never entered. Read-only
+    trees belong to a package manager (a Go module cache keeps testdata/*.db), and nothing
+    inside one can be moved out anyway."""
     pats = [_segments(p) for p in patterns]
     found: list[Path] = []
 
@@ -391,6 +393,7 @@ def match_units(base: Path, patterns: list[str]) -> list[Path]:
                 entry.name not in NO_DESCEND
                 and entry.is_dir(follow_symlinks=False)
                 and any(_prefix(p, 0, child, 0) for p in pats)
+                and os.access(entry.path, os.W_OK)
             ):
                 walk(Path(entry.path), child)
 
