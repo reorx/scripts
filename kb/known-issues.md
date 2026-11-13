@@ -42,6 +42,13 @@
 - 记录：2026-09-29
 - 只清 `~/.cargo/config.toml` 里 `build.target-dir` 指向的那个目录。项目用 `.cargo/config.toml` 改回本地 `target/` 的不在范围内。要覆盖它们，可以用 cargo-sweep 的 `-r` 扫 `~/Code`，但那会逐个跑 `cargo metadata`，更慢，也更容易误伤。
 
+## mac-dev-cleanup：sim 段删除旧运行时只验证过 dry-run
+
+- 记录：2026-11-13（`kb/plans/2026-11-13-ios-simulator-cleanup-spec.md`）
+- 本机只有一个运行时（iOS 26.5），`simctl runtime delete <id>` 从没真删过。在 launchd 的 gui 域、无 sudo 下只验证了 `runtime list` 和 `runtime delete --dry-run`；删除分支只在假 `xcrun` 上演练过。删除失败时这一步打 `⚠️` 并给出手动命令，不算段失败，所以没人看日志的话旧运行时（每个约 8 GB）会一直留着。
+- 另一个会静默失效的情况：新运行时的默认设备里没有 iPhone 17 时，旧运行时被指定设备占着，也只在日志里提示。`xcodebuild` 或 `simctl` 进程任何年龄都算忙，挂死的一个会让磁盘部分天天跳过。
+- 处理方向：装上下一个 iOS 运行时、在上面建好 iPhone 17、旧设备闲置满 7 天后，看 06:00 日志的 `old runtimes` 一行和 `simctl runtime list`，确认旧的删掉了；删不掉就查报错，必要时改成提醒用户手动删。
+
 ## dev-space：LaCie 未加密，上面有生产库备份和生产 SQL dump
 
 - 记录：2026-11-13（首次真实运行后；`kb/plans/2026-11-13-dev-disk-cleanup.md`）

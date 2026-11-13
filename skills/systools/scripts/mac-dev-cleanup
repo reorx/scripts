@@ -2,12 +2,13 @@
 # /// script
 # requires-python = ">=3.11"
 # ///
-"""Release macOS dev resources: booted iOS simulators, agent-browser Chrome trees, stale
-Rust build artifacts in the shared cargo target dir, unused entries in the uv, go, pnpm
-and npm caches, expired codex sessions, and code-sign clones left behind by browsers that
-did not quit normally. The per-project rules and the disk monitor live in dev-space, next
-to this script; the `projects` and `watch` sections run it, so the 06:00 job stays the
-single entry point.
+"""Release macOS dev resources: booted iOS simulators and what simulators leave on disk
+(idle devices, old system logs, old runtimes and Device Support), agent-browser Chrome
+trees, stale Rust build artifacts in the shared cargo target dir, unused entries in the
+uv, go, pnpm and npm caches, expired codex sessions, and code-sign clones left behind by
+browsers that did not quit normally. The per-project rules and the disk monitor live in
+dev-space, next to this script; the `projects` and `watch` sections run it, so the 06:00
+job stays the single entry point.
 
 None of them cleans up after itself. A booted simulator keeps a full launchd_sim tree of
 iOS daemons and widget extensions alive (hundreds of processes, GBs of RAM); a leaked
@@ -52,6 +53,7 @@ import time
 import tomllib
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 # Chrome's --user-data-dir is what ties a process to an agent-browser session, and is
@@ -62,6 +64,10 @@ AGENT_BROWSER_DAEMON_RE = re.compile(r"node_modules/agent-browser/bin/agent-brow
 CHROME_ROOT_RE = re.compile(r"/Google Chrome\.app/Contents/MacOS/Google Chrome\b")
 SIM_RUNTIME_RE = re.compile(r"simruntime/Contents/Resources/RuntimeRoot")
 SIMULATOR_APP_RE = re.compile(r"Simulator\.app/Contents/MacOS/Simulator\b")
+# The one simulator every agent tests on (named in ~/.claude/CLAUDE.md): the device of this
+# name on the newest iOS runtime. The sim section never deletes it; other simulators go once
+# they have been shut down and unused for --sim-days.
+SIM_KEEP_NAME = "iPhone 17"
 
 # `ps` truncates the command column to terminal width unless -ww is given, which
 # silently hides processes whose --user-data-dir sits past the cutoff.
@@ -370,21 +376,294 @@ def cleanup_agent_browser(min_age_hours: float, dry_run: bool) -> int:
 
 
 # ── simulator cleanup ───────────────────────────────────────
-def cleanup_simulators(dry_run: bool) -> int:
-    """Shut down booted simulators and quit Simulator.app. Returns processes reaped."""
+# Shutting down frees memory. The rest frees disk and keeps this Mac at one simulator,
+# SIM_KEEP_NAME on the newest runtime:
+# - idle simulators: every other device shut down and unused for --sim-days is deleted, so the
+#   one an agent made for a test and the default set Xcode creates with each new runtime go
+#   away. Last use is the later of device.plist's lastUsedAt and the file's mtime. Measured
+#   2026-11-13: boot writes lastUsedAt, and so does xcodebuild picking the device as its
+#   -destination (even for -showBuildSettings); shutdown rewrites the file. The data dir's
+#   mtime can't tell: on 2026-11-06 something touched every device's at once.
+# - system logs: unified logging inside a simulator keeps months of .tracev3 files under
+#   data/var/db/diagnostics (Persist, Special, Signpost). Old ones go, as logd's own rotation
+#   would delete them. uuidtext stays: it holds the format strings logs reference by binary
+#   UUID, and new logs still point into files written months ago. Shut-down devices only, so
+#   no logd is writing.
+# - runtimes: per platform only the newest Ready disk image stays; an older one goes once no
+#   device uses it (the idle rule takes its devices first), through `simctl runtime delete`.
+# - Device Support: Xcode copies a phone's symbols for every OS version it meets (~6 GB each)
+#   and never removes them; per model only the newest version stays.
+# None of it runs while xcodebuild or simctl does: an agent may be testing.
+SIM_BUSY_RE = re.compile(r"^(?:\S*/)?(?:xcodebuild|simctl)(?:\s|$)|^(?:\S*/)?xcrun\s+(?:simctl|xcodebuild)\b")
+SIM_RUNTIME_ID_RE = re.compile(r"\.([A-Za-z]+)-(\d+(?:-\d+)*)$")
+APPLE_BUILD_RE = re.compile(r"(\d+)([A-Z])(\d+)([a-z]?)")
+# "iPhone17,3 26.5.2 (23F84)"; Xcode before 14.3 wrote "16.4 (20E247)" or "16.4 (20E247) arm64e".
+DEVICE_SUPPORT_RE = re.compile(r"(?:(?P<model>[A-Za-z]+\d+,\d+) )?(?P<version>\d+(?:\.\d+)*) \((?P<build>\w+)\)(?: \S+)?")
+XCODE_DIR = Path.home() / "Library/Developer/Xcode"
+
+
+@dataclass
+class SimDevice:
+    udid: str
+    name: str
+    runtime: str  # com.apple.CoreSimulator.SimRuntime.iOS-26-5
+    state: str
+    available: bool
+    data_path: Path
+    last_used: float  # epoch seconds, inf when nothing tells
+
+
+@dataclass
+class SimRuntime:
+    image_id: str
+    platform: str  # com.apple.platform.iphonesimulator
+    runtime: str  # com.apple.CoreSimulator.SimRuntime.iOS-26-5
+    version: str
+    build: str
+    ready: bool  # deletable, and its state is Ready
+    size: int
+
+
+def runtime_key(runtime: str) -> tuple[str, tuple[int, ...]]:
+    """("iOS", (26, 5)) from com.apple.CoreSimulator.SimRuntime.iOS-26-5."""
+    match = SIM_RUNTIME_ID_RE.search(runtime)
+    if not match:
+        return runtime, ()
+    return match[1], tuple(int(n) for n in match[2].split("-"))
+
+
+def build_key(build: str) -> tuple:
+    """Orders Apple build numbers within a version: 23F79 > 23F77 > 23F5054e (a beta)."""
+    match = APPLE_BUILD_RE.fullmatch(build)
+    if not match:
+        return 0, "", 0, 0
+    return int(match[1]), match[2], 0 if match[4] else 1, int(match[3])
+
+
+def parse_sim_devices(simctl_json: str) -> list[SimDevice]:
+    """Every device of `simctl list devices -j`, with its last use."""
+    devices = []
+    for runtime, entries in json.loads(simctl_json).get("devices", {}).items():
+        for entry in entries:
+            data_path = Path(entry["dataPath"])
+            stamps = []
+            if entry.get("lastUsedAt"):
+                stamps.append(datetime.fromisoformat(entry["lastUsedAt"]).timestamp())
+            plist = data_path.parent / "device.plist"
+            if plist.exists():
+                stamps.append(plist.stat().st_mtime)
+            devices.append(SimDevice(entry["udid"], entry["name"], runtime, entry.get("state", "?"),
+                                     bool(entry.get("isAvailable")), data_path, max(stamps, default=float("inf"))))
+    return devices
+
+
+def kept_sim_devices(devices: list[SimDevice], name: str) -> set[str]:
+    """UDIDs of the designated device: `name` on the newest runtime where it is available.
+
+    A device of that name on a newer runtime that shows unavailable (not mounted yet) is kept
+    too, and when none of that name is available, all of them are.
+    """
+    named = [d for d in devices if d.name == name]
+    available = [runtime_key(d.runtime)[1] for d in named if d.available]
+    if not available:
+        return {d.udid for d in named}
+    newest = max(available)
+    return {d.udid for d in named if runtime_key(d.runtime)[1] >= newest}
+
+
+def plan_sim_devices(devices: list[SimDevice], keep: set[str], idle_days: int, now: float) -> list[SimDevice]:
+    """Shut-down devices outside keep, unused for idle_days.
+
+    Nothing when keep is empty: no designated device means the name is wrong, not that every
+    simulator may go.
+    """
+    if not keep:
+        return []
+    cutoff = now - idle_days * 86400
+    return [d for d in devices if d.udid not in keep and d.state == "Shutdown" and d.last_used < cutoff]
+
+
+def plan_sim_logs(devices: list[SimDevice], skip: set[str], keep_days: int, now: float) -> list[Path]:
+    """Unified log files (.tracev3) older than keep_days in the shut-down devices outside skip."""
+    cutoff = now - keep_days * 86400
+    old = []
+    for device in devices:
+        if device.state != "Shutdown" or device.udid in skip:
+            continue
+        for dirpath, _dirs, files in os.walk(device.data_path / "var/db/diagnostics"):
+            for name in files:
+                path = os.path.join(dirpath, name)
+                if name.endswith(".tracev3") and os.lstat(path).st_mtime < cutoff:
+                    old.append(Path(path))
+    return sorted(old)
+
+
+def parse_sim_runtimes(runtime_json: str) -> list[SimRuntime]:
+    """The disk images of `simctl runtime list -j`."""
+    return [
+        SimRuntime(r["identifier"], r.get("platformIdentifier", "?"), r.get("runtimeIdentifier", "?"),
+                   r.get("version", ""), r.get("build", ""), bool(r.get("deletable")) and r.get("state") == "Ready",
+                   int(r.get("sizeBytes", 0)))
+        for r in json.loads(runtime_json).values()
+    ]
+
+
+def plan_sim_runtimes(
+    runtimes: list[SimRuntime], devices: list[SimDevice]
+) -> tuple[list[SimRuntime], list[tuple[SimRuntime, list[str]]]]:
+    """(runtimes to delete, older runtimes kept with the names of the devices on them).
+
+    Per platform the newest Ready image stays. Images that aren't Ready (being added, unusable)
+    are neither deleted nor allowed to push an older one out.
+    """
+    platforms: dict[str, list[SimRuntime]] = {}
+    for r in runtimes:
+        if r.ready:
+            platforms.setdefault(r.platform, []).append(r)
+    drop, held = [], []
+    for group in platforms.values():
+        newest = max(group, key=lambda r: (version_tuple(r.version), build_key(r.build)))
+        for r in group:
+            if r is newest:
+                continue
+            # An older build of the newest runtime: its devices run on the newer build.
+            users = [] if r.runtime == newest.runtime else sorted(d.name for d in devices if d.runtime == r.runtime)
+            if users:
+                held.append((r, users))
+            else:
+                drop.append(r)
+    return drop, held
+
+
+def plan_device_support(xcode: Path) -> list[Path]:
+    """Device Support folders older than the newest one of their model, in every *DeviceSupport dir."""
+    drop = []
+    for support in sorted(xcode.glob("* DeviceSupport")):
+        models: dict[str, list[tuple[tuple, Path]]] = {}
+        for entry in support.iterdir():
+            match = DEVICE_SUPPORT_RE.fullmatch(entry.name)
+            if not match or entry.is_symlink() or not entry.is_dir():
+                continue
+            rank = (version_tuple(match["version"]), build_key(match["build"]), entry.stat().st_mtime)
+            models.setdefault(match["model"] or "", []).append((rank, entry))
+        for entries in models.values():
+            entries.sort()
+            drop += [entry for _rank, entry in entries[:-1]]
+    return sorted(drop)
+
+
+def remove_trees(paths: list[Path]) -> None:
+    """Move each path into a trash dir beside it, then delete the trash."""
+    for parent in sorted({p.parent for p in paths}):
+        trash = make_trash(parent)
+        for path in paths:
+            if path.parent == parent:
+                path.rename(trash / path.name)
+        rmtree_force(trash)
+
+
+def sim_label(device: SimDevice, now: float) -> str:
+    platform, version = runtime_key(device.runtime)
+    used = "unknown" if device.last_used == float("inf") else f"{human_age(int(now - device.last_used))} ago"
+    return f"{device.name} ({device.udid[:8]}, {platform} {'.'.join(map(str, version))}), last used {used}"
+
+
+def runtime_label(runtime: SimRuntime) -> str:
+    return f"{runtime_key(runtime.runtime)[0]} {runtime.version} ({runtime.build}, {runtime.image_id[:8]})"
+
+
+def cleanup_simulators(keep_name: str, days: int, dry_run: bool) -> int:
+    """Shut down simulators and quit Simulator.app, then prune what they leave on disk.
+
+    Returns processes reaped plus bytes cleaned (or that would be).
+    """
     print("── iOS simulators ─────────────────────────────────")
     listing = run(["xcrun", "simctl", "list", "devices", "-j"], timeout=60)
     if listing.returncode != 0:
         print(f"{DANGER_MARKER} simctl unavailable: {listing.stderr.strip()[:200]}")
         return 0
+    reaped = shutdown_simulators(parse_booted_devices(listing.stdout), dry_run)
+    return reaped + prune_simulators(keep_name, days, dry_run)
 
-    devices = parse_booted_devices(listing.stdout)
+
+def prune_simulators(keep_name: str, days: int, dry_run: bool) -> int:
+    """Delete idle simulators, old system logs, old runtimes and old Device Support. Returns du bytes."""
+    busy = [pid for pid, _ppid, _age, _cpu, cmd in parse_ps(ps_snapshot()) if SIM_BUSY_RE.search(cmd)]
+    if busy:
+        print(f"xcodebuild/simctl running (pid {', '.join(map(str, busy))}), may be testing: disk cleanup skipped this run")
+        return 0
+    devices = parse_sim_devices(run(["xcrun", "simctl", "list", "devices", "-j"], timeout=60).stdout)
+    runtimes = parse_sim_runtimes(run(["xcrun", "simctl", "runtime", "list", "-j"], timeout=60).stdout)
+    now = time.time()
+    keep = kept_sim_devices(devices, keep_name)
+    for device in devices:
+        if device.udid in keep:
+            print(f"  keeping {sim_label(device, now)}")
+    if not keep:
+        print(f"  {DANGER_MARKER} no simulator named {keep_name!r} (SIM_KEEP_NAME), so none is deleted")
+
+    idle = plan_sim_devices(devices, keep, days, now)
+    idle_ids = {d.udid for d in idle}
+    logs = plan_sim_logs(devices, idle_ids, days, now)
+    old_runtimes, held = plan_sim_runtimes(runtimes, [d for d in devices if d.udid not in idle_ids])
+    support = plan_device_support(XCODE_DIR)
+
+    idle_du, idle_real = report_sizes(f"idle simulators > {days}d", len(idle), [d.data_path.parent for d in idle])
+    for device in idle:
+        print(f"    {sim_label(device, now)}")
+    logs_du, logs_real = report_sizes(f"system logs > {days}d", len(logs), logs)
+    runtime_bytes = sum(r.size for r in old_runtimes)
+    print(f"  {'old runtimes':<34} {len(old_runtimes):>6}  size {human_bytes(runtime_bytes):>9}")
+    for r in old_runtimes:
+        print(f"    {runtime_label(r)}")
+    for r, users in held:
+        print(f"    kept {runtime_label(r)}, in use by {', '.join(users)}")
+        if any(d.udid in keep and d.runtime == r.runtime for d in devices):
+            # Xcode makes a default device set for each new runtime, which may lack this model.
+            print(f"  {DANGER_MARKER} the newest {runtime_key(r.runtime)[0]} runtime has no {keep_name!r}, so this one stays: "
+                  f"`xcrun simctl create '{keep_name}' '{keep_name}'` makes one there (installed apps don't move over)")
+    support_du, support_real = report_sizes("old Device Support", len(support), support)
+    for path in support:
+        print(f"    {path.parent.name}/{path.name}")
+
+    if not (idle or logs or old_runtimes or support):
+        print("nothing to clean on disk")
+        return 0
+    total = idle_du + logs_du + runtime_bytes + support_du
+    real = idle_real + logs_real + runtime_bytes + support_real
+    if dry_run:
+        print(f"[dry-run] would delete {len(idle)} simulator(s), {len(logs)} log file(s), {len(old_runtimes)} runtime(s), "
+              f"{len(support)} Device Support folder(s), real {human_bytes(real)}")
+        return total
+
+    free_before = volume_free(Path.home())
+    if idle:
+        result = run(["xcrun", "simctl", "delete", *sorted(idle_ids)], timeout=300)
+        if result.returncode != 0:
+            print(f"  {DANGER_MARKER} simctl delete: {result.stderr.strip()[:200]}")
+    for path in logs:
+        path.unlink(missing_ok=True)
+    if old_runtimes:
+        # Plan again on what simctl lists now: a device that failed to delete still holds its runtime.
+        devices = parse_sim_devices(run(["xcrun", "simctl", "list", "devices", "-j"], timeout=60).stdout)
+        for r in plan_sim_runtimes(runtimes, devices)[0]:
+            result = run(["xcrun", "simctl", "runtime", "delete", r.image_id], timeout=600)
+            if result.returncode != 0:
+                print(f"  {DANGER_MARKER} could not delete {runtime_label(r)}: {(result.stderr or result.stdout).strip()[:200]}"
+                      f" — run `xcrun simctl runtime delete {r.image_id}` by hand")
+    remove_trees(support)
+    print(f"✅ done, volume free +{human_bytes(max(volume_free(Path.home()) - free_before, 0))}")
+    return total
+
+
+def shutdown_simulators(devices: list[dict[str, str]], dry_run: bool) -> int:
+    """Shut down booted simulators and quit Simulator.app. Returns processes reaped."""
     before = ps_snapshot()
     runtime_procs = count_procs(SIM_RUNTIME_RE, before)
     app_pids = {pid for pid, _, _, _, cmd in parse_ps(before) if SIMULATOR_APP_RE.search(cmd)}
 
     if not devices and not runtime_procs and not app_pids:
-        print("nothing to clean")
+        print("no simulator running")
         return 0
 
     for device in devices:
@@ -2829,6 +3108,163 @@ def selftest_dev_space() -> None:
     check("the new sections free disk, not memory", {"projects", "go", "pnpm", "npm", "codex", "watch"} <= DISK_TARGETS, True)
 
 
+def _sim_device(root: Path, name: str, runtime: str, state: str = "Shutdown", used_days: float | None = None,
+                plist_days: float = 100, available: bool = True, now: float = 0.0) -> dict:
+    """One `simctl list devices -j` entry, with its device dir (device.plist aged plist_days) under root."""
+    udid = f"{len(list(root.iterdir())):08X}-0000-0000-0000-000000000000"
+    _write(root / udid / "device.plist", "<plist/>", days=plist_days, now=now)
+    (root / udid / "data").mkdir()
+    entry = {"udid": udid, "name": name, "state": state, "isAvailable": available,
+             "dataPath": str(root / udid / "data"), "deviceTypeIdentifier": "x", "_runtime": runtime}
+    if used_days is not None:
+        entry["lastUsedAt"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - used_days * 86400))
+    return entry
+
+
+def _simctl_json(entries: list[dict]) -> str:
+    devices: dict[str, list] = {}
+    for e in entries:
+        runtime = f"com.apple.CoreSimulator.SimRuntime.{e['_runtime']}"
+        devices.setdefault(runtime, []).append({k: v for k, v in e.items() if k != "_runtime"})
+    return json.dumps({"devices": devices})
+
+
+def _runtime_json(*images: tuple[str, ...]) -> str:
+    """`simctl runtime list -j` for (image id, platform, version, build[, state]) tuples."""
+    out = {}
+    for image_id, platform, version, build, *state in images:
+        name = {"iphonesimulator": "iOS", "watchsimulator": "watchOS"}[platform]
+        out[image_id] = {
+            "identifier": image_id, "platformIdentifier": f"com.apple.platform.{platform}", "version": version,
+            "build": build, "runtimeIdentifier": f"com.apple.CoreSimulator.SimRuntime.{name}-{version.replace('.', '-')}",
+            "deletable": True, "state": state[0] if state else "Ready", "sizeBytes": 8_000_000_000,
+        }
+    return json.dumps(out)
+
+
+def selftest_sim() -> None:
+    print("\nsim: idle simulators, system logs, old runtimes, Device Support")
+    check("runtime ids compare by number: iOS 26.10 is newer than 26.9",
+          runtime_key("com.apple.CoreSimulator.SimRuntime.iOS-26-10") > runtime_key("com.apple.CoreSimulator.SimRuntime.iOS-26-9"),
+          True)
+    check("runtime id → platform and version", runtime_key("com.apple.CoreSimulator.SimRuntime.watchOS-11-0"), ("watchOS", (11, 0)))
+    check("a release build outranks a beta of the same train", build_key("23F77") > build_key("23F5054e"), True)
+    for cmd, busy in [("/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild test -scheme X", True),
+                      ("xcrun simctl boot 75620740", True),
+                      ("/Applications/Xcode.app/Contents/Developer/usr/bin/simctl list devices -j", True),
+                      ("/Library/Developer/PrivateFrameworks/CoreSimulator.framework/Versions/A/XPCServices/"
+                       "com.apple.CoreSimulator.CoreSimulatorService.xpc/Contents/MacOS/com.apple.CoreSimulator.CoreSimulatorService", False),
+                      ("vim notes/simctl.md", False), ("grep -r xcodebuild .", False)]:
+        check(f"busy: {cmd[:60]!r} → {busy}", bool(SIM_BUSY_RE.search(cmd)), busy)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        now = time.time()
+        keep = _sim_device(root, "iPhone 17", "iOS-26-5", used_days=30, now=now)
+        booted = _sim_device(root, "iPhone 17 Pro", "iOS-26-5", state="Booted", used_days=30, now=now)
+        never = _sim_device(root, "iPad Air 11-inch (M4)", "iOS-26-5", plist_days=100, now=now)
+        shut_recently = _sim_device(root, "iPhone 17e", "iOS-26-5", used_days=30, plist_days=2, now=now)
+        fresh = _sim_device(root, "iPhone Air", "iOS-26-5", used_days=1, plist_days=1, now=now)
+        older_keep = _sim_device(root, "iPhone 17", "iOS-26-4", used_days=30, plist_days=30, now=now)
+        orphan = _sim_device(root, "iPhone 16", "iOS-18-0", used_days=30, plist_days=30, available=False, now=now)
+        devices = parse_sim_devices(_simctl_json([keep, booted, never, shut_recently, fresh, older_keep, orphan]))
+        by_udid = {d.udid: d for d in devices}
+        check("parses every device with its runtime", sorted(d.name for d in devices),
+              sorted(["iPhone 17", "iPhone 17 Pro", "iPad Air 11-inch (M4)", "iPhone 17e", "iPhone Air", "iPhone 17", "iPhone 16"]))
+        check("last use = the later of lastUsedAt (boot) and device.plist's mtime (boot and shutdown)",
+              round((now - by_udid[shut_recently["udid"]].last_used) / 86400), 2)
+        check("a never-booted device's last use is its device.plist (creation)",
+              round((now - by_udid[never["udid"]].last_used) / 86400), 100)
+
+        kept = kept_sim_devices(devices, "iPhone 17")
+        check("the designated device is the one on the newest runtime", kept, {keep["udid"]})
+        idle = plan_sim_devices(devices, kept, 7, now)
+        check("idle, shut-down, non-designated devices go, on any runtime, available or not",
+              sorted(d.name for d in idle), sorted(["iPad Air 11-inch (M4)", "iPhone 17", "iPhone 16"]))
+        check("the iPhone 17 that goes is the one on the older runtime",
+              [d.udid for d in idle if d.name == "iPhone 17"], [older_keep["udid"]])
+        check("SAFETY: the designated device is never deleted, however idle", keep["udid"] in {d.udid for d in idle}, False)
+        check("SAFETY: a booted device is never deleted", booted["udid"] in {d.udid for d in idle}, False)
+        check("a device shut down 2 days ago stays (long boot, old lastUsedAt)", shut_recently["udid"] in {d.udid for d in idle}, False)
+        check("SAFETY: no designated device found → nothing is deleted on a guess",
+              plan_sim_devices(devices, kept_sim_devices(devices, "iPhone 99"), 7, now), [])
+
+        later = parse_sim_devices(_simctl_json([keep, _sim_device(root, "iPhone 17", "iOS-26-10", used_days=3, now=now),
+                                                _sim_device(root, "iPhone 17", "iOS-26-9", used_days=3, now=now)]))
+        check("designated: iOS 26.10 beats 26.9 and 26.5 (numeric, not string order)",
+              [d.runtime.rsplit(".", 1)[-1] for d in later if d.udid in kept_sim_devices(later, "iPhone 17")], ["iOS-26-10"])
+        no_new = parse_sim_devices(_simctl_json([keep, _sim_device(root, "iPhone 18", "iOS-27-0", used_days=60, now=now)]))
+        check("SAFETY: a newer runtime without an iPhone 17 leaves the old iPhone 17 designated",
+              kept_sim_devices(no_new, "iPhone 17"), {keep["udid"]})
+        unmounted = parse_sim_devices(_simctl_json([
+            _sim_device(root, "iPhone 17", "iOS-27-0", used_days=30, available=False, now=now), older_keep]))
+        check("SAFETY: an unavailable iPhone 17 on a newer runtime (not mounted yet) is kept too",
+              sorted(d.runtime.rsplit(".", 1)[-1] for d in unmounted if d.udid in kept_sim_devices(unmounted, "iPhone 17")),
+              ["iOS-26-4", "iOS-27-0"])
+
+        def logs(entry: dict) -> dict[str, Path]:
+            diag = Path(entry["dataPath"]) / "var/db"
+            return {
+                "old": _write(diag / "diagnostics/Persist/0000000000000001.tracev3", days=10, now=now),
+                "special": _write(diag / "diagnostics/Special/0000000000000002.tracev3", days=10, now=now),
+                "new": _write(diag / "diagnostics/Persist/0000000000000003.tracev3", days=1, now=now),
+                "logd": _write(diag / "diagnostics/logd.0.log", days=10, now=now),
+                "uuidtext": _write(diag / "uuidtext/AB/CDEF0123456789", days=10, now=now),
+            }
+
+        keep_logs, booted_logs, idle_logs = logs(keep), logs(booted), logs(never)
+        planned = plan_sim_logs(devices, {d.udid for d in idle}, 7, now)
+        check("old .tracev3 files of shut-down devices go, the designated one's included",
+              sorted(planned), sorted([keep_logs["old"], keep_logs["special"]]))
+        check("SAFETY: uuidtext stays (newer logs still decode with old format strings)", keep_logs["uuidtext"] in planned, False)
+        check("logs newer than 7 days, and logd's own text logs, stay",
+              {keep_logs["new"], keep_logs["logd"]} & set(planned), set())
+        check("SAFETY: a booted device's logs are left alone", set(booted_logs.values()) & set(planned), set())
+        check("a device deleted in the same run isn't counted twice", set(idle_logs.values()) & set(planned), set())
+
+        one = parse_sim_runtimes(_runtime_json(("A", "iphonesimulator", "26.5", "23F77")))
+        check("SAFETY: a single runtime is never deleted", plan_sim_runtimes(one, devices), ([], []))
+        two = parse_sim_runtimes(_runtime_json(("OLD", "iphonesimulator", "26.9", "23X1"), ("NEW", "iphonesimulator", "26.10", "23Y1"),
+                                               ("WATCH", "watchsimulator", "11.0", "22R1")))
+        on_new = parse_sim_devices(_simctl_json([_sim_device(root, "iPhone 17", "iOS-26-10", used_days=1, now=now)]))
+        drop, held = plan_sim_runtimes(two, on_new)
+        check("the older runtime of a platform goes (26.9 < 26.10); the only watchOS one stays",
+              ([r.image_id for r in drop], held), (["OLD"], []))
+        on_old = parse_sim_devices(_simctl_json([_sim_device(root, "iPhone 17 Pro", "iOS-26-9", used_days=1, now=now)]))
+        drop, held = plan_sim_runtimes(two, on_old)
+        check("SAFETY: an old runtime a device still uses stays, naming the device",
+              (drop, [(r.image_id, users) for r, users in held]), ([], [("OLD", ["iPhone 17 Pro"])]))
+        builds = parse_sim_runtimes(_runtime_json(("B1", "iphonesimulator", "26.5", "23F77"), ("B2", "iphonesimulator", "26.5", "23F79")))
+        check("an older build of the same runtime goes even with devices on it (the newer build serves them)",
+              [r.image_id for r in plan_sim_runtimes(builds, devices)[0]], ["B1"])
+        staging = parse_sim_runtimes(_runtime_json(("OLD", "iphonesimulator", "26.9", "23X1"),
+                                                   ("NEW", "iphonesimulator", "26.10", "23Y1", "Mounting")))
+        check("SAFETY: a newer runtime that isn't Ready yet doesn't push the old one out",
+              plan_sim_runtimes(staging, on_new), ([], []))
+
+        xcode = root / "Xcode"
+        ios = xcode / "iOS DeviceSupport"
+        current = ios / "iPhone17,3 26.5.2 (23F84)"
+        _write(current / "Symbols/usr/lib/dyld")
+        check("SAFETY: a model with one Device Support version keeps it", plan_device_support(xcode), [])
+        newest = ios / "iPhone17,3 26.10 (23Z1)"
+        middle = ios / "iPhone17,3 26.9.1 (23W1)"
+        other_model = ios / "iPhone15,2 17.0 (21A329)"
+        legacy = ios / "16.4 (20E247) arm64e"
+        odd = ios / "Some Folder"
+        watch = xcode / "watchOS DeviceSupport/Watch7,1 11.0 (22R1)"
+        for d in (newest, middle, other_model, legacy, odd, watch):
+            _write(d / "Info.plist")
+        planned = plan_device_support(xcode)
+        check("per model only the newest stays (26.10 > 26.9.1 > 26.5.2)", sorted(planned), sorted([current, middle]))
+        check("SAFETY: other models, other platforms and folders it can't parse stay",
+              {other_model, legacy, odd, watch, newest} & set(planned), set())
+        os.chmod(current / "Symbols/usr/lib", 0o555)
+        remove_trees(planned)
+        check("removed, read-only dirs included, no trash left",
+              sorted(p.name for p in ios.iterdir()), sorted(p.name for p in (newest, other_model, legacy, odd)))
+
+
 def selftest() -> int:
     print("parse_etime")
     check("mm:ss", parse_etime("08:50"), 530)
@@ -3147,6 +3583,7 @@ def selftest() -> int:
     selftest_npm()
     selftest_codex()
     selftest_dev_space()
+    selftest_sim()
 
     print("\nrun_sections")
     ran = []
@@ -3212,6 +3649,14 @@ def main() -> int:
         metavar="HOURS",
         help="Only reap agent-browser sessions older than HOURS (default: 0 = all). "
         "Use e.g. --min-age 2 to run this while a session is actively driving a browser.",
+    )
+    parser.add_argument(
+        "--sim-days",
+        type=int,
+        default=7,
+        metavar="DAYS",
+        help=f"Delete simulators other than {SIM_KEEP_NAME!r} shut down and unused for DAYS, and simulator "
+        "system logs older than DAYS (default: 7)",
     )
     parser.add_argument(
         "--cargo-days",
@@ -3282,7 +3727,7 @@ def main() -> int:
 
     sections = {
         "browser": lambda: cleanup_agent_browser(args.min_age, args.dry_run),
-        "sim": lambda: cleanup_simulators(args.dry_run),
+        "sim": lambda: cleanup_simulators(SIM_KEEP_NAME, args.sim_days, args.dry_run),
         "cargo": lambda: cleanup_cargo(args.cargo_days, args.cargo_max_size, args.dry_run),
         "projects": lambda: run_dev_space("projects", args.dry_run),
         "uv": lambda: cleanup_uv(args.uv_days, args.dry_run),
