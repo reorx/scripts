@@ -57,7 +57,10 @@ tags:
 - 06:00 定时任务的首次完整运行、首周观察，见 `kb/next-up.md`。
 - LaCie 未加密，上面有生产库备份和生产 SQL dump，已记入 `kb/known-issues.md`，等用户决定是否改用加密卷。
 - 凭据备份文件留在项目里，需要用户经 envops 处理：campus_watch `backend/*.env.bak.*`，condenser `.env.bak.20261110-205340`。
-- 还没有清理方案的大户：`~/Library/Application Support/vocalflow/vocalflow.sqlite`（1.9G）、CoreSimulator（10G）、iOS DeviceSupport（5.7G）、`~/.hermes`（3.1G）。
+- 还没有清理方案的大户：`~/Library/Application Support/vocalflow/vocalflow.sqlite`（1.9G）。用户说这一项不用处理。
+- 后续交给两个 herdr tab 处理，主会话只写 brief、核对结果：
+  - `~/.hermes`：释放约 522M，3.1G → 2.6G。有 5 项待用户决定，包括 cua-driver、浏览器工具链和会话自动清理，见 `tmp/2026-11-13-hermes-cleanup/REPORT.md`。
+  - iOS 模拟器：只留 iPhone 17，释放约 7.6G，sim 段加了四条每日规则。有 3 项待用户决定：手机是否已经是 iOS 27、要不要提前删 5.7G 的 Device Support、要不要换 iOS 27 运行时、paseo 是否设 `PASEO_IOS_SIMULATOR_NAME`。见 `tmp/2026-11-13-ios-sim-cleanup/SUMMARY.md`。
 - 跳过了 vocalflow 的 `VocalFlowCore/.build/{index-build,out}`（约 1.16G），项目正在编辑器里使用。
 - uv 缓存里约 1300 个 wheel 指针指向已不存在的 archive，是这次清理之前就有的。新建 venv 时会联网重新下载，不影响已有 venv。
 - 每小时检查剩余空间这件事推迟，首周观察后再决定。
@@ -68,3 +71,6 @@ tags:
 - [项目规则引擎 spec](../plans/2026-11-13-dev-space-rules-spec.md) — ① 的依据，本次更新
 - [全局缓存清理段 spec](../plans/2026-11-13-global-cache-sections-spec.md) — ② 的依据
 - [监控与告警 spec](../plans/2026-11-13-dev-space-watch-spec.md) — ③ 的依据
+- [~/.hermes 清理 brief](../plans/2026-11-13-hermes-cleanup-brief.md) — 本次新建，交给 hermes-clean tab
+- [iOS 模拟器清理 brief](../plans/2026-11-13-ios-simulator-cleanup-brief.md) — 本次新建，交给 ios-sim tab
+- [iOS 模拟器清理 spec](../plans/2026-11-13-ios-simulator-cleanup-spec.md) — 由 ios-sim tab 编写

@@ -11,6 +11,21 @@
   首轮剩下的 77 个过期 codex 会话应在这一次删完，日志里不该再有「codex refused」。
   → 记到 `kb/plans/2026-11-13-dev-disk-cleanup.md`「首次真实运行」
 
+- **sim 段的新规则**：
+  - 命令：`grep -A12 '── iOS simulators' ~/Library/Logs/mac-dev-cleanup.log | tail -14`
+  - 预期：有一行 `keeping iPhone 17`；四项都很小或为 0，日志一项最多只有几个文件；没有 ⚠️。
+
+  → 记到 `kb/plans/2026-11-13-ios-simulator-cleanup-spec.md`
+
+## 装上下一个 iOS 模拟器运行时，且旧 iPhone 17 闲置满 7 天之后
+
+- **删除旧运行时**：
+  - 看 `mac-dev-cleanup.log` 里 `old runtimes` 那一行；
+  - 跑 `xcrun simctl runtime list`，确认旧运行时已经删掉。
+
+  这一步目前只在 dry-run 里验证过（见 known-issues）。通过就删掉那条 known issue。
+  → 记到 `kb/plans/2026-11-13-ios-simulator-cleanup-spec.md`
+
 ## 2026-11-20 之后（首次真实运行一周）
 
 - **首周观察**：
