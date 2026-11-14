@@ -76,17 +76,18 @@ age_days = 14
 root = "~/Code/vibench"
 related = [
   # worktrees named ~/Code/vibench-<branch> belong here too; add them while they exist
-  "~/Code/vibench-live",
+  "~/Code/vibench-live",            # drop when P3b retires the live worktree
   "~/Code/vibench-backups",
   "~/Library/Application Support/vibench",
+  "~/.vibench",                     # live's data since P2 (2026-11-14)
 ]
 alert_size = "30GiB"
 protect = [
   # the production database and the host identity backup (kb/docs/deployment.md)
-  "~/Code/vibench-live/.live/data/vibench.sqlite",
-  "~/Code/vibench-live/.live/data/vibench.sqlite-wal",
-  "~/Code/vibench-live/.live/data/vibench.sqlite-shm",
-  "~/Code/vibench-live/.live/backups/identity-*",
+  "~/.vibench/data/vibench.sqlite",
+  "~/.vibench/data/vibench.sqlite-wal",
+  "~/.vibench/data/vibench.sqlite-shm",
+  "~/.vibench/backups/identity-*",
   # a running relay workspace and an experiment HOME with resident gpg-agent
   "tmp/hosted-pwa-relay",
   "tmp/2026-10-16-claude-halt",
@@ -121,18 +122,18 @@ keep_newest = 2
 
 [[projects.vibench.rules]]
 id = "live-deploy-snapshots"
-why = "vibench-live/.live/backups/<ts>-<sha>/: the VACUUM INTO snapshot deploy takes before each release (~300-400M). The two newest stay local for a quick restore; older ones live on LaCie, which doubles as the offsite copy. identity-* never matches."
+why = "~/.vibench/backups/<ts>-<sha>/: the VACUUM INTO snapshot deploy takes before each release (~300-400M). The two newest stay local for a quick restore; older ones live on LaCie, which doubles as the offsite copy. identity-* never matches."
 action = "archive"
 when = "daily"
-paths = ["~/Code/vibench-live/.live/backups/20*", "~/Code/vibench-live/.live/backups/17*"]
+paths = ["~/.vibench/backups/20*", "~/.vibench/backups/17*"]
 keep_newest = 2
 
 [[projects.vibench.rules]]
 id = "live-migration-backups"
-why = "vibench-live/.live/data/vibench.sqlite.bak-*: the server's copy before each migration. All of them go to LaCie (user decision 2026-11-13); a day of grace keeps clear of a migration in progress."
+why = "~/.vibench/data/vibench.sqlite.bak-*: the server's copy before each migration. All of them go to LaCie (user decision 2026-11-13); a day of grace keeps clear of a migration in progress."
 action = "archive"
 when = "daily"
-paths = ["~/Code/vibench-live/.live/data/vibench.sqlite.bak-*"]
+paths = ["~/.vibench/data/vibench.sqlite.bak-*"]
 age_days = 1
 
 [[projects.vibench.rules]]
@@ -140,7 +141,7 @@ id = "live-db-offsite"
 why = "Daily offsite copy of the production database: the Mac's main DB had no copy off this machine (only the relay's is uploaded to OSS)."
 action = "sqlite-backup"
 when = "daily"
-source = "~/Code/vibench-live/.live/data/vibench.sqlite"
+source = "~/.vibench/data/vibench.sqlite"
 keep_daily = 7
 keep_weekly = 8
 
