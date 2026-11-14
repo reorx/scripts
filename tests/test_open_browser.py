@@ -21,7 +21,7 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import unquote, urlsplit
 
-SPEC = importlib.util.spec_from_file_location('open_browser', Path(__file__).with_name('open-browser.py'))
+SPEC = importlib.util.spec_from_file_location('open_browser', (Path(__file__).resolve().parent.parent / 'open-browser.py'))
 app = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = app
 SPEC.loader.exec_module(app)

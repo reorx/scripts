@@ -6,6 +6,7 @@
 export CLAUDE_PROJECT_DIR="/Users/reorx/Code/test-project"
 
 # Use SOUND env var or default
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SOUND="${SOUND:-default}"
 echo "Using sound: $SOUND"
 
@@ -25,7 +26,7 @@ if [ "$1" == "n" ]; then
       "transcript_path": "/tmp/claude/transcript.json",
       "cwd": "/Users/reorx/Code/test-project",
       "hook_event_name": "tool-before-bash"
-    }' | ./cc-notify.py -m "Running bash command" -s "$SOUND" -d
+    }' | "$ROOT/cc-notify.py" -m "Running bash command" -s "$SOUND" -d
     echo "Test completed!"
 elif [ "$1" == "a" ];then
     echo "test alert"
@@ -34,6 +35,6 @@ elif [ "$1" == "a" ];then
       "transcript_path": "/tmp/claude/transcript.json",
       "cwd": "/Users/reorx/Code/test-project",
       "hook_event_name": "tool-before-bash"
-    }' | ./cc-notify.py -m "Running bash command" -s "$SOUND" -t alert $iconargs -d
+    }' | "$ROOT/cc-notify.py" -m "Running bash command" -s "$SOUND" -t alert $iconargs -d
 fi
 

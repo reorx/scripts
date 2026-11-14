@@ -13,9 +13,9 @@ import {
   readHistory,
   rewrittenCommits,
   type Commit,
-} from './skills/squash-docs/scripts/squash-docs.ts';
+} from '../skills/squash-docs/scripts/squash-docs.ts';
 
-const script = fileURLToPath(new URL('./skills/squash-docs/scripts/squash-docs.ts', import.meta.url));
+const script = fileURLToPath(new URL('../skills/squash-docs/scripts/squash-docs.ts', import.meta.url));
 const docs = parseArgs([]);
 const commit = (id: string, subject: string, files = ['README.md'], body = ''): Commit => ({
   hash: id.repeat(40),

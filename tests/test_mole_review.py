@@ -25,7 +25,7 @@ from pathlib import Path
 from rich.style import Style
 from textual import events
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location('mole_review', HERE / 'mole-review.py')
 mr = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(mr)

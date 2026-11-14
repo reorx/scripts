@@ -21,7 +21,7 @@ import unittest
 from argparse import Namespace
 from pathlib import Path
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location('claude_session_search', HERE / 'claude_session_search.py')
 css = importlib.util.module_from_spec(spec)
 sys.modules['claude_session_search'] = css

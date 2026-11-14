@@ -639,7 +639,7 @@ pg-doctor --selftest
 - Anything that is or *might* be a postmaster for that directory is classified non-fixable.
 - Before deleting, `--fix` re-scans `ps` for a live postmaster serving that exact `-D` path and aborts if one appeared since the diagnosis.
 - The removed file is backed up (`/tmp/postmaster.pid.<instance>.<timestamp>` by default, `--backup-dir` to change).
-- `--selftest` asserts `healthy` and `ambiguous` are not in the fixable set; `test-pg-doctor.sh` in the scripts repo root additionally builds synthetic data directories for every verdict and runs `--fix` against the *live* data directory, asserting the lock file's inode/mtime/size are unchanged.
+- `--selftest` asserts `healthy` and `ambiguous` are not in the fixable set; `tests/test-pg-doctor.sh` in the scripts repo additionally builds synthetic data directories for every verdict and runs `--fix` against the *live* data directory, asserting the lock file's inode/mtime/size are unchanged.
 
 **Notes / gotchas:**
 

@@ -17,7 +17,7 @@ from pathlib import Path
 import sys
 
 # Import the module we're testing
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import mdformat
 
 

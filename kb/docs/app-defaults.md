@@ -81,5 +81,5 @@ app-defaults.py restore Graker '/完整路径/备份文件.plist'
 ## 维护入口
 
 - 脚本：`app-defaults.py`
-- 行为测试：`uv run test_app_defaults.py`，需要 macOS 的 `plutil`。
+- 行为测试：`uv run tests/test_app_defaults.py`，需要 macOS 的 `plutil`。
 - 安装链接：`./link-script app-defaults.py`

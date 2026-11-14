@@ -2,7 +2,7 @@
 # Behavior tests for `cc-format --hook` with Claude Code and Codex PostToolUse events
 set -euo pipefail
 
-CC_FORMAT="$(cd "$(dirname "$0")" && pwd)/cc-format"
+CC_FORMAT="$(cd "$(dirname "$0")/.." && pwd)/cc-format"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 REPO="$WORK/repo"

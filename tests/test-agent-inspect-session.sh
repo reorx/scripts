@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Runs agent-inspect-session.sh against fake config dirs; never reads the real ~/.claude.
-script="$(cd "$(dirname "$0")" && pwd)/agent-inspect-session.sh"
+script="$(cd "$(dirname "$0")/.." && pwd)/agent-inspect-session.sh"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 failures=0

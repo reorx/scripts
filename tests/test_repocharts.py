@@ -19,7 +19,7 @@ from fractions import Fraction
 from pathlib import Path
 from unittest.mock import patch
 
-SPEC = importlib.util.spec_from_file_location('repocharts', Path(__file__).with_name('repocharts.py'))
+SPEC = importlib.util.spec_from_file_location('repocharts', (Path(__file__).resolve().parent.parent / 'repocharts.py'))
 app = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = app
 SPEC.loader.exec_module(app)
@@ -747,7 +747,7 @@ class Cli(unittest.TestCase):
 
     def test_runs_through_its_shebang(self):
         repo = self.recent_repo()
-        script = Path(__file__).with_name('repocharts.py')
+        script = (Path(__file__).resolve().parent.parent / 'repocharts.py')
         result = subprocess.run(
             [str(script), str(repo.root), '--by', 'month', '--no-color'], capture_output=True, text=True, check=True
         )

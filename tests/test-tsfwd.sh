@@ -6,7 +6,7 @@
 # 127.0.0.1 listener, dead ones point at ports nothing listens on.
 set -uo pipefail
 
-TSFWD=$(cd "$(dirname "$0")" && pwd)/tsfwd.sh
+TSFWD=$(cd "$(dirname "$0")/.." && pwd)/tsfwd.sh
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/tsfwd-test.XXXXXX")
 STATE=$WORK/serve.json
 CALLS=$WORK/calls.log

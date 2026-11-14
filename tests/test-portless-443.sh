@@ -3,7 +3,7 @@
 # the sudo guard, and the plist it would install.
 set -euo pipefail
 
-script="$(cd "$(dirname "$0")" && pwd)/portless-443.sh"
+script="$(cd "$(dirname "$0")/.." && pwd)/portless-443.sh"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 failures=0

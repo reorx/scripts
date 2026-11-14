@@ -38,7 +38,7 @@ hooks.json 里的命令一改，hash 就会变，Codex 会跳过这个 hook，�
 
 ## 测试与验收
 
-- `./test-cc-format.sh`：hook 模式的行为测试，用真实的 ruff/biome。覆盖 Claude 事件、Codex 多文件 patch（新增、修改、移动、删除、带空格路径、绝对路径）、格式化失败和开关关闭。cc-format 被 toggle 关闭时测试会直接退出。
+- `./tests/test-cc-format.sh`：hook 模式的行为测试，用真实的 ruff/biome。覆盖 Claude 事件、Codex 多文件 patch（新增、修改、移动、删除、带空格路径、绝对路径）、格式化失败和开关关闭。cc-format 被 toggle 关闭时测试会直接退出。
 - 格式化器选择（prettier/biome 配置检测）的测试在 `tmp/cc-format-test/test.sh`，未入库。
 - 2026-10-20 的 Codex 端到端验收：用 `codex exec --dangerously-bypass-hook-trust` 跑真实会话，验证了三点：新建后再修改同一文件能成功；有语法错误的文件不再让 patch 显示为失败；同一脚本里后面的 patch 继续执行。输出在 `tmp/2026-10-20-cc-format-hook/`。
 

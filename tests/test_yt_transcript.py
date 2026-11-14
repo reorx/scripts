@@ -14,7 +14,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-SPEC = importlib.util.spec_from_file_location('yt_transcript', Path(__file__).with_name('yt-transcript.py'))
+SPEC = importlib.util.spec_from_file_location('yt_transcript', (Path(__file__).resolve().parent.parent / 'yt-transcript.py'))
 app = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = app
 SPEC.loader.exec_module(app)

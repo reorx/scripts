@@ -24,7 +24,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-HERE = Path(__file__).resolve().parent
+HERE = Path(__file__).resolve().parent.parent
 spec = importlib.util.spec_from_file_location('brewer', HERE / 'brewer.py')
 br = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(br)

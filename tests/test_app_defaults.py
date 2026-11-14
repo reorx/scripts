@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-SPEC = importlib.util.spec_from_file_location("app_defaults", Path(__file__).with_name("app-defaults.py"))
+SPEC = importlib.util.spec_from_file_location("app_defaults", (Path(__file__).resolve().parent.parent / "app-defaults.py"))
 app = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = app
 SPEC.loader.exec_module(app)

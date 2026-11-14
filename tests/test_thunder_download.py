@@ -19,7 +19,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-SCRIPT = Path(__file__).with_name('thunder-download.py')
+SCRIPT = (Path(__file__).resolve().parent.parent / 'thunder-download.py')
 spec = importlib.util.spec_from_file_location('thunder_download', SCRIPT)
 app = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(app)

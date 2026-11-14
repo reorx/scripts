@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-SCRIPT=$(cd "$(dirname "$0")" && pwd)/openon.sh
+SCRIPT=$(cd "$(dirname "$0")/.." && pwd)/openon.sh
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/openon-test.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/bin" "$WORK/temp files"

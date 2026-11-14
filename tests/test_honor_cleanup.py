@@ -6,7 +6,7 @@ import subprocess
 import tempfile
 import unittest
 
-SCRIPT = Path(__file__).with_name('honor-cleanup.py')
+SCRIPT = (Path(__file__).resolve().parent.parent / 'honor-cleanup.py')
 FAKE_ADB = """#!/usr/bin/env -S uv run --script
 import json, os, sys
 from pathlib import Path
