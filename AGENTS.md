@@ -46,6 +46,11 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 - Sun Browser is driven through its DevTools HTTP endpoint: `PUT /json/new?<encoded url>`, then `/json/activate/<id>`. AdsPower launches it with `--remote-debugging-port=0`, so the port comes from `DevToolsActivePort` in the profile's `--user-data-dir`; `OPEN_BROWSER_PROFILE` is the AdsPower id.
 - Never start a target: not through `open -a`, its bundle id, or by running its binary with the user-data dir. When it is not running, that starts a bare browser without the manager's proxy, fingerprint and cookie key. Not running is an error, with no fallback to the default browser or to another profile. Opening a tab does not raise the window, so it is raised with `NSRunningApplication` by pid. Run `uv run tests/test_open_browser.py` when changing it.
 
+## AGENTS.md sizes
+
+- `agents-md-top.py [root] [-n 20]` ranks the AGENTS.md files under `~/Code` by tiktoken `o200k_base` tokens (columns: path, tokens, size, mtime, project = first directory under the root); rows over `$AGENTS_MD_MAX_TOKENS` (default 5000) are yellow.
+- Files are listed with `rg --files --follow` and matched by name in Python. Never narrow the listing with `rg -g AGENTS.md`: a glob is an override and brings back AGENTS.md files a `.gitignore` excludes. `--follow` keeps `AGENTS.md -> CLAUDE.md` links and project dirs linked into `~/Code`; a file reached through several paths is listed once, by the path not going through a symlinked directory. Run `uv run tests/test_agents_md_top.py` when changing it.
+
 ## Claude session search
 
 - `claude_session_search.py` is the behavior baseline of `~/Code/agent-session-manager`: its `make parity` diffs the app's `asm` CLI against this script line by line, so a change to what the script prints or in what order has to land in `asm` too. Sessions list newest first prompt first, ties by last update, then by session ID (`newest_first`). Run `python3 tests/test_claude_session_search.py` when changing it.
