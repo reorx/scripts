@@ -563,6 +563,28 @@ class TestConfig(Sandbox):
         with self.assertRaises(ds.ConfigError):
             self.config(dup)
 
+    def test_installed_vibench_survives_broad_cleanup(self):
+        cfg = ds.load_config(SCRIPT.parent.parent / 'config/dev-space.toml', home=self.home)
+        project = cfg.projects['vibench']
+        home = self.home / '.vibench'
+        for name in ('versions/0.19.0/bin/vibench', 'backups/20261116T100000Z-0.19.0/backup.json',
+                     'backups/live.env.example', 'backups/identity-example/key'):
+            write(home / name)
+        for name in ('current', 'previous'):
+            (home / name).symlink_to('versions/0.19.0')
+        # Even a future broad rule must not delete installed state, including versions itself.
+        rule = ds.Rule(id='probe', why='test guards', action='delete', when='daily',
+                       paths=['~/.vibench/*', '~/.vibench/backups/*'])
+        runner = ds.Runner(cfg, dry_run=True, open_paths={}, out=io.StringIO())
+        runner.run_paths(ds.Job(project, rule, [project.root]))
+        self.assertEqual(runner.result.done, [])
+        skips = self.skipped(runner.result)
+        self.assertEqual(skips[str(home / 'versions')], 'protected')
+        self.assertIn('symlink', skips[str(home / 'current')])
+        self.assertIn('symlink', skips[str(home / 'previous')])
+        self.assertFalse(any('backups/20' in p or 'backups/17' in p
+                             for r in project.rules for p in r.paths))
+
     def test_parse_size(self):
         self.assertEqual(ds.parse_size('15GiB'), 15 * GIB)
         self.assertEqual(ds.parse_size('512MiB'), 512 * 1024**2)

@@ -13,8 +13,6 @@ code_root = "~/Code"
 archive_root = "/Volumes/LaCie/DevArchive"
 state_dir = "~/.local/state/dev-space"
 pressure_free = "15GiB"
-# vibench-live is production: only the explicit rules under [projects.vibench] apply to it
-defaults_exclude = ["~/Code/vibench-live"]
 protect = []
 
 # ── Defaults: every git project directly under code_root ───────────────────
@@ -76,7 +74,6 @@ age_days = 14
 root = "~/Code/vibench"
 related = [
   # worktrees named ~/Code/vibench-<branch> belong here too; add them while they exist
-  "~/Code/vibench-live",            # drop when P3b retires the live worktree
   "~/Code/vibench-backups",
   "~/Library/Application Support/vibench",
   "~/.vibench",                     # live's data since P2 (2026-11-14)
@@ -88,6 +85,12 @@ protect = [
   "~/.vibench/data/vibench.sqlite-wal",
   "~/.vibench/data/vibench.sqlite-shm",
   "~/.vibench/backups/identity-*",
+  # The installed CLI owns retention; protect the versions directory itself and all descendants.
+  "~/.vibench/versions",
+  "~/.vibench/current",
+  "~/.vibench/previous",
+  "~/.vibench/backups/20*",
+  "~/.vibench/backups/live.env.*",
   # a running relay workspace and an experiment HOME with resident gpg-agent
   "tmp/hosted-pwa-relay",
   "tmp/2026-10-16-claude-halt",
@@ -118,14 +121,6 @@ action = "delete"
 when = "daily"
 paths = ["apps/e2e/tmp/*", "apps/server/tmp/*"]
 age_days = 7
-keep_newest = 2
-
-[[projects.vibench.rules]]
-id = "live-deploy-snapshots"
-why = "~/.vibench/backups/<ts>-<sha>/: the VACUUM INTO snapshot deploy takes before each release (~300-400M). The two newest stay local for a quick restore; older ones live on LaCie, which doubles as the offsite copy. identity-* never matches."
-action = "archive"
-when = "daily"
-paths = ["~/.vibench/backups/20*", "~/.vibench/backups/17*"]
 keep_newest = 2
 
 [[projects.vibench.rules]]
