@@ -338,18 +338,25 @@ The installed vibench CLI manages its own versions and upgrade snapshots, includ
 
 **Script:** `scripts/window-server-doctor.py`
 
-**Prerequisites:** macOS only. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Wraps `ps`, `top`, `lsappinfo`, `system_profiler`, `log show`, `ioreg`, optionally `powermetrics` and `sample` (those two need sudo).
+**Prerequisites:** macOS only. Uses `uv run --script` with Python ≥3.11 (no third-party deps). Wraps `ps`, `top`, `lsappinfo`, `system_profiler`, `log show`, `ioreg`, optionally `sample` (needs sudo). Per-process GPU time needs Apple Silicon.
 
 When WindowServer is burning CPU, the goal is to find which *other* app is driving its rendering work — so the user can fix it without logging out or quitting apps. This script runs 8 checks and emits a verdict that names likely contributors.
 
 **How to use:**
 
 ```bash
-# Fast partial run (no sudo): process stats, foreground apps, displays, log, ioreg
+# Everything but the hot frames, no sudo: process stats, foreground apps, displays,
+# GPU ms/s by process, log, GPU utilization
 <skill-path>/scripts/window-server-doctor.py --quick
 
-# Full diagnostic with sudo (enables powermetrics GPU-by-process + sample hot frames)
+# Measure GPU per process over a longer window (default 3s)
+<skill-path>/scripts/window-server-doctor.py --quick --gpu-seconds 10
+
+# Add WindowServer hot frames (sample needs sudo)
 sudo -E <skill-path>/scripts/window-server-doctor.py
+
+# Behaviour tests (12, the last one runs the real script without sudo)
+uv run <skill-path>/scripts/test_window_server_doctor.py
 
 # Opt in to exact window counts per app (15-25s, needs Automation permission)
 <skill-path>/scripts/window-server-doctor.py --slow-windows
@@ -366,7 +373,7 @@ sudo -E <skill-path>/scripts/window-server-doctor.py
 | 2 | Live thread count + CPU (`top`) | No |
 | 3 | Foreground apps (`lsappinfo`) — or exact windows/app with `--slow-windows` (System Events) | No |
 | 4 | Connected displays, resolution, refresh rate (`system_profiler`) | No |
-| 5 | Per-process GPU ms/s (`powermetrics --show-process-gpu`) | **Yes** |
+| 5 | Per-process GPU ms/s (two `ioreg -c AGXDeviceUserClient` snapshots, `--gpu-seconds` apart) | No |
 | 6 | WindowServer hot call stacks, top-of-stack aggregation (`sample`) | **Yes** |
 | 7 | Recent WindowServer warnings/errors (`log show`) | No |
 | 8 | GPU utilization counters (`ioreg` / `PerformanceStatistics`) | No |
@@ -376,16 +383,26 @@ sudo -E <skill-path>/scripts/window-server-doctor.py
 **How to interpret results:**
 
 - WindowServer itself is almost never the root cause — it reflects compositing work driven by *other* apps. Check #5 (GPU ms/s by process) names the real culprit.
+- **Normal range on this Mac** (Mac mini, 4608×2592 display scaled to 2304×1296; 7 days of proc-top data, 2026-11-16): median **44%**, p90 52% while the user is at the screen; ~1% when the screen is dark; ~4% when dark after the 05:30 scheduled wake. So the ≥20% "elevated" exit code fires on every normal working session here. Compare with these numbers before hunting for a cause.
+- **A finished VNC session leaves nothing behind.** A live one shows up as `screensharingd` + `ScreensharingAgent` in `ps`. The session of 2026-11-15 ran WindowServer at ~13%, and it was back to ~1% within 10 minutes of the session ending.
 - High CPU + multiple 120Hz displays + many foreground apps is a common "death by a thousand cuts" pattern, not a single rogue process.
 - Hot frame `CGXComposeSurfaces` / `CARenderServer*` means compositing load (too many surfaces updating). `mach_msg_trap` on top usually means WS is mostly idle.
 - Log errors like "pid X failed to act on a ping" point at a specific misbehaving client process — resolve PID X with `ps -p X` to see who.
 
 **Typical scenarios:**
-- "WindowServer is using 60% CPU, what's wrong?" → run with `sudo -E` for full coverage, focus on section 5 + verdict
-- "My Mac UI is laggy but Activity Monitor doesn't show a CPU hog" → run `--quick` first; if WS is the top, rerun with sudo for GPU breakdown
-- "Which app is burning the GPU?" → `sudo -E window-server-doctor.py --quick` then look at section 5 isn't available under `--quick`; drop `--quick` instead
+- "WindowServer is using 60% CPU, what's wrong?" → run `--quick`, focus on section 5 + verdict; rerun with `sudo -E` only if you need the hot frames
+- "My Mac UI is laggy but Activity Monitor doesn't show a CPU hog" → run `--quick`; section 5 names the apps feeding WS
+- "Which app is burning the GPU?" → `--quick --gpu-seconds 10`, section 5
 - "Do I have too many windows open?" → run with `--slow-windows` to see per-app window counts
 - Non-disruptive fixes: Cmd+H the top GPU consumer, reduce transparency/motion in Accessibility, switch dynamic wallpaper to static, unplug unused external displays
+
+**GPU-by-process via ioreg: how it works, and its traps** (verified 2026-11-17, macOS 26, Apple Silicon):
+
+- Every process that uses the GPU holds one or more `AGXDeviceUserClient`s. Each client's `AppUsage` lists `accumulatedGPUTime` per command queue, readable without root. This is the counter behind Activity Monitor's GPU Time column. It replaced `powermetrics --show-process-gpu`, which needs sudo; powermetrics' per-task CPU ms/s was dropped with it (`ps`/`top` give CPU per process anyway). The `--json` key is `gpu` (was `powermetrics`).
+- **Units are nanoseconds.** Checked against `Device Utilization %` from `IOAccelerator` `PerformanceStatistics`: the per-process sum in ms/s tracked utilization × 10 within 1–1.5× (processes' GPU time overlaps).
+- **Diff per client, not per process.** Clients are keyed by their registry id (`id 0x…` on the `+-o` line). A process that closes a client and opens another would show its old client's whole lifetime as a negative rate, hiding new work. A client missing from the first snapshot was opened during the window, so all of its time counts.
+- `IOUserClientCreator` names are cut to 16 chars (`Google Chrome He`), so the script takes the executable name from `ps -o comm=` for the listed pids. It keeps the ioreg name for processes that have exited.
+- Intel Macs have no `AGXDeviceUserClient`; section 5 then reports an error and the rest still runs.
 
 ## macOS Keep-Awake
 
