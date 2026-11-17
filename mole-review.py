@@ -1027,6 +1027,9 @@ def main() -> None:
     if os.geteuid() == 0:
         # HOME would be /var/root, so every home-level guard would protect the wrong directory
         sys.exit('mole-review must not run as root, run it as the user whose files are being reviewed')
+    # checked before --rescan: the review could not open anyway, the scan would be wasted
+    if args.whitelist == DEFAULT_WHITELIST and not args.whitelist.exists():
+        sys.exit('Initialize Mole protections first: run mo clean --whitelist and press Enter to save')
     if args.rescan:
         if args.list != DEFAULT_LIST:
             parser.error(f'--rescan regenerates {DEFAULT_LIST}, it cannot be combined with another list path')
@@ -1040,8 +1043,6 @@ def main() -> None:
             sys.exit(code if code > 0 else 128 - code)
     if not args.list.exists():
         sys.exit(f'{args.list} not found, generate it with: mo clean --dry-run')
-    if args.whitelist == DEFAULT_WHITELIST and not args.whitelist.exists():
-        sys.exit('Initialize Mole protections first: run mo clean --whitelist and press Enter to save')
     MoleReviewApp(args.list, args.whitelist).run()
 
 

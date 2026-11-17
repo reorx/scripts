@@ -472,6 +472,14 @@ class TestRescan(unittest.TestCase):
         self.assertIn('mo clean --whitelist', str(cm.exception.code))
         self.assertFalse(self.whitelist_path.exists())
 
+    def test_rescan_with_missing_shared_whitelist_fails_before_running_mo(self):
+        # the review could not open anyway, so the minutes-long scan would be wasted
+        self.whitelist_path.unlink()
+        with self.assertRaises(SystemExit) as cm:
+            self.run_main(['--rescan'])
+        self.assertIn('mo clean --whitelist', str(cm.exception.code))
+        self.assertFalse(self.calls.exists())
+
     def test_explicit_separate_whitelist_can_start_without_shared_file(self):
         self.list_path.write_text('=== A ===\n/tmp  # 1KB\n')
         self.whitelist_path.unlink()
@@ -855,9 +863,7 @@ class TestAppWhitelist(AppTestCase):
             self.whitelist_path.write_text(external)
             await pilot.press('r')
             self.assertNotIn(protected, [i.path for i in app.shown])
-            app.query_one(mr.ItemTable).move_cursor(
-                row=next(n for n, i in enumerate(app.shown) if i.path == target)
-            )
+            app.query_one(mr.ItemTable).move_cursor(row=next(n for n, i in enumerate(app.shown) if i.path == target))
             await pilot.press('x')
             self.assertEqual(self.whitelist_path.read_text(), external + target + '\n')
 
