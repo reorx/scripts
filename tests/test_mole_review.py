@@ -464,21 +464,20 @@ class TestRescan(unittest.TestCase):
         self.run_main([])
         self.assertFalse(self.calls.exists())
 
-    def test_missing_shared_whitelist_requires_mole_initialization(self):
+    def test_missing_shared_whitelist_still_opens_review(self):
+        # mole runs on its built-in defaults without the file, the list it wrote is reviewable as is
         self.list_path.write_text('=== A ===\n/tmp  # 1KB\n')
         self.whitelist_path.unlink()
-        with self.assertRaises(SystemExit) as cm:
-            self.run_main([])
-        self.assertIn('mo clean --whitelist', str(cm.exception.code))
+        opened = self.run_main([])
+        self.assertIn('=== A ===', opened)
         self.assertFalse(self.whitelist_path.exists())
 
-    def test_rescan_with_missing_shared_whitelist_fails_before_running_mo(self):
-        # the review could not open anyway, so the minutes-long scan would be wasted
+    def test_rescan_with_missing_shared_whitelist_opens_review(self):
         self.whitelist_path.unlink()
-        with self.assertRaises(SystemExit) as cm:
-            self.run_main(['--rescan'])
-        self.assertIn('mo clean --whitelist', str(cm.exception.code))
-        self.assertFalse(self.calls.exists())
+        opened = self.run_main(['--rescan'])
+        self.assertEqual(self.calls.read_text(), 'clean --dry-run\n')
+        self.assertIn('=== Developer tools ===', opened)
+        self.assertFalse(self.whitelist_path.exists())
 
     def test_explicit_separate_whitelist_can_start_without_shared_file(self):
         self.list_path.write_text('=== A ===\n/tmp  # 1KB\n')
@@ -952,6 +951,72 @@ class TestAppWhitelist(AppTestCase):
             await pilot.press('space')
             await pilot.pause()
             self.assertEqual(app.marked, set())
+
+
+class TestAppUninitializedSharedWhitelist(AppTestCase):
+    """Mole's shared whitelist was never saved: Mole runs on built-in defaults that a file
+    holding only our entries would replace, so review works but nothing writes the file."""
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(mr, 'DEFAULT_WHITELIST', self.whitelist_path)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def messages(self, app):
+        return '\n'.join(n.message for n in app._notifications)
+
+    async def test_opens_with_every_row_and_says_how_to_initialize(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40), notifications=True) as pilot:
+            await pilot.pause()
+            self.assertEqual(len(app.shown), 7)
+            self.assertIn('mo clean --whitelist', self.messages(app))
+            self.assertIn('mo defaults', app.query_one('#summary', mr.Static).render().plain)
+
+    async def test_marking_and_deleting_still_work(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            target = app.current_item().path
+            await pilot.press('d')
+            await self.confirm(pilot)
+            await self.settle(app, pilot)
+            self.assertFalse(os.path.lexists(target))
+            self.assertFalse(self.whitelist_path.exists())
+
+    async def test_x_does_not_create_the_shared_file(self):
+        app = self.make_app()
+        async with app.run_test(size=(160, 40), notifications=True) as pilot:
+            top = app.current_item().path
+            app._notifications.clear()
+            await pilot.press('x')
+            await pilot.pause()
+            self.assertFalse(self.whitelist_path.exists())
+            self.assertIn(top, [i.path for i in app.shown])
+            self.assertIn('mo clean --whitelist', self.messages(app))
+
+    async def test_e_does_not_create_the_shared_file_or_open_an_editor(self):
+        app = self.make_app()
+        with mock.patch.object(mr.subprocess, 'run') as run:
+            async with app.run_test(size=(160, 40), notifications=True) as pilot:
+                app._notifications.clear()
+                await pilot.press('e')
+                await pilot.pause()
+                self.assertFalse(self.whitelist_path.exists())
+                run.assert_not_called()
+                self.assertIn('mo clean --whitelist', self.messages(app))
+
+    async def test_x_works_after_mole_saves_the_file_and_r_reloads(self):
+        target = self.p('npm/_cacache/content-v2')
+        app = self.make_app()
+        async with app.run_test(size=(160, 40)) as pilot:
+            self.whitelist_path.parent.mkdir(parents=True, exist_ok=True)
+            saved = f'# Saved by Mole\n{self.p("Caches/pip")}\n'
+            self.whitelist_path.write_text(saved)
+            await pilot.press('r')
+            app.query_one(mr.ItemTable).move_cursor(row=next(n for n, i in enumerate(app.shown) if i.path == target))
+            await pilot.press('x')
+            self.assertEqual(self.whitelist_path.read_text(), saved + target + '\n')
 
 
 class TestAppDelete(AppTestCase):

@@ -73,7 +73,7 @@ Personal scripts for work tricks, productivity, and everyday life, plus agent sk
 
 ## Mole cleanup review
 
-- `mole-review.py` shares `~/.config/mole/whitelist` with Mole (`--whitelist` overrides it): edits also affect `mo clean`. Initialize missing shared config with `mo clean --whitelist` and save before review, preserving Mole's optional defaults. Space marks deletion; `x` toggles only the current row's protection; `w` shows/hides protected rows. The default deletion log stays at `~/.config/mole-review/deleted.log`. Run `uv run tests/test_mole_review.py` when changing it.
+- `mole-review.py` shares `~/.config/mole/whitelist` with Mole (`--whitelist` overrides it): edits also affect `mo clean`. Review (and `--rescan`) never requires that file. While it is missing Mole runs on its built-in `DEFAULT_WHITELIST_PATTERNS`, and a saved file replaces them (only `SAFETY_WHITELIST_PATTERNS` merge back), so `x`/`e` never create the shared file: they point to `mo clean --whitelist`, and `r` picks up the saved file. Space marks deletion; `x` toggles only the current row's protection; `w` shows/hides protected rows. The default deletion log stays at `~/.config/mole-review/deleted.log`. Run `uv run tests/test_mole_review.py` when changing it.
 
 ## Homebrew upgrades
 

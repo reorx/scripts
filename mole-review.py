@@ -13,8 +13,10 @@ by size, and lets you mark entries and delete them in one go.
 Shares Mole's whitelist (~/.config/mole/whitelist): protected entries are
 hidden from review and skipped by Mole's cleanup. Changes made here also
 affect `mo clean`; changes made with `mo clean --whitelist` appear on reload.
-Initialize it with `mo clean --whitelist` before first use so Mole's default
-protections are preserved. --whitelist can point at a separate file instead.
+Review works without that file, but whitelisting (x, e) waits until Mole has
+saved it once: Mole runs on built-in defaults while it is missing, and a file
+holding only our entries would replace them. --whitelist can point at a
+separate file instead, created on first use.
 
 With --rescan it first runs `mo clean --dry-run` on the terminal, exactly as
 if typed in the shell, then opens the fresh list.
@@ -60,6 +62,10 @@ RESCAN_CMD = ['mo', 'clean', '--dry-run']
 WHITELIST_HEADER = (
     '# Mole Whitelist - Protected paths will be skipped during cleanup and hidden from review.\n'
     '# One path or glob per line.\n'
+)
+WHITELIST_INIT_HINT = (
+    "Mole's whitelist is not saved yet, so x and e are off: "
+    'run mo clean --whitelist, press Enter to save, then r to reload'
 )
 
 KEYS_HELP = """\
@@ -608,6 +614,8 @@ class MoleReviewApp(App):
         self.query_one('#copy-path', Button).can_focus = False
         self.load_data()
         table.focus()
+        if self.whitelist_unsaved():
+            self.notify(WHITELIST_INIT_HINT, severity='warning', timeout=10)
 
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
         if action in APP_ACTIONS and isinstance(self.screen, ModalScreen):
@@ -632,6 +640,11 @@ class MoleReviewApp(App):
         self.marked = {p for p in self.marked if p in paths and p not in self.wl_paths}
         self.rebuild_categories()
         self.refresh_table()
+
+    def whitelist_unsaved(self) -> bool:
+        """Mole's shared whitelist was never saved: Mole runs on built-in defaults, which a
+        file holding only our entries would replace. A separate --whitelist has no such defaults."""
+        return self.whitelist_path == DEFAULT_WHITELIST and not self.whitelist_path.exists()
 
     def selected_categories(self) -> set[str]:
         if self.category is None:
@@ -768,7 +781,7 @@ class MoleReviewApp(App):
             ('entries', str(len(self.items))),
             ('gone', str(self.gone)),  # listed but no longer on disk
             ('whitelist', f'{len(wl_items)} · {format_size(total_size(wl_items))}'),
-            ('patterns', str(len(self.patterns))),
+            ('patterns', 'mo defaults' if self.whitelist_unsaved() else str(len(self.patterns))),
         ]
         text = Text()
         for n, (label, value) in enumerate(rows):
@@ -894,6 +907,9 @@ class MoleReviewApp(App):
         item = self.current_item()
         if item is None:
             return
+        elif self.whitelist_unsaved():
+            self.notify(WHITELIST_INIT_HINT, severity='warning')
+            return
         elif item.path in self.wl_paths:
             self.unwhitelist(item)
         else:
@@ -934,6 +950,9 @@ class MoleReviewApp(App):
         self.notify(f'Copied {item.path}')
 
     def action_edit_whitelist(self) -> None:
+        if self.whitelist_unsaved():
+            self.notify(WHITELIST_INIT_HINT, severity='warning')
+            return
         if not self.whitelist_path.exists():
             self.whitelist_path.parent.mkdir(parents=True, exist_ok=True)
             self.whitelist_path.write_text(WHITELIST_HEADER)
@@ -1027,9 +1046,6 @@ def main() -> None:
     if os.geteuid() == 0:
         # HOME would be /var/root, so every home-level guard would protect the wrong directory
         sys.exit('mole-review must not run as root, run it as the user whose files are being reviewed')
-    # checked before --rescan: the review could not open anyway, the scan would be wasted
-    if args.whitelist == DEFAULT_WHITELIST and not args.whitelist.exists():
-        sys.exit('Initialize Mole protections first: run mo clean --whitelist and press Enter to save')
     if args.rescan:
         if args.list != DEFAULT_LIST:
             parser.error(f'--rescan regenerates {DEFAULT_LIST}, it cannot be combined with another list path')
